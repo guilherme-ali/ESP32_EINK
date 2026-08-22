@@ -1,0 +1,7 @@
+# Name,   Type, SubType, Offset,  Size,     Flags
+# ESP32-S3-ePaper-1.54 V2 (8 MB flash). Sem OTA: uma unica app + LittleFS
+# para gravacoes de audio, wallpapers e cache de sincronizacao.
+nvs,      data, nvs,     0x9000,  0x6000,
+phy_init, data, phy,     0xf000,  0x1000,
+factory,  app,  factory, 0x10000, 3M,
+spiffs,   data, spiffs,  ,        4864K,

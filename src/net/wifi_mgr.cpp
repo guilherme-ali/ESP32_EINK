@@ -1,34 +1,74 @@
 #include "wifi_mgr.h"
 #include <LittleFS.h>
 
-bool WifiManager::begin(SettingsStore &settings) {
+bool WifiManager::connect(SettingsStore &settings, uint32_t timeoutMs) {
   settings_ = &settings;
-  Settings &cfg = settings.get();
+  const Settings &cfg = settings.get();
+  if (cfg.wifiNetworkCount == 0) return false;
 
-  if (settings.hasWifi()) {
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(cfg.wifiSsid, cfg.wifiPass);
-    Serial.printf("Conectando a '%s'...\n", cfg.wifiSsid);
+  WiFi.mode(WIFI_STA);
+  int found = WiFi.scanNetworks();
 
-    uint32_t start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < 12000) {
-      delay(250);
+  // Escaneia uma vez e compara contra TODAS as redes salvas (equivale a
+  // "tentar" cada uma, sem gastar bateria com timeouts de conexao em
+  // redes fora de alcance). A favorita, se estiver por perto, vence
+  // mesmo sem ser a de sinal mais forte.
+  int bestIdx = -1;
+  int bestRssi = -1000;
+  int favoriteIdx = -1;
+  for (int i = 0; i < cfg.wifiNetworkCount; i++) {
+    for (int j = 0; j < found; j++) {
+      if (WiFi.SSID(j) != cfg.wifiSsid[i]) continue;
+      if (WiFi.RSSI(j) > bestRssi) {
+        bestRssi = WiFi.RSSI(j);
+        bestIdx = i;
+      }
+      if (cfg.favoriteWifiSsid[0] != '\0' && strcmp(cfg.wifiSsid[i], cfg.favoriteWifiSsid) == 0) {
+        favoriteIdx = i;
+      }
     }
+  }
+  WiFi.scanDelete();
 
-    if (WiFi.status() == WL_CONNECTED) {
-      mode_ = Mode::Station;
-      Serial.printf("Wi-Fi conectado: %s\n", WiFi.localIP().toString().c_str());
-      startServer();
-      return true;
-    }
-    Serial.println("Falha ao conectar - abrindo portal de configuracao.");
+  int chosen = favoriteIdx >= 0 ? favoriteIdx : bestIdx;
+  if (chosen < 0) {
+    Serial.println("Nenhuma rede salva por perto.");
+    WiFi.mode(WIFI_OFF);
+    return false;
   }
 
-  startApPortal();
-  return false;
+  Serial.printf("Conectando a '%s'%s...\n", cfg.wifiSsid[chosen],
+                chosen == favoriteIdx ? " (favorita)" : "");
+  WiFi.begin(cfg.wifiSsid[chosen], cfg.wifiPass[chosen]);
+
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
+    delay(250);
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Falha ao conectar.");
+    WiFi.mode(WIFI_OFF);
+    mode_ = Mode::Off;
+    return false;
+  }
+
+  mode_ = Mode::Station;
+  Serial.printf("Wi-Fi conectado: %s\n", WiFi.localIP().toString().c_str());
+  startServerOnce();
+  return true;
 }
 
-void WifiManager::startApPortal() {
+void WifiManager::disconnect() {
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  mode_ = Mode::Off;
+  Serial.println("Wi-Fi desligado.");
+}
+
+void WifiManager::startApPortal(SettingsStore &settings) {
+  settings_ = &settings;
+
   uint8_t mac[6];
   WiFi.macAddress(mac);
   char name[24];
@@ -40,16 +80,26 @@ void WifiManager::startApPortal() {
 
   mode_ = Mode::ApPortal;
   Serial.printf("Portal AP '%s' em %s\n", apName_.c_str(), WiFi.softAPIP().toString().c_str());
-  startServer();
+  startServerOnce();
 }
 
-void WifiManager::startServer() {
+void WifiManager::startServerOnce() {
+  if (serverStarted_) return;
   server_.on("/", HTTP_GET, [this]() { handleRoot(); });
   server_.on("/save", HTTP_POST, [this]() { handleSave(); });
   server_.on("/notes", HTTP_GET, [this]() { handleListNotes(); });
   server_.on("/note", HTTP_GET, [this]() { handleGetNote(); });
   server_.begin();
+  serverStarted_ = true;
 }
+
+int WifiManager::scan() {
+  if (mode_ == Mode::Off) WiFi.mode(WIFI_STA);
+  return WiFi.scanNetworks();
+}
+
+String WifiManager::scanSsid(int i) const { return WiFi.SSID(i); }
+int WifiManager::scanRssi(int i) const { return WiFi.RSSI(i); }
 
 // GET /notes - lista em texto simples os arquivos de /notes, um por
 // linha, com tamanho em bytes. Usado pra achar o nome antes de baixar
@@ -101,7 +151,7 @@ void WifiManager::handleRoot() {
   const Settings &cfg = settings_->get();
 
   String html;
-  html.reserve(1600);
+  html.reserve(1800);
   html += F("<!DOCTYPE html><html><head><meta charset='utf-8'>"
              "<meta name='viewport' content='width=device-width,initial-scale=1'>"
              "<title>Gravador de Ideias - Config</title><style>"
@@ -109,12 +159,21 @@ void WifiManager::handleRoot() {
              "input{width:100%;padding:8px;margin:6px 0 14px;box-sizing:border-box}"
              "button{width:100%;padding:10px;background:#222;color:#fff;border:0;border-radius:4px}"
              "h3{margin-top:28px;border-top:1px solid #ccc;padding-top:12px}"
+             "ul{padding-left:18px;margin:4px 0}"
              "</style></head><body><form action='/save' method='POST'>");
 
-  html += F("<h2>Configurar dispositivo</h2><h3>Wi-Fi</h3>"
-             "<label>Rede (SSID)</label><input name='ssid' value='");
-  html += cfg.wifiSsid;
-  html += F("'><label>Senha (deixe em branco p/ manter)</label>"
+  html += F("<h2>Configurar dispositivo</h2><h3>Wi-Fi</h3>");
+  if (cfg.wifiNetworkCount > 0) {
+    html += F("<p>Redes salvas:</p><ul>");
+    for (int i = 0; i < cfg.wifiNetworkCount; i++) {
+      html += "<li>" + String(cfg.wifiSsid[i]) + "</li>";
+    }
+    html += F("</ul>");
+  } else {
+    html += F("<p>Nenhuma rede salva ainda.</p>");
+  }
+  html += F("<label>Adicionar/atualizar rede (SSID)</label><input name='ssid'>"
+             "<label>Senha (deixe em branco p/ manter, se ja existir)</label>"
              "<input name='pass' type='password'>");
 
   html += F("<h3>Transcricao (STT)</h3>"
@@ -147,7 +206,16 @@ void WifiManager::handleSave() {
 
   Settings &cfg = settings_->get();
   if (ssid.length() > 0) {
-    settings_->saveWifi(ssid.c_str(), pass.length() > 0 ? pass.c_str() : cfg.wifiPass);
+    String finalPass = pass;
+    if (finalPass.length() == 0) {
+      for (int i = 0; i < cfg.wifiNetworkCount; i++) {
+        if (ssid == cfg.wifiSsid[i]) {
+          finalPass = cfg.wifiPass[i];
+          break;
+        }
+      }
+    }
+    settings_->saveWifiNetwork(ssid.c_str(), finalPass.c_str());
   }
   settings_->saveStt(sttEndpoint.c_str(), sttModel.c_str(),
                       sttKey.length() > 0 ? sttKey.c_str() : cfg.sttApiKey);
@@ -161,7 +229,7 @@ void WifiManager::handleSave() {
 }
 
 void WifiManager::loop() {
-  server_.handleClient();
+  if (serverStarted_) server_.handleClient();
 }
 
 String WifiManager::statusLine() const {
@@ -171,5 +239,5 @@ String WifiManager::statusLine() const {
   if (mode_ == Mode::ApPortal) {
     return apName_ + " " + WiFi.softAPIP().toString();
   }
-  return "desconectado";
+  return "desligado";
 }

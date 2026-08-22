@@ -21,6 +21,7 @@
 #include "net/wifi_mgr.h"
 #include "net/stt.h"
 #include "net/gdrive.h"
+#include "app/app.h"
 
 static BoardPower power(PIN_EPD_PWR, PIN_AUDIO_PWR, PIN_VBAT_PWR);
 static Rtc rtc;
@@ -34,33 +35,6 @@ static SettingsStore settingsStore;
 static WifiManager wifiMgr;
 static SttClient sttClient;
 static GDriveClient gdrive;
-static char lastTxtPath[48] = "";
-static uint32_t lastActivityMs = 0;
-
-// Sobrevive ao deep sleep (RTC memory) - o wallpaper da tela de
-// descanso fica o mesmo durante todo um periodo de descanso, so muda
-// quando um novo periodo comeca (o usuario mexeu no aparelho e ele
-// voltou a ficar ocioso - ver markActivity()).
-RTC_DATA_ATTR static int rtcWallpaperIndex = -1;
-
-static void markActivity() {
-  lastActivityMs = millis();
-  rtcWallpaperIndex = -1;
-}
-
-// Taxa vem das configuracoes (ajustavel pelo menu) - PCM 16-bit mono,
-// entao bytes/s = taxa * 2. Notas antigas gravadas numa taxa diferente
-// mostram a duracao calculada com a taxa ATUAL, nao a que foi usada na
-// hora (limitacao conhecida - o WAV em si guarda a taxa certa).
-static uint32_t bytesPerSec() { return settingsStore.get().audioSampleRateHz * 2; }
-
-enum class AppState { Idle, Recording, Playing };
-static AppState appState = AppState::Idle;
-
-static int selectedIndex = 0;
-static int noteCount = 0;
-static char currentRecordingPath[48];
-static uint32_t recordingStartMs = 0;
 
 static EPaperPins epdPins = {
   .cs = PIN_EPD_CS, .dc = PIN_EPD_DC, .rst = PIN_EPD_RST, .busy = PIN_EPD_BUSY,
@@ -70,66 +44,25 @@ static EPaperDisplay epd(200, 200, epdPins);
 static Canvas canvas(epd);
 static LockScreen lockScreen(epd, canvas);
 
-static void formatDuration(uint32_t bytes, uint32_t sampleRateHz, char *out, size_t outLen) {
-  uint32_t bps = sampleRateHz > 0 ? sampleRateHz * 2 : bytesPerSec();
-  float secs = bytes / (float)bps;
-  snprintf(out, outLen, "%.0fs", secs);
-}
+// A UI interativa inteira (tela inicial, gravacao, menus, notas,
+// configuracoes) vive na maquina de estados de App - main.cpp so cuida
+// do que roda uma vez no boot (Wi-Fi, pareamento do Drive, NTP) e do
+// caminho do sono (tela de bloqueio, deep sleep), que mexem direto com
+// esp_sleep e ficam fora do loop de botoes do App.
+static App app(epd, canvas, notes, settingsStore, codec, recorder, player, wifiMgr, sttClient,
+               gdrive, rtc);
 
-static void drawIdleScreen() {
-  canvas.clear(EPD_WHITE);
-  canvas.drawRect(0, 0, 200, 200, EPD_BLACK);
-  canvas.drawText(8, 6, "Minhas notas", EPD_BLACK, 1);
+// Sobrevive ao deep sleep (RTC memory) - o wallpaper da tela de
+// descanso fica o mesmo durante todo um periodo de descanso, so muda
+// quando um novo periodo comeca (o usuario mexeu no aparelho e ele
+// voltou a ficar ocioso - ver markActivity()).
+RTC_DATA_ATTR static int rtcWallpaperIndex = -1;
 
-  uint64_t freeB = notes.freeBytes();
-  uint32_t freeSecs = (uint32_t)(freeB / bytesPerSec());
-  char freeLine[32];
-  snprintf(freeLine, sizeof(freeLine), "livre: ~%um%02us", freeSecs / 60, freeSecs % 60);
-  canvas.drawText(8, 16, freeLine, EPD_BLACK, 1);
+static void markActivity() { rtcWallpaperIndex = -1; }
 
-  String wifiLine = wifiMgr.isConnected() ? ("wifi: " + wifiMgr.statusLine())
-                                           : ("config: " + wifiMgr.statusLine());
-  canvas.drawText(8, 26, wifiLine.c_str(), EPD_BLACK, 1);
-  canvas.drawFastHLine(4, 36, 192, EPD_BLACK);
-
-  if (noteCount == 0) {
-    canvas.drawText(8, 44, "Nenhuma nota ainda.", EPD_BLACK, 1);
-    canvas.drawText(8, 56, "Aperte BOOT p/ gravar.", EPD_BLACK, 1);
-  } else {
-    int visible = min(noteCount, 12);
-    for (int i = 0; i < visible; i++) {
-      NoteEntry e;
-      if (!notes.getAt(i, e)) continue;
-      char durBuf[8];
-      formatDuration(e.sizeBytes, e.sampleRateHz, durBuf, sizeof(durBuf));
-
-      char line[32];
-      snprintf(line, sizeof(line), "%c %s %s", i == selectedIndex ? '>' : ' ', e.label, durBuf);
-      canvas.drawText(8, 42 + i * 11, line, EPD_BLACK, 1);
-    }
-  }
-
-  canvas.drawFastHLine(4, 178, 192, EPD_BLACK);
-  canvas.drawText(8, 184, "BOOT grava | PWR nav/toca", EPD_BLACK, 1);
-  epd.displayPart();
-}
-
-static void drawRecordingScreen(uint32_t elapsedSec, uint32_t freeSec) {
-  canvas.clear(EPD_WHITE);
-  canvas.drawRect(0, 0, 200, 200, EPD_BLACK);
-  canvas.drawText(8, 8, "Gravando...", EPD_BLACK, 1);
-  canvas.drawFastHLine(4, 20, 192, EPD_BLACK);
-
-  char line[24];
-  snprintf(line, sizeof(line), "%um%02us", elapsedSec / 60, elapsedSec % 60);
-  canvas.drawText(60, 80, line, EPD_BLACK, 2);
-
-  char freeLine[32];
-  snprintf(freeLine, sizeof(freeLine), "espaco p/ mais %um%02us", freeSec / 60, freeSec % 60);
-  canvas.drawText(8, 130, freeLine, EPD_BLACK, 1);
-
-  canvas.drawText(8, 184, "BOOT para parar", EPD_BLACK, 1);
-  epd.displayPart();
+static void onButtonEvent(BtnId id, BtnAction action) {
+  markActivity();
+  app.onButton(id, action);
 }
 
 static void drawWifiSetupScreen(const String &line1, const String &line2) {
@@ -177,30 +110,6 @@ static void syncRtcFromNtp() {
                 dt.day, dt.hour, dt.minute, dt.second);
 }
 
-// Roda so no boot: tenta conectar ao Wi-Fi salvo; se precisar do portal
-// AP, fica nessa tela ate o usuario configurar pelo celular (o proprio
-// portal reinicia o ESP quando salva) ou apertar BOOT longo para pular
-// e usar o app offline.
-static void runWifiSetup() {
-  buttons.setCallback(onWifiSetupButtonEvent);
-
-  if (wifiMgr.begin(settingsStore)) {
-    syncRtcFromNtp();
-    return; // conectado direto com credenciais salvas
-  }
-
-  String line1 = "Rede: " + wifiMgr.apName();
-  String line2 = "Acesse http://" + WiFi.softAPIP().toString() + " pelo celular";
-  drawWifiSetupScreen(line1, line2);
-
-  while (!g_skipWifiSetup) {
-    wifiMgr.loop();
-    buttons.poll();
-    delay(5);
-  }
-  Serial.println("Configuracao de Wi-Fi pulada - modo offline.");
-}
-
 static void drawDrivePairingScreen(const char *userCode, const char *verificationUrl) {
   canvas.clear(EPD_WHITE);
   canvas.drawRect(0, 0, 200, 200, EPD_BLACK);
@@ -230,138 +139,62 @@ static void runDrivePairingIfNeeded() {
   }
 }
 
-static void refreshNotes() {
-  noteCount = notes.count();
-  if (selectedIndex >= noteCount) selectedIndex = max(0, noteCount - 1);
-}
-
-static void startRecording() {
-  RtcDateTime now;
-  if (!rtc.getDateTime(now)) {
-    now = {2026, 1, 1, 0, 0, 0};
+// Callback que o App chama sob demanda (Sincronizar, menu Wi-Fi) pra
+// ligar o radio, escanear e conectar na rede salva mais forte por
+// perto. Aproveita a conexao pra tambem acertar o relogio via NTP e
+// checar o pareamento do Drive, do jeito que era feito so no boot antes.
+static bool onConnectRequested() {
+  bool ok = wifiMgr.connect(settingsStore);
+  if (ok) {
+    syncRtcFromNtp();
+    runDrivePairingIfNeeded();
   }
-  notes.buildPath(now, currentRecordingPath, sizeof(currentRecordingPath));
+  return ok;
+}
 
-  uint32_t sampleRate = settingsStore.get().audioSampleRateHz;
-  if (!codec.setSampleRate(sampleRate)) {
-    Serial.println("!! ERRO: setSampleRate falhou.");
-    return;
+// Callback que o App chama a partir do menu Wi-Fi ("Portal") pra
+// configurar STT/Drive (campos longos demais pro teclado de 2 botoes)
+// ou cadastrar Wi-Fi pelo celular. Sobe o Access Point, mostra a tela
+// de instrucoes e bloqueia ate BOOT longo (ou ate o portal salvar, que
+// reinicia o ESP sozinho).
+static void onPortalRequested() {
+  g_skipWifiSetup = false;
+  buttons.setCallback(onWifiSetupButtonEvent);
+  wifiMgr.startApPortal(settingsStore);
+
+  String line1 = "Rede: " + wifiMgr.apName();
+  String line2 = "Acesse http://" + WiFi.softAPIP().toString() + " pelo celular";
+  drawWifiSetupScreen(line1, line2);
+
+  while (!g_skipWifiSetup) {
+    wifiMgr.loop();
+    buttons.poll();
+    delay(5);
   }
-  codec.enable(true);
-  codec.setMicGain(settingsStore.get().micGainDb);
-  if (!recorder.start(currentRecordingPath, sampleRate, &codec)) {
-    Serial.println("!! ERRO: Recorder.start falhou.");
-    return;
-  }
-  appState = AppState::Recording;
-  recordingStartMs = millis();
-  drawRecordingScreen(0, (uint32_t)(notes.freeBytes() / bytesPerSec()));
-  Serial.printf("Gravando em %s (%lu Hz)\n", currentRecordingPath, (unsigned long)sampleRate);
+
+  wifiMgr.disconnect();
+  buttons.setCallback(onButtonEvent);
+  Serial.println("Portal de configuracao fechado.");
 }
 
-static void drawTranscribingScreen() {
-  canvas.clear(EPD_WHITE);
-  canvas.drawRect(0, 0, 200, 200, EPD_BLACK);
-  canvas.drawText(8, 8, "Transcrevendo...", EPD_BLACK, 1);
-  canvas.drawFastHLine(4, 20, 192, EPD_BLACK);
-  canvas.drawText(8, 90, "enviando audio para", EPD_BLACK, 1);
-  canvas.drawText(8, 102, "o servico de STT", EPD_BLACK, 1);
-  epd.displayPart();
-}
-
-static void drawTranscriptScreen(const char *text) {
-  canvas.clear(EPD_WHITE);
-  canvas.drawRect(0, 0, 200, 200, EPD_BLACK);
-  canvas.drawText(8, 8, "Nota transcrita:", EPD_BLACK, 1);
-  canvas.drawFastHLine(4, 20, 192, EPD_BLACK);
-  canvas.drawWrappedText(8, 28, text, EPD_BLACK, 1, 30, 10);
-  canvas.drawFastHLine(4, 178, 192, EPD_BLACK);
-  canvas.drawText(8, 184, "BOOT grava | PWR nav/toca", EPD_BLACK, 1);
-  epd.displayPart();
-}
-
-static void drawSyncingScreen() {
-  canvas.clear(EPD_WHITE);
-  canvas.drawRect(0, 0, 200, 200, EPD_BLACK);
-  canvas.drawText(8, 8, "Sincronizando...", EPD_BLACK, 1);
-  canvas.drawFastHLine(4, 20, 192, EPD_BLACK);
-  canvas.drawText(8, 90, "enviando para o", EPD_BLACK, 1);
-  canvas.drawText(8, 102, "Google Drive", EPD_BLACK, 1);
-  epd.displayPart();
-}
-
-// Se houver Wi-Fi e um endpoint de STT configurado, transcreve o WAV e
-// salva o .txt ao lado dele. Silenciosamente pulado sem rede/config -
-// a nota continua salva e reproduzivel normalmente.
-static void transcribeIfPossible(const char *wavPath) {
-  lastTxtPath[0] = '\0';
-
+// Roda so no boot. No uso normal o radio fica desligado (WIFI_OFF) e so
+// liga sob demanda (ver onConnectRequested/onPortalRequested acima) -
+// o portal automatico aqui e so pro PRIMEIRO uso, quando ainda nao ha
+// nenhuma rede nem STT/Drive configurados (sem isso nao haveria como
+// entrar com nada pela primeira vez).
+static void runWifiSetup() {
   const Settings &cfg = settingsStore.get();
-  if (!wifiMgr.isConnected() || cfg.sttEndpoint[0] == '\0') return;
+  bool needsInitialSetup =
+      cfg.wifiNetworkCount == 0 && cfg.sttEndpoint[0] == '\0' && !settingsStore.hasDriveApp();
 
-  drawTranscribingScreen();
-
-  static char textBuf[SttClient::kMaxTextLen];
-  if (!sttClient.transcribe(cfg, wavPath, textBuf, sizeof(textBuf))) {
-    Serial.println("Transcricao falhou, nota continua salva sem .txt.");
+  if (!needsInitialSetup) {
+    WiFi.mode(WIFI_OFF);
+    Serial.println("Wi-Fi desligado - conecta sob demanda (Sincronizar ou menu Wi-Fi).");
     return;
   }
 
-  String txtPath = String(wavPath);
-  txtPath.replace(".wav", ".txt");
-  File f = LittleFS.open(txtPath, FILE_WRITE);
-  if (f) {
-    f.print(textBuf);
-    f.close();
-    strncpy(lastTxtPath, txtPath.c_str(), sizeof(lastTxtPath) - 1);
-  }
-
-  drawTranscriptScreen(textBuf);
-  delay(3000); // da tempo de ler antes de eventualmente voltar pra lista
-}
-
-// Se houver Wi-Fi, sincronizacao automatica ligada e o dispositivo ja
-// pareado com o Drive, sobe o .wav (+ .txt, se a transcricao rolou).
-// Silenciosamente pulado sem rede/pareamento - a nota fica so local.
-static void syncIfPossible(const char *wavPath) {
-  const Settings &cfg = settingsStore.get();
-  if (!wifiMgr.isConnected() || !cfg.autoSyncEnabled || !settingsStore.hasDriveAuth()) return;
-
-  drawSyncingScreen();
-  const char *txtPath = lastTxtPath[0] ? lastTxtPath : nullptr;
-  if (!gdrive.uploadNote(settingsStore, wavPath, txtPath)) {
-    Serial.println("Sincronizacao falhou, nota continua so local.");
-  }
-}
-
-static void stopRecording() {
-  uint32_t bytes = recorder.stop();
-  codec.enable(false);
-  appState = AppState::Idle;
-  Serial.printf("Gravacao parada: %u bytes\n", bytes);
-
-  if (bytes == 0) {
-    LittleFS.remove(currentRecordingPath);
-  } else {
-    transcribeIfPossible(currentRecordingPath);
-    syncIfPossible(currentRecordingPath);
-  }
-  refreshNotes();
-  selectedIndex = 0; // nota mais nova = topo da lista
-  drawIdleScreen();
-}
-
-static void playSelected() {
-  NoteEntry e;
-  if (!notes.getAt(selectedIndex, e)) return;
-
-  Serial.printf("Reproduzindo %s\n", e.path);
-  appState = AppState::Playing;
-  codec.setVolume(20.0f);
-  player.play(codec, e.path);
-  codec.enable(false);
-  appState = AppState::Idle;
-  drawIdleScreen();
+  Serial.println("Primeiro uso: nenhuma rede/config encontrada, abrindo portal.");
+  onPortalRequested();
 }
 
 // Monta o LockScreenStatus com o que der pra ler rapido (RTC + bateria
@@ -375,18 +208,11 @@ static LockScreenStatus buildLockStatus() {
 
   power.vbatOn();
   delay(5); // divisor resistivo estabilizar
-  float vbatVolts = Battery::readVoltage();
   status.batteryPercent = Battery::readPercent();
   power.vbatOff();
 
   status.hasTempHumidity = settingsStore.get().showTempHumidity &&
                             shtc3.read(status.tempC, status.humidity);
-
-  Serial.printf("[lockscreen] rtc_ok=%d %04u-%02u-%02u %02u:%02u  vbat=%.2fV bat=%d%%  "
-                "shtc3_ok=%d temp=%.1fC hum=%.1f%%\n",
-                status.hasTime, now.year, now.month, now.day, now.hour, now.minute,
-                vbatVolts, status.batteryPercent, status.hasTempHumidity, status.tempC,
-                status.humidity);
 
   status.pendingSyncCount = notes.countPendingSync();
   return status;
@@ -448,27 +274,6 @@ static void runLockScreenRefreshAndSleep() {
   esp_deep_sleep_start();
 }
 
-static void onButtonEvent(BtnId id, BtnAction action) {
-  markActivity();
-
-  if (id == BtnId::Boot && action == BtnAction::ShortClick) {
-    if (appState == AppState::Idle) {
-      startRecording();
-    } else if (appState == AppState::Recording) {
-      stopRecording();
-    }
-  } else if (id == BtnId::Pwr && appState == AppState::Idle) {
-    if (action == BtnAction::ShortClick) {
-      if (noteCount > 0) {
-        selectedIndex = (selectedIndex + 1) % noteCount;
-        drawIdleScreen();
-      }
-    } else if (action == BtnAction::LongPress) {
-      if (noteCount > 0) playSelected();
-    }
-  }
-}
-
 void setup() {
   // Wake por timer (relogio da tela de bloqueio, a cada poucos minutos)
   // usa um caminho bem mais curto - so I2C+e-paper, sem WiFi/codec/
@@ -481,7 +286,7 @@ void setup() {
   Serial.begin(115200);
   delay(2000);
   Serial.println("=================================");
-  Serial.println("Fase 3 - Notas e UI");
+  Serial.println("Fase 4 - Menus e arquivos");
   Serial.println("=================================");
 
   if (!LittleFS.begin(true)) {
@@ -496,6 +301,7 @@ void setup() {
   if (!rtc.begin(PIN_I2C_SDA, PIN_I2C_SCL)) {
     Serial.println("!! AVISO: RTC PCF85063 nao respondeu no I2C.");
   }
+  shtc3.begin(PIN_I2C_SDA, PIN_I2C_SCL);
 
   epd.init();
   epd.clear();
@@ -513,35 +319,12 @@ void setup() {
   runDrivePairingIfNeeded();
   buttons.setCallback(onButtonEvent);
 
-  refreshNotes();
-  drawIdleScreen();
-  markActivity();
-  Serial.printf("%d nota(s) encontradas. Pronto.\n", noteCount);
+  app.begin(enterScreensaver, onConnectRequested, onPortalRequested);
+  Serial.printf("%d nota(s) encontradas. Pronto.\n", notes.count());
 }
 
 void loop() {
   buttons.poll();
   wifiMgr.loop();
-
-  if (appState == AppState::Recording) {
-    // A captura roda em tasks proprias (ver audio/recorder.cpp) - o
-    // loop() so cuida da UI, sem competir pelo tempo do I2S.
-    static uint32_t lastUiUpdate = 0;
-    uint32_t now = millis();
-    if (now - lastUiUpdate >= 1000) {
-      lastUiUpdate = now;
-      uint32_t elapsedSec = (now - recordingStartMs) / 1000;
-      uint32_t freeSec = (uint32_t)(notes.freeBytes() / bytesPerSec());
-      drawRecordingScreen(elapsedSec, freeSec);
-      if (recorder.overflowCount() > 0) {
-        Serial.printf("!! AVISO: %lu overflow(s) no ring buffer de audio\n",
-                      (unsigned long)recorder.overflowCount());
-      }
-    }
-  } else if (appState == AppState::Idle) {
-    uint32_t timeoutMs = settingsStore.get().screensaverTimeoutSec * 1000UL;
-    if (millis() - lastActivityMs >= timeoutMs) {
-      enterScreensaver(); // nao retorna - entra em deep sleep
-    }
-  }
+  app.loop();
 }

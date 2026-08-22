@@ -94,6 +94,35 @@ int NotesStore::countPendingSync() {
   return pending;
 }
 
+bool NotesStore::deleteAt(int index) {
+  rescan();
+  if (index < 0 || index >= g_cacheCount) return false;
+
+  String wavPath = String(g_cache[index].path);
+  String txtPath = wavPath; txtPath.replace(".wav", ".txt");
+  String sncPath = wavPath; sncPath.replace(".wav", ".snc");
+
+  bool ok = LittleFS.remove(wavPath);
+  if (LittleFS.exists(txtPath)) LittleFS.remove(txtPath);
+  if (LittleFS.exists(sncPath)) LittleFS.remove(sncPath);
+  return ok;
+}
+
+int NotesStore::deleteAll() {
+  rescan();
+  int removed = 0;
+  for (int i = 0; i < g_cacheCount; i++) {
+    String wavPath = String(g_cache[i].path);
+    String txtPath = wavPath; txtPath.replace(".wav", ".txt");
+    String sncPath = wavPath; sncPath.replace(".wav", ".snc");
+    if (LittleFS.remove(wavPath)) removed++;
+    if (LittleFS.exists(txtPath)) LittleFS.remove(txtPath);
+    if (LittleFS.exists(sncPath)) LittleFS.remove(sncPath);
+  }
+  g_cacheCount = 0;
+  return removed;
+}
+
 uint64_t NotesStore::totalBytes() { return LittleFS.totalBytes(); }
 uint64_t NotesStore::usedBytes() { return LittleFS.usedBytes(); }
 uint64_t NotesStore::freeBytes() { return LittleFS.totalBytes() - LittleFS.usedBytes(); }

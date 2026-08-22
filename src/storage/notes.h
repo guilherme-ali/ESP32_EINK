@@ -29,6 +29,14 @@ public:
   // depois de um upload bem-sucedido.
   int countPendingSync();
 
+  // Remove o .wav do indice e os irmaos .txt/.snc, se existirem.
+  bool deleteAt(int index);
+
+  // Remove TODAS as notas em /notes (.wav, .txt, .snc). Usado pelo item
+  // "Apagar todas as notas" do menu de configuracoes, com confirmacao
+  // dupla na UI antes de chamar isso.
+  int deleteAll();
+
   uint64_t totalBytes();
   uint64_t usedBytes();
   uint64_t freeBytes();

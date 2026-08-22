@@ -50,8 +50,16 @@ EPaperDisplay::EPaperDisplay(int width, int height, const EPaperPins &pins)
     : pins_(pins), width_(width), height_(height), bufferLen_(width * height / 8) {
   spiPortInit();
   spiGpioInit();
-  buffer_ = (uint8_t *)heap_caps_malloc(bufferLen_, MALLOC_CAP_SPIRAM);
+  // RAM interna (nao PSRAM): sao so 5000 bytes e o buffer leva milhares
+  // de read-modify-write por tela desenhada (Canvas::drawPixel) - RAM
+  // interna e bem mais rapida pra isso que PSRAM, e sobra espaco (o
+  // build usa ~22% dos 320KB). MALLOC_CAP_DMA garante que o SPI consiga
+  // fazer DMA direto do buffer sem copia intermediaria.
+  buffer_ = (uint8_t *)heap_caps_malloc(bufferLen_, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
   assert(buffer_);
+  shadow_ = (uint8_t *)heap_caps_malloc(bufferLen_, MALLOC_CAP_INTERNAL);
+  assert(shadow_);
+  memset(shadow_, 0, bufferLen_);
 }
 
 void EPaperDisplay::spiGpioInit() {
@@ -229,6 +237,7 @@ void EPaperDisplay::display() {
   sendCommand(0x24);
   writeBytes(buffer_, bufferLen_);
   turnOnDisplay();
+  memcpy(shadow_, buffer_, bufferLen_);
 }
 
 void EPaperDisplay::displayPartBaseImage() {
@@ -237,6 +246,7 @@ void EPaperDisplay::displayPartBaseImage() {
   sendCommand(0x26);
   writeBytes(buffer_, bufferLen_);
   turnOnDisplay();
+  memcpy(shadow_, buffer_, bufferLen_);
 }
 
 void EPaperDisplay::initPartial() {
@@ -271,10 +281,21 @@ void EPaperDisplay::initPartial() {
   readBusy();
 }
 
+// A janela reduzida (setWindows/setCursor por faixa de linhas) foi
+// tentada e revertida: duas convencoes de mapeamento Y foram testadas
+// na placa (direta e invertida, essa ultima batendo com o data entry
+// mode 0x01 usado em init()) e as duas corromperam a tela - sem a
+// documentacao exata do SSD1681 em maos, virou tentativa as cegas.
+// Fica so o pulo do refresh quando nada mudou desde o ultimo frame
+// (ver shadow_ abaixo) - sem risco visual, ainda um ganho real quando
+// uma tecla nao muda nada (ex: apertar BOOT numa tela ja atualizada).
 void EPaperDisplay::displayPart() {
+  if (memcmp(buffer_, shadow_, bufferLen_) == 0) return; // identico ao ultimo frame - sem refresh
+
   sendCommand(0x24);
   writeBytes(buffer_, bufferLen_);
   turnOnDisplayPart();
+  memcpy(shadow_, buffer_, bufferLen_);
 }
 
 void EPaperDisplay::drawPixel(uint16_t x, uint16_t y, uint8_t color) {

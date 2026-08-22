@@ -51,6 +51,13 @@ private:
   spi_device_handle_t spi_ = nullptr;
   uint8_t *buffer_ = nullptr;
 
+  // Ultimo frame de fato enviado ao painel - displayPart() compara
+  // buffer_ contra isto e pula o refresh inteiro quando nada mudou.
+  // Perdido a cada boot/wake (RAM comum, nao RTC_DATA_ATTR) - tudo bem,
+  // o primeiro desenho depois de acordar sempre difere (nao sabemos o
+  // que estava fisicamente na tela) e manda o refresh normalmente.
+  uint8_t *shadow_ = nullptr;
+
   void spiGpioInit();
   void spiPortInit();
   void readBusy();

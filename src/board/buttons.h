@@ -10,9 +10,7 @@ enum class BtnId : uint8_t { Boot = 1, Pwr = 2 };
 enum class BtnAction : uint8_t {
   None,
   ShortClick,
-  DoubleClick,
   LongPress,
-  Released,
 };
 
 using ButtonEventFn = void (*)(BtnId id, BtnAction action);
@@ -27,6 +25,11 @@ public:
   // a lista ligada da multi_button. Usado para alternar entre a tela de
   // configuracao de Wi-Fi (so boot) e o app normal.
   void setCallback(ButtonEventFn onEvent);
+
+  // true se BOOT ou PWR estao fisicamente pressionados agora. main.cpp
+  // usa isto pra nao entrar em light sleep com um botao em andamento -
+  // a deteccao de long press depende do polling de 5ms continuar.
+  bool anyPressed();
 
 private:
   Button boot_{};

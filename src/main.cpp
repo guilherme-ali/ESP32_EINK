@@ -218,6 +218,26 @@ static LockScreenStatus buildLockStatus() {
   return status;
 }
 
+// Trava os 3 rails de energia (EPD/AUDIO/VBAT) no estado atual durante
+// o deep sleep. Sem isso nada garante que o pino continua no "off" que
+// acabamos de escrever - GPIOs comuns podem flutuar durante o sono e
+// isso poderia reenergizar EPD/audio por horas de standby. O
+// gpio_hold_dis() correspondente fica no inicio do setup(), antes de
+// qualquer power.XOn()/XOff() - sem ele a tela nunca mais ligaria.
+static void holdPowerRailsAndSleep() {
+  gpio_hold_en((gpio_num_t)PIN_EPD_PWR);
+  gpio_hold_en((gpio_num_t)PIN_AUDIO_PWR);
+  gpio_hold_en((gpio_num_t)PIN_VBAT_PWR);
+  gpio_deep_sleep_hold_en();
+
+  // So os dominios que sabemos que nao precisamos - RTC_SLOW_MEM fica
+  // ligado no default (guarda os RTC_DATA_ATTR, ex. rtcWallpaperIndex).
+  esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_FAST_MEM, ESP_PD_OPTION_OFF);
+  esp_sleep_pd_config(ESP_PD_DOMAIN_XTAL, ESP_PD_OPTION_OFF);
+
+  esp_deep_sleep_start();
+}
+
 // Desenha a tela de bloqueio (wallpaper sorteado uma vez por periodo de
 // descanso + cartao com hora/bateria/sensores) e desliga a alimentacao
 // do e-paper - o painel e biestavel, entao a imagem fica visivel sem
@@ -246,8 +266,14 @@ static void enterScreensaver() {
   if (refreshSec > 0) {
     esp_sleep_enable_timer_wakeup((uint64_t)refreshSec * 1000000ULL);
   }
-  esp_deep_sleep_start();
+  holdPowerRailsAndSleep();
 }
+
+// Quantos wakes por timer seguidos usam a LUT parcial (mais rapida)
+// antes de forcar um refresh completo pra limpar fantasma acumulado -
+// ~1x/hora no intervalo padrao de 5 minutos.
+constexpr int kLockFullRefreshEvery = 12;
+RTC_DATA_ATTR static int lockPartialRefreshCount = 0;
 
 // So roda quando o wake foi por timer (relogio da tela de bloqueio) -
 // religa o minimo (I2C + e-paper), redesenha e volta a dormir sem tocar
@@ -262,8 +288,20 @@ static void runLockScreenRefreshAndSleep() {
   notes.begin();
 
   epd.init();
-  lockScreen.draw(rtcWallpaperIndex, buildLockStatus());
+  // A LUT parcial e bem mais rapida que a cheia (menos ciclos de
+  // waveform) - o painel perde a RAM com a energia cortada de qualquer
+  // jeito, entao o frame inteiro precisa ser reenviado, mas nao precisa
+  // ser com a LUT lenta. Uma passada cheia de vez em quando limpa
+  // fantasma acumulado (mesmo padrao init()->initPartial() do boot).
+  bool fullRefresh = (++lockPartialRefreshCount >= kLockFullRefreshEvery);
+  if (fullRefresh) {
+    lockPartialRefreshCount = 0;
+  } else {
+    epd.initPartial();
+  }
+  lockScreen.draw(rtcWallpaperIndex, buildLockStatus(), fullRefresh);
   power.epdOff();
+  power.audioOff(); // reafirma - este caminho nunca liga audio, mas o hold (Fase 4a) so cobre o estado que escrevemos aqui
 
   esp_sleep_enable_ext1_wakeup((1ULL << PIN_BTN_BOOT) | (1ULL << PIN_BTN_PWR),
                                 ESP_EXT1_WAKEUP_ANY_LOW);
@@ -271,10 +309,21 @@ static void runLockScreenRefreshAndSleep() {
   if (refreshSec > 0) {
     esp_sleep_enable_timer_wakeup((uint64_t)refreshSec * 1000000ULL);
   }
-  esp_deep_sleep_start();
+  holdPowerRailsAndSleep();
 }
 
 void setup() {
+  // Libera o hold dos rails de energia (ver holdPowerRailsAndSleep())
+  // do sono anterior, se houver - tem que ser ANTES de qualquer outra
+  // coisa, inclusive do desvio do wake por timer logo abaixo (que liga
+  // o e-paper na primeira linha). Sem isso os pinos continuam travados
+  // e power.epdOn()/audioOn() nao tem efeito nenhum. Seguro num boot a
+  // frio tambem - liberar um hold que nunca existiu e um no-op.
+  gpio_hold_dis((gpio_num_t)PIN_EPD_PWR);
+  gpio_hold_dis((gpio_num_t)PIN_AUDIO_PWR);
+  gpio_hold_dis((gpio_num_t)PIN_VBAT_PWR);
+  gpio_deep_sleep_hold_dis();
+
   // Wake por timer (relogio da tela de bloqueio, a cada poucos minutos)
   // usa um caminho bem mais curto - so I2C+e-paper, sem WiFi/codec/
   // botoes - pra gastar o minimo de bateria possivel. Precisa ser a
@@ -314,6 +363,15 @@ void setup() {
 
   buttons.begin(PIN_BTN_BOOT, PIN_BTN_PWR, onButtonEvent);
 
+  // Fonte de wake do light sleep usado no loop() abaixo, pra economizar
+  // bateria parado num menu esperando o proximo clique (240MHz girando
+  // a toa sem isso). Diferente do ext1 usado no deep sleep - convive
+  // sem conflito, e so precisa ser armada uma vez (persiste entre
+  // chamadas de esp_light_sleep_start()).
+  esp_sleep_enable_gpio_wakeup();
+  gpio_wakeup_enable((gpio_num_t)PIN_BTN_BOOT, GPIO_INTR_LOW_LEVEL);
+  gpio_wakeup_enable((gpio_num_t)PIN_BTN_PWR, GPIO_INTR_LOW_LEVEL);
+
   settingsStore.begin();
   runWifiSetup();
   runDrivePairingIfNeeded();
@@ -327,4 +385,15 @@ void loop() {
   buttons.poll();
   wifiMgr.loop();
   app.loop();
+
+  // Light sleep entre eventos: nunca durante a gravacao (as tasks de
+  // audio no core 0 seriam pausadas junto, ver App::canLightSleep()) e
+  // nunca com um botao fisicamente pressionado (a deteccao de long
+  // press depende do polling continuo de 5ms - ver Buttons::anyPressed()).
+  // O timer de 200ms existe so pra continuar reavaliando o timeout de
+  // inatividade da tela mesmo sem nenhum clique.
+  if (settingsStore.get().powerSavingEnabled && app.canLightSleep() && !buttons.anyPressed()) {
+    esp_sleep_enable_timer_wakeup(200000);
+    esp_light_sleep_start();
+  }
 }

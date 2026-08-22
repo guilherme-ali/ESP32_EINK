@@ -37,6 +37,11 @@ struct Settings {
   uint16_t lockRefreshSec = 300; // intervalo do relogio na tela de bloqueio
   int8_t wallpaperChoice = -1;   // -1 = sorteia a cada vez que dorme; N = fixo
   bool showTempHumidity = true;
+
+  // Light sleep entre eventos enquanto acordado fora da gravacao (ver
+  // main.cpp loop()). Desligar so serve pra depurar pelo cabo USB - o
+  // light sleep derruba/reconecta o CDC e atrapalha o monitor serial.
+  bool powerSavingEnabled = true;
 };
 
 class SettingsStore {
@@ -61,6 +66,7 @@ public:
   bool saveLockRefresh(uint16_t seconds);
   bool saveWallpaperChoice(int8_t choice);
   bool saveShowTempHumidity(bool enabled);
+  bool savePowerSaving(bool enabled);
   bool hasWifi() const { return settings_.wifiNetworkCount > 0; }
   bool hasDriveApp() const { return settings_.driveClientId[0] != '\0'; }
   bool hasDriveAuth() const { return settings_.driveRefreshToken[0] != '\0'; }

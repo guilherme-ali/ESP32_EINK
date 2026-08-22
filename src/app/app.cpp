@@ -54,6 +54,7 @@ enum SettingsIdx {
   kSetWallpaper,
   kSetShowTemp,
   kSetAutoSync,
+  kSetPowerSaving,
   kSetDeleteAll,
   kSetBack,
   kSettingsItemCount
@@ -214,17 +215,12 @@ void App::drawNoteDetail() {
     return;
   }
 
-  String txtPath = String(e.path); txtPath.replace(".wav", ".txt");
-  String sncPath = String(e.path); sncPath.replace(".wav", ".snc");
-
   MenuItem items[kNoteDetailCount];
   setItem(items[kNdPlay], "Reproduzir");
   setItem(items[kNdTranscript], "Ver transcricao");
-  setVal(items[kNdTranscript].value, sizeof(items[kNdTranscript].value),
-         LittleFS.exists(txtPath) ? "ok" : "sem");
+  setVal(items[kNdTranscript].value, sizeof(items[kNdTranscript].value), e.hasTxt ? "ok" : "sem");
   setItem(items[kNdSync], "Sincronizar esta");
-  setVal(items[kNdSync].value, sizeof(items[kNdSync].value),
-         LittleFS.exists(sncPath) ? "enviada" : "pendente");
+  setVal(items[kNdSync].value, sizeof(items[kNdSync].value), e.hasSnc ? "enviada" : "pendente");
   setItem(items[kNdDelete], "Apagar");
   setItem(items[kNdBack], "Voltar");
 
@@ -268,6 +264,10 @@ void App::drawSettings() {
   setItem(items[kSetAutoSync], "Sincr. ao gravar");
   setVal(items[kSetAutoSync].value, sizeof(items[kSetAutoSync].value),
          cfg.autoSyncEnabled ? "sim" : "nao");
+
+  setItem(items[kSetPowerSaving], "Economia de energia");
+  setVal(items[kSetPowerSaving].value, sizeof(items[kSetPowerSaving].value),
+         cfg.powerSavingEnabled ? "sim" : "nao");
 
   setItem(items[kSetDeleteAll], "Apagar todas notas");
   setItem(items[kSetBack], "Voltar");
@@ -358,12 +358,15 @@ void App::stopRecording() {
 
   if (bytes == 0) {
     LittleFS.remove(currentRecordingPath_);
-  } else if (settingsStore_.get().autoSyncEnabled) {
-    // Com o toggle desligado (padrao), a nota fica so local ate o
-    // usuario apertar "Sincronizar" - nem a transcricao roda aqui,
-    // exatamente para nao depender de Wi-Fi logo apos gravar.
-    transcribeIfPossible(currentRecordingPath_);
-    syncIfPossible(currentRecordingPath_);
+  } else {
+    notes_.markDirty(); // nota nova no disco - refaz a varredura na proxima leitura
+    if (settingsStore_.get().autoSyncEnabled) {
+      // Com o toggle desligado (padrao), a nota fica so local ate o
+      // usuario apertar "Sincronizar" - nem a transcricao roda aqui,
+      // exatamente para nao depender de Wi-Fi logo apos gravar.
+      transcribeIfPossible(currentRecordingPath_);
+      syncIfPossible(currentRecordingPath_);
+    }
   }
   goHome();
 }
@@ -419,6 +422,7 @@ void App::transcribeIfPossible(const char *wavPath) {
     f.print(textBuf);
     f.close();
     strncpy(lastTxtPath_, txtPath.c_str(), sizeof(lastTxtPath_) - 1);
+    notes_.markDirty();
   }
 
   Screens::drawText(canvas_, epd_, "Nota transcrita:", textBuf, "BOOT grava | PWR menu");
@@ -434,6 +438,7 @@ void App::syncIfPossible(const char *wavPath) {
   if (!gdrive_.uploadNote(settingsStore_, wavPath, txtPath)) {
     Serial.println("Sincronizacao falhou, nota continua so local.");
   }
+  notes_.markDirty(); // uploadNote() cria o .snc quando da certo
 }
 
 void App::syncOneNote(int index) {
@@ -456,6 +461,7 @@ void App::syncOneNote(int index) {
   bool hasTxt = LittleFS.exists(txtPath);
   bool ok = settingsStore_.hasDriveAuth() &&
             gdrive_.uploadNote(settingsStore_, e.path, hasTxt ? txtPath.c_str() : nullptr);
+  notes_.markDirty();
 
   if (wasOffline) wifiMgr_.disconnect();
 
@@ -518,6 +524,7 @@ void App::runManualSync() {
     }
   }
 
+  notes_.markDirty();
   if (wasOffline) wifiMgr_.disconnect();
   Screens::drawSyncSummary(canvas_, epd_, transcribed, uploaded, failed, pendingTotal);
 }
@@ -790,6 +797,9 @@ void App::onButtonSettings(BtnId id, BtnAction action) {
       break;
     case kSetAutoSync:
       settingsStore_.saveAutoSync(!cfg.autoSyncEnabled);
+      break;
+    case kSetPowerSaving:
+      settingsStore_.savePowerSaving(!cfg.powerSavingEnabled);
       break;
     case kSetDeleteAll: {
       confirmDeleteAllStep_ = 0;

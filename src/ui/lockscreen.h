@@ -23,7 +23,11 @@ public:
   LockScreen(EPaperDisplay &epd, Canvas &canvas) : epd_(epd), canvas_(canvas) {}
 
   // wallpaperIndex < 0 -> so o cartao, sem ilustracao de fundo.
-  void draw(int wallpaperIndex, const LockScreenStatus &status);
+  // fullRefresh=true usa a LUT cheia (mais lento, sem fantasma) - usado
+  // ao entrar no sono. fullRefresh=false usa a LUT parcial (mais
+  // rapido) para os wakes periodicos do relogio, que o chamador ja
+  // preparou com initPartial() antes de chamar isto.
+  void draw(int wallpaperIndex, const LockScreenStatus &status, bool fullRefresh = true);
 
 private:
   EPaperDisplay &epd_;

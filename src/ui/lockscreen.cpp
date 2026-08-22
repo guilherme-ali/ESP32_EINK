@@ -11,7 +11,7 @@ constexpr int kCardY = 70;
 constexpr int kCardH = 62;
 } // namespace
 
-void LockScreen::draw(int wallpaperIndex, const LockScreenStatus &status) {
+void LockScreen::draw(int wallpaperIndex, const LockScreenStatus &status, bool fullRefresh) {
   if (wallpaperIndex >= 0 && wallpaperIndex < WALLPAPER_COUNT) {
     memcpy_P(epd_.buffer(), WALLPAPERS[wallpaperIndex], epd_.bufferLen());
   } else {
@@ -51,8 +51,16 @@ void LockScreen::draw(int wallpaperIndex, const LockScreenStatus &status) {
   int lineW = Canvas::textWidth(line, 1);
   canvas_.drawText((200 - lineW) / 2, kCardY + 46, line, EPD_BLACK, 1);
 
-  // Refresh completo - a tela de bloqueio redesenha a cada poucos
-  // minutos por muito tempo seguido, entao vale gastar o "flash" pra
-  // nao acumular fantasma de refresh parcial.
-  epd_.display();
+  if (fullRefresh) {
+    // LUT cheia - usado ao entrar no sono (raro, vale o "flash" extra
+    // pra nao acumular fantasma).
+    epd_.display();
+  } else {
+    // LUT parcial - os wakes periodicos do relogio (a cada poucos
+    // minutos, por horas) sao bem mais frequentes que a entrada no
+    // sono; o chamador forca uma passada com fullRefresh=true de vez
+    // em quando pra limpar fantasma acumulado (ver kLockFullRefreshEvery
+    // em main.cpp).
+    epd_.displayPart();
+  }
 }

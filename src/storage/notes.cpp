@@ -9,11 +9,13 @@ constexpr int kMaxNotes = 128;
 
 NoteEntry g_cache[kMaxNotes];
 int g_cacheCount = 0;
+bool g_dirty = true; // forca a primeira varredura
 
-// Escaneia /notes toda vez (poucas dezenas de arquivos, cabe no
-// orcamento de flash de audio sem compressao) e ordena do mais novo
-// para o mais antigo - o nome do arquivo e o timestamp, entao ordenar
-// a string basta.
+// Escaneia /notes (poucas dezenas de arquivos, cabe no orcamento de
+// flash de audio sem compressao) e ordena do mais novo para o mais
+// antigo - o nome do arquivo e o timestamp, entao ordenar a string
+// basta. So roda quando g_dirty (ver rescanIfDirty()) - navegar o menu
+// nao mexe em /notes, entao nao precisa reler o diretorio a cada tecla.
 void rescan() {
   g_cacheCount = 0;
   File dir = LittleFS.open(kNotesDir);
@@ -33,6 +35,8 @@ void rescan() {
         char *dot = strchr(e.label, '.');
         if (dot) *dot = '\0';
         e.sizeBytes = f.size();
+        e.hasTxt = false;
+        e.hasSnc = false;
 
         WavHeader hdr;
         e.sampleRateHz = (f.size() >= sizeof(hdr) && f.read((uint8_t *)&hdr, sizeof(hdr)) == sizeof(hdr))
@@ -43,6 +47,36 @@ void rescan() {
       }
     }
     f = dir.openNextFile();
+  }
+
+  // Segunda passagem pela mesma pasta - so metadados de diretorio (sem
+  // abrir/ler conteudo), pra marcar quais .wav ja tem .txt/.snc do
+  // lado. Substitui um LittleFS.exists() por nota (medido em ~13ms
+  // cada nesta flash) por comparacoes de string em memoria.
+  File dir2 = LittleFS.open(kNotesDir);
+  if (dir2 && dir2.isDirectory()) {
+    File f2 = dir2.openNextFile();
+    while (f2) {
+      if (!f2.isDirectory()) {
+        String name = f2.name();
+        int slash = name.lastIndexOf('/');
+        String base = slash >= 0 ? name.substring(slash + 1) : name;
+        bool isTxt = base.endsWith(".txt");
+        bool isSnc = base.endsWith(".snc");
+        if (isTxt || isSnc) {
+          int dot = base.lastIndexOf('.');
+          String label = dot >= 0 ? base.substring(0, dot) : base;
+          for (int i = 0; i < g_cacheCount; i++) {
+            if (label == g_cache[i].label) {
+              if (isTxt) g_cache[i].hasTxt = true;
+              else g_cache[i].hasSnc = true;
+              break;
+            }
+          }
+        }
+      }
+      f2 = dir2.openNextFile();
+    }
   }
 
   // insertion sort descendente por label (timestamp) - poucas dezenas
@@ -56,6 +90,12 @@ void rescan() {
     }
     g_cache[j + 1] = key;
   }
+}
+
+void rescanIfDirty() {
+  if (!g_dirty) return;
+  rescan();
+  g_dirty = false;
 }
 } // namespace
 
@@ -73,7 +113,7 @@ void NotesStore::buildPath(const RtcDateTime &now, char *outPath, size_t outLen)
 }
 
 int NotesStore::count() {
-  rescan();
+  rescanIfDirty();
   return g_cacheCount;
 }
 
@@ -84,18 +124,16 @@ bool NotesStore::getAt(int index, NoteEntry &out) {
 }
 
 int NotesStore::countPendingSync() {
-  rescan();
+  rescanIfDirty();
   int pending = 0;
   for (int i = 0; i < g_cacheCount; i++) {
-    String sncPath = String(g_cache[i].path);
-    sncPath.replace(".wav", ".snc");
-    if (!LittleFS.exists(sncPath)) pending++;
+    if (!g_cache[i].hasSnc) pending++;
   }
   return pending;
 }
 
 bool NotesStore::deleteAt(int index) {
-  rescan();
+  rescanIfDirty();
   if (index < 0 || index >= g_cacheCount) return false;
 
   String wavPath = String(g_cache[index].path);
@@ -103,25 +141,29 @@ bool NotesStore::deleteAt(int index) {
   String sncPath = wavPath; sncPath.replace(".wav", ".snc");
 
   bool ok = LittleFS.remove(wavPath);
-  if (LittleFS.exists(txtPath)) LittleFS.remove(txtPath);
-  if (LittleFS.exists(sncPath)) LittleFS.remove(sncPath);
+  if (g_cache[index].hasTxt) LittleFS.remove(txtPath);
+  if (g_cache[index].hasSnc) LittleFS.remove(sncPath);
+  g_dirty = true;
   return ok;
 }
 
 int NotesStore::deleteAll() {
-  rescan();
+  rescanIfDirty();
   int removed = 0;
   for (int i = 0; i < g_cacheCount; i++) {
     String wavPath = String(g_cache[i].path);
     String txtPath = wavPath; txtPath.replace(".wav", ".txt");
     String sncPath = wavPath; sncPath.replace(".wav", ".snc");
     if (LittleFS.remove(wavPath)) removed++;
-    if (LittleFS.exists(txtPath)) LittleFS.remove(txtPath);
-    if (LittleFS.exists(sncPath)) LittleFS.remove(sncPath);
+    if (g_cache[i].hasTxt) LittleFS.remove(txtPath);
+    if (g_cache[i].hasSnc) LittleFS.remove(sncPath);
   }
   g_cacheCount = 0;
+  g_dirty = true;
   return removed;
 }
+
+void NotesStore::markDirty() { g_dirty = true; }
 
 uint64_t NotesStore::totalBytes() { return LittleFS.totalBytes(); }
 uint64_t NotesStore::usedBytes() { return LittleFS.usedBytes(); }

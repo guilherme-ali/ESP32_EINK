@@ -12,6 +12,8 @@ struct NoteEntry {
   uint32_t sizeBytes;
   uint32_t sampleRateHz; // lido do cabecalho WAV - notas antigas podem
                           // ter sido gravadas numa taxa diferente da atual
+  bool hasTxt; // tem NOME.txt (transcrita) do lado
+  bool hasSnc; // tem NOME.snc (ja enviada ao Drive) do lado
 };
 
 class NotesStore {
@@ -36,6 +38,12 @@ public:
   // "Apagar todas as notas" do menu de configuracoes, com confirmacao
   // dupla na UI antes de chamar isso.
   int deleteAll();
+
+  // Chamar sempre que algo fora desta classe mexer em /notes por baixo
+  // dos panos (gravar uma nota nova, criar um .txt/.snc na sincronizacao)
+  // - a proxima leitura (count/getAt/countPendingSync) refaz a varredura.
+  // Sem isso, count()/getAt() ficam servindo o cache antigo indefinidamente.
+  void markDirty();
 
   uint64_t totalBytes();
   uint64_t usedBytes();

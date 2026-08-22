@@ -25,6 +25,8 @@ void SettingsStore::load() {
   prefs.getString("driveFolder", settings_.driveFolderId, sizeof(settings_.driveFolderId));
   settings_.autoSyncEnabled = prefs.getBool("autoSync", true);
   settings_.screensaverTimeoutSec = prefs.getUShort("ssTimeout", 120);
+  settings_.audioSampleRateHz = prefs.getUInt("sampleRate", 16000);
+  settings_.micGainDb = prefs.getFloat("micGain", 24.0f);
 }
 
 bool SettingsStore::saveWifi(const char *ssid, const char *pass) {
@@ -62,5 +64,25 @@ bool SettingsStore::saveDriveRefreshToken(const char *refreshToken) {
 bool SettingsStore::saveDriveFolderId(const char *folderId) {
   strncpy(settings_.driveFolderId, folderId, sizeof(settings_.driveFolderId) - 1);
   prefs.putString("driveFolder", settings_.driveFolderId);
+  return true;
+}
+
+bool SettingsStore::saveAudio(uint32_t sampleRateHz, float micGainDb) {
+  settings_.audioSampleRateHz = sampleRateHz;
+  settings_.micGainDb = micGainDb;
+  prefs.putUInt("sampleRate", sampleRateHz);
+  prefs.putFloat("micGain", micGainDb);
+  return true;
+}
+
+bool SettingsStore::saveScreensaverTimeout(uint16_t seconds) {
+  settings_.screensaverTimeoutSec = seconds;
+  prefs.putUShort("ssTimeout", seconds);
+  return true;
+}
+
+bool SettingsStore::saveAutoSync(bool enabled) {
+  settings_.autoSyncEnabled = enabled;
+  prefs.putBool("autoSync", enabled);
   return true;
 }

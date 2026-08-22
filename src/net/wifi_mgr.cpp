@@ -1,4 +1,5 @@
 #include "wifi_mgr.h"
+#include <LittleFS.h>
 
 bool WifiManager::begin(SettingsStore &settings) {
   settings_ = &settings;
@@ -45,7 +46,55 @@ void WifiManager::startApPortal() {
 void WifiManager::startServer() {
   server_.on("/", HTTP_GET, [this]() { handleRoot(); });
   server_.on("/save", HTTP_POST, [this]() { handleSave(); });
+  server_.on("/notes", HTTP_GET, [this]() { handleListNotes(); });
+  server_.on("/note", HTTP_GET, [this]() { handleGetNote(); });
   server_.begin();
+}
+
+// GET /notes - lista em texto simples os arquivos de /notes, um por
+// linha, com tamanho em bytes. Usado pra achar o nome antes de baixar
+// com /note?name=... (nao existe UI pra isso - e ferramenta de debug).
+void WifiManager::handleListNotes() {
+  File dir = LittleFS.open("/notes");
+  if (!dir || !dir.isDirectory()) {
+    server_.send(404, "text/plain", "sem /notes");
+    return;
+  }
+  String out;
+  File f = dir.openNextFile();
+  while (f) {
+    if (!f.isDirectory()) {
+      String name = f.name();
+      int slash = name.lastIndexOf('/');
+      if (slash >= 0) name = name.substring(slash + 1);
+      out += name + "\t" + String((unsigned long)f.size()) + "\n";
+    }
+    f = dir.openNextFile();
+  }
+  server_.send(200, "text/plain", out);
+}
+
+// GET /note?name=ARQUIVO.wav - baixa o arquivo bruto de /notes. So pra
+// diagnostico (baixar e ouvir/analisar no PC) - sem essa rota nao tem
+// como tirar um WAV do dispositivo sem sincronizar pro Drive.
+void WifiManager::handleGetNote() {
+  if (!server_.hasArg("name")) {
+    server_.send(400, "text/plain", "falta ?name=");
+    return;
+  }
+  String name = server_.arg("name");
+  if (name.indexOf('/') >= 0 || name.indexOf("..") >= 0) {
+    server_.send(400, "text/plain", "nome invalido");
+    return;
+  }
+  String path = "/notes/" + name;
+  File f = LittleFS.open(path, FILE_READ);
+  if (!f) {
+    server_.send(404, "text/plain", "nao encontrado");
+    return;
+  }
+  server_.streamFile(f, "application/octet-stream");
+  f.close();
 }
 
 void WifiManager::handleRoot() {

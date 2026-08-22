@@ -1,4 +1,5 @@
 #include "notes.h"
+#include "../audio/wav.h"
 #include <LittleFS.h>
 #include <string.h>
 
@@ -32,6 +33,12 @@ void rescan() {
         char *dot = strchr(e.label, '.');
         if (dot) *dot = '\0';
         e.sizeBytes = f.size();
+
+        WavHeader hdr;
+        e.sampleRateHz = (f.size() >= sizeof(hdr) && f.read((uint8_t *)&hdr, sizeof(hdr)) == sizeof(hdr))
+                             ? hdr.sampleRate
+                             : 0;
+
         g_cacheCount++;
       }
     }

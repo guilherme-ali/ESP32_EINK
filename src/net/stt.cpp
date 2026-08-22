@@ -255,21 +255,37 @@ bool SttClient::transcribe(const Settings &cfg, const char *wavPath, char *outTe
     return false;
   }
 
-  File file = LittleFS.open(wavPath, FILE_READ);
-  if (!file) {
-    Serial.println("[STT] nao foi possivel abrir o WAV.");
-    return false;
-  }
-  size_t fileSize = file.size();
+  // Erros 503/sobrecarga do provedor sao comuns no tier gratuito e
+  // costumam sumir sozinhos - vale uma segunda tentativa antes de
+  // desistir e deixar a nota sem transcricao.
+  constexpr int kMaxAttempts = 2;
+  for (int attempt = 1; attempt <= kMaxAttempts; attempt++) {
+    File file = LittleFS.open(wavPath, FILE_READ);
+    if (!file) {
+      Serial.println("[STT] nao foi possivel abrir o WAV.");
+      return false;
+    }
+    size_t fileSize = file.size();
 
-  bool ok;
-  if (host == "generativelanguage.googleapis.com") {
-    ok = transcribeGemini(cfg, host, port, file, fileSize, outText, outLen);
-  } else {
-    ok = transcribeOpenAiCompatible(cfg, host, port, path, file, fileSize, outText, outLen);
+    bool ok;
+    if (host == "generativelanguage.googleapis.com") {
+      ok = transcribeGemini(cfg, host, port, file, fileSize, outText, outLen);
+    } else {
+      ok = transcribeOpenAiCompatible(cfg, host, port, path, file, fileSize, outText, outLen);
+    }
+    file.close();
+
+    if (ok) {
+      Serial.printf("[STT] transcrito (%u chars).\n", (unsigned)strlen(outText));
+      return true;
+    }
+
+    if (attempt < kMaxAttempts) {
+      Serial.printf("[STT] tentativa %d falhou, tentando de novo em 2s...\n", attempt);
+      delay(2000);
+    }
   }
 
-  file.close();
-  if (ok) Serial.printf("[STT] transcrito (%u chars).\n", (unsigned)strlen(outText));
-  return ok;
+  Serial.println("[STT] desistindo apos todas as tentativas.");
+  return false;
 }

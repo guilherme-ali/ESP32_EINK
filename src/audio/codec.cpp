@@ -83,7 +83,13 @@ bool AudioCodec::begin() {
 
   const audio_codec_if_t *codec = es8311_codec_new(&cfg);
   codec_ = codec;
-  return codec_ != nullptr;
+  if (!codec_) return false;
+
+  // O driver vendor nunca escreve ES8311_ADC_REG18 (ALC enable) - o
+  // default de fabrica pode deixar o AGC/automute ligado, o que corta
+  // ou abafa trechos baixos da fala. Desabilita explicitamente.
+  codec->set_reg(codec, 0x18, 0x00);
+  return true;
 }
 
 bool AudioCodec::initI2s(uint32_t sampleRate) {
@@ -99,8 +105,12 @@ bool AudioCodec::initI2s(uint32_t sampleRate) {
   i2sConfig.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
   i2sConfig.communication_format = I2S_COMM_FORMAT_STAND_I2S;
   i2sConfig.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
-  i2sConfig.dma_buf_count = 6;
-  i2sConfig.dma_buf_len = 256;
+  // 8 buffers de 512 frames ~= 341ms de audio a 12kHz de folga - o
+  // refresh do e-paper e outras pausas da task de UI (core 1) nao devem
+  // mais fazer o DMA estourar (a captura agora roda em task propria no
+  // core 0, ver audio/recorder.cpp).
+  i2sConfig.dma_buf_count = 8;
+  i2sConfig.dma_buf_len = 512;
   i2sConfig.use_apll = true; // APLL da menos erro de clock, ES8311 e sensivel a isso
 
   if (i2s_driver_install(kPort, &i2sConfig, 0, nullptr) != ESP_OK) return false;

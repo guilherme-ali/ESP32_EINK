@@ -34,4 +34,6 @@ private:
   void startServer();
   void handleRoot();
   void handleSave();
+  void handleListNotes();
+  void handleGetNote();
 };

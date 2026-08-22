@@ -10,6 +10,8 @@ struct NoteEntry {
   char path[48]; // "/notes/YYYYMMDD-HHMMSS.wav"
   char label[24]; // "YYYYMMDD-HHMMSS" sem extensao, para exibir na tela
   uint32_t sizeBytes;
+  uint32_t sampleRateHz; // lido do cabecalho WAV - notas antigas podem
+                          // ter sido gravadas numa taxa diferente da atual
 };
 
 class NotesStore {

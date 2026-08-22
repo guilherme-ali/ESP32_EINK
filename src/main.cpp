@@ -34,8 +34,11 @@ static char lastTxtPath[48] = "";
 static uint32_t lastActivityMs = 0;
 static void markActivity() { lastActivityMs = millis(); }
 
-static const uint32_t SAMPLE_RATE = 8000;
-static const uint32_t BYTES_PER_SEC = SAMPLE_RATE * 2; // 16-bit mono
+// Taxa vem das configuracoes (ajustavel pelo menu) - PCM 16-bit mono,
+// entao bytes/s = taxa * 2. Notas antigas gravadas numa taxa diferente
+// mostram a duracao calculada com a taxa ATUAL, nao a que foi usada na
+// hora (limitacao conhecida - o WAV em si guarda a taxa certa).
+static uint32_t bytesPerSec() { return settingsStore.get().audioSampleRateHz * 2; }
 
 enum class AppState { Idle, Recording, Playing };
 static AppState appState = AppState::Idle;
@@ -52,8 +55,9 @@ static EPaperPins epdPins = {
 static EPaperDisplay epd(200, 200, epdPins);
 static Canvas canvas(epd);
 
-static void formatDuration(uint32_t bytes, char *out, size_t outLen) {
-  float secs = bytes / (float)BYTES_PER_SEC;
+static void formatDuration(uint32_t bytes, uint32_t sampleRateHz, char *out, size_t outLen) {
+  uint32_t bps = sampleRateHz > 0 ? sampleRateHz * 2 : bytesPerSec();
+  float secs = bytes / (float)bps;
   snprintf(out, outLen, "%.0fs", secs);
 }
 
@@ -63,7 +67,7 @@ static void drawIdleScreen() {
   canvas.drawText(8, 6, "Minhas notas", EPD_BLACK, 1);
 
   uint64_t freeB = notes.freeBytes();
-  uint32_t freeSecs = (uint32_t)(freeB / BYTES_PER_SEC);
+  uint32_t freeSecs = (uint32_t)(freeB / bytesPerSec());
   char freeLine[32];
   snprintf(freeLine, sizeof(freeLine), "livre: ~%um%02us", freeSecs / 60, freeSecs % 60);
   canvas.drawText(8, 16, freeLine, EPD_BLACK, 1);
@@ -82,7 +86,7 @@ static void drawIdleScreen() {
       NoteEntry e;
       if (!notes.getAt(i, e)) continue;
       char durBuf[8];
-      formatDuration(e.sizeBytes, durBuf, sizeof(durBuf));
+      formatDuration(e.sizeBytes, e.sampleRateHz, durBuf, sizeof(durBuf));
 
       char line[32];
       snprintf(line, sizeof(line), "%c %s %s", i == selectedIndex ? '>' : ' ', e.label, durBuf);
@@ -196,20 +200,21 @@ static void startRecording() {
   }
   notes.buildPath(now, currentRecordingPath, sizeof(currentRecordingPath));
 
-  if (!codec.setSampleRate(SAMPLE_RATE)) {
+  uint32_t sampleRate = settingsStore.get().audioSampleRateHz;
+  if (!codec.setSampleRate(sampleRate)) {
     Serial.println("!! ERRO: setSampleRate falhou.");
     return;
   }
   codec.enable(true);
-  codec.setMicGain(24.0f);
-  if (!recorder.start(currentRecordingPath, SAMPLE_RATE)) {
+  codec.setMicGain(settingsStore.get().micGainDb);
+  if (!recorder.start(currentRecordingPath, sampleRate, &codec)) {
     Serial.println("!! ERRO: Recorder.start falhou.");
     return;
   }
   appState = AppState::Recording;
   recordingStartMs = millis();
-  drawRecordingScreen(0, (uint32_t)(notes.freeBytes() / BYTES_PER_SEC));
-  Serial.printf("Gravando em %s\n", currentRecordingPath);
+  drawRecordingScreen(0, (uint32_t)(notes.freeBytes() / bytesPerSec()));
+  Serial.printf("Gravando em %s (%lu Hz)\n", currentRecordingPath, (unsigned long)sampleRate);
 }
 
 static void drawTranscribingScreen() {
@@ -405,19 +410,19 @@ void loop() {
   wifiMgr.loop();
 
   if (appState == AppState::Recording) {
-    if (!recorder.feed(codec)) {
-      Serial.println("!! ERRO durante gravacao, parando.");
-      stopRecording();
-      return;
-    }
-
+    // A captura roda em tasks proprias (ver audio/recorder.cpp) - o
+    // loop() so cuida da UI, sem competir pelo tempo do I2S.
     static uint32_t lastUiUpdate = 0;
     uint32_t now = millis();
     if (now - lastUiUpdate >= 1000) {
       lastUiUpdate = now;
       uint32_t elapsedSec = (now - recordingStartMs) / 1000;
-      uint32_t freeSec = (uint32_t)(notes.freeBytes() / BYTES_PER_SEC);
+      uint32_t freeSec = (uint32_t)(notes.freeBytes() / bytesPerSec());
       drawRecordingScreen(elapsedSec, freeSec);
+      if (recorder.overflowCount() > 0) {
+        Serial.printf("!! AVISO: %lu overflow(s) no ring buffer de audio\n",
+                      (unsigned long)recorder.overflowCount());
+      }
     }
   } else if (appState == AppState::Idle) {
     uint32_t timeoutMs = settingsStore.get().screensaverTimeoutSec * 1000UL;

@@ -18,10 +18,16 @@
 #define PIN_AUDIO_PWR 42
 #define PIN_VBAT_PWR  17
 
-// I2C (RTC PCF85063 @0x51, SHTC3 @0x70 - nao usado neste projeto)
+// I2C (RTC PCF85063 @0x51, SHTC3 @0x70)
 #define PIN_I2C_SDA   47
 #define PIN_I2C_SCL   48
 #define I2C_ADDR_PCF85063 0x51
+#define I2C_ADDR_SHTC3     0x70
+
+// Bateria: ADC1_CH3, divisor resistivo (x2), atras da trilha VBAT_PWR
+// (ver board/power.h). Fonte: 02_Example/Arduino/01_ADC_Test/adc_bsp.cpp
+// do repo oficial da Waveshare.
+#define PIN_VBAT_ADC  4
 
 // Codec de audio ES8311 (mic + speaker), I2S padrao
 #define PIN_I2S_MCLK  14

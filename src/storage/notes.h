@@ -24,6 +24,11 @@ public:
   int count();
   bool getAt(int index, NoteEntry &out); // 0 = mais recente
 
+  // Quantos .wav em /notes NAO tem um NOME.snc do lado (ainda nao
+  // subiram pro Drive). O marcador .snc e criado pelo cliente do Drive
+  // depois de um upload bem-sucedido.
+  int countPendingSync();
+
   uint64_t totalBytes();
   uint64_t usedBytes();
   uint64_t freeBytes();

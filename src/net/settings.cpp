@@ -27,6 +27,9 @@ void SettingsStore::load() {
   settings_.screensaverTimeoutSec = prefs.getUShort("ssTimeout", 120);
   settings_.audioSampleRateHz = prefs.getUInt("sampleRate", 16000);
   settings_.micGainDb = prefs.getFloat("micGain", 24.0f);
+  settings_.lockRefreshSec = prefs.getUShort("lockRefresh", 300);
+  settings_.wallpaperChoice = (int8_t)prefs.getChar("wallpaper", -1);
+  settings_.showTempHumidity = prefs.getBool("showTempHum", true);
 }
 
 bool SettingsStore::saveWifi(const char *ssid, const char *pass) {
@@ -84,5 +87,23 @@ bool SettingsStore::saveScreensaverTimeout(uint16_t seconds) {
 bool SettingsStore::saveAutoSync(bool enabled) {
   settings_.autoSyncEnabled = enabled;
   prefs.putBool("autoSync", enabled);
+  return true;
+}
+
+bool SettingsStore::saveLockRefresh(uint16_t seconds) {
+  settings_.lockRefreshSec = seconds;
+  prefs.putUShort("lockRefresh", seconds);
+  return true;
+}
+
+bool SettingsStore::saveWallpaperChoice(int8_t choice) {
+  settings_.wallpaperChoice = choice;
+  prefs.putChar("wallpaper", choice);
+  return true;
+}
+
+bool SettingsStore::saveShowTempHumidity(bool enabled) {
+  settings_.showTempHumidity = enabled;
+  prefs.putBool("showTempHum", enabled);
   return true;
 }

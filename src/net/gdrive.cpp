@@ -330,5 +330,14 @@ bool GDriveClient::uploadNote(SettingsStore &settingsStore, const char *wavPath,
     uploadFile(accessToken, folderId, txtPath, txtName.c_str(), "text/plain; charset=utf-8");
   }
 
+  if (ok) {
+    // Marcador vazio NOME.snc - e assim que NotesStore::countPendingSync()
+    // (e futuramente a lista de notas) sabe que essa ja subiu.
+    String sncPath = String(wavPath);
+    sncPath.replace(".wav", ".snc");
+    File snc = LittleFS.open(sncPath, FILE_WRITE);
+    if (snc) snc.close();
+  }
+
   return ok;
 }

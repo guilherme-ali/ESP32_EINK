@@ -7,9 +7,12 @@
 #include "board/power.h"
 #include "board/buttons.h"
 #include "board/rtc.h"
+#include "board/battery.h"
+#include "board/shtc3.h"
 #include "display/epaper.h"
 #include "ui/canvas.h"
 #include "ui/wallpapers.h"
+#include "ui/lockscreen.h"
 #include "audio/codec.h"
 #include "audio/recorder.h"
 #include "audio/player.h"
@@ -21,6 +24,7 @@
 
 static BoardPower power(PIN_EPD_PWR, PIN_AUDIO_PWR, PIN_VBAT_PWR);
 static Rtc rtc;
+static Shtc3 shtc3;
 static Buttons buttons;
 static AudioCodec codec;
 static Recorder recorder;
@@ -32,7 +36,17 @@ static SttClient sttClient;
 static GDriveClient gdrive;
 static char lastTxtPath[48] = "";
 static uint32_t lastActivityMs = 0;
-static void markActivity() { lastActivityMs = millis(); }
+
+// Sobrevive ao deep sleep (RTC memory) - o wallpaper da tela de
+// descanso fica o mesmo durante todo um periodo de descanso, so muda
+// quando um novo periodo comeca (o usuario mexeu no aparelho e ele
+// voltou a ficar ocioso - ver markActivity()).
+RTC_DATA_ATTR static int rtcWallpaperIndex = -1;
+
+static void markActivity() {
+  lastActivityMs = millis();
+  rtcWallpaperIndex = -1;
+}
 
 // Taxa vem das configuracoes (ajustavel pelo menu) - PCM 16-bit mono,
 // entao bytes/s = taxa * 2. Notas antigas gravadas numa taxa diferente
@@ -54,6 +68,7 @@ static EPaperPins epdPins = {
 };
 static EPaperDisplay epd(200, 200, epdPins);
 static Canvas canvas(epd);
+static LockScreen lockScreen(epd, canvas);
 
 static void formatDuration(uint32_t bytes, uint32_t sampleRateHz, char *out, size_t outLen) {
   uint32_t bps = sampleRateHz > 0 ? sampleRateHz * 2 : bytesPerSec();
@@ -136,6 +151,32 @@ static void onWifiSetupButtonEvent(BtnId id, BtnAction action) {
   }
 }
 
+// O PCF85063 nao tem como saber a hora certa sozinho - so acerta com
+// ajuda de fora. Sem isso, o relogio fica preso em qualquer data que
+// tenha sido gravada nele uma vez (foi o que aconteceu: meses de testes
+// com uma data de fabrica/teste nunca corrigida). Roda uma vez, toda
+// vez que conecta no Wi-Fi - barato e mantem o relogio sempre certo.
+static void syncRtcFromNtp() {
+  configTime(-3 * 3600, 0, "pool.ntp.org", "time.google.com");
+
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo, 8000)) {
+    Serial.println("!! AVISO: NTP nao respondeu, RTC continua com a hora antiga.");
+    return;
+  }
+
+  RtcDateTime dt;
+  dt.year = timeinfo.tm_year + 1900;
+  dt.month = timeinfo.tm_mon + 1;
+  dt.day = timeinfo.tm_mday;
+  dt.hour = timeinfo.tm_hour;
+  dt.minute = timeinfo.tm_min;
+  dt.second = timeinfo.tm_sec;
+  rtc.setDateTime(dt);
+  Serial.printf("RTC sincronizado via NTP: %04u-%02u-%02u %02u:%02u:%02u\n", dt.year, dt.month,
+                dt.day, dt.hour, dt.minute, dt.second);
+}
+
 // Roda so no boot: tenta conectar ao Wi-Fi salvo; se precisar do portal
 // AP, fica nessa tela ate o usuario configurar pelo celular (o proprio
 // portal reinicia o ESP quando salva) ou apertar BOOT longo para pular
@@ -144,6 +185,7 @@ static void runWifiSetup() {
   buttons.setCallback(onWifiSetupButtonEvent);
 
   if (wifiMgr.begin(settingsStore)) {
+    syncRtcFromNtp();
     return; // conectado direto com credenciais salvas
   }
 
@@ -322,23 +364,87 @@ static void playSelected() {
   drawIdleScreen();
 }
 
-// Mostra um wallpaper aleatorio com refresh completo (sem ghosting) e
-// desliga a alimentacao do e-paper - o painel e biestavel, entao a
-// imagem fica visivel sem energia. Acorda so com BOOT (GPIO0), que
-// reinicia o ESP32 do zero (deep sleep nao preserva RAM).
+// Monta o LockScreenStatus com o que der pra ler rapido (RTC + bateria
+// + SHTC3, todos ja com o barramento I2C ligado pelo chamador).
+static LockScreenStatus buildLockStatus() {
+  LockScreenStatus status = {};
+
+  RtcDateTime now;
+  status.hasTime = rtc.getDateTime(now);
+  if (status.hasTime) status.time = now;
+
+  power.vbatOn();
+  delay(5); // divisor resistivo estabilizar
+  float vbatVolts = Battery::readVoltage();
+  status.batteryPercent = Battery::readPercent();
+  power.vbatOff();
+
+  status.hasTempHumidity = settingsStore.get().showTempHumidity &&
+                            shtc3.read(status.tempC, status.humidity);
+
+  Serial.printf("[lockscreen] rtc_ok=%d %04u-%02u-%02u %02u:%02u  vbat=%.2fV bat=%d%%  "
+                "shtc3_ok=%d temp=%.1fC hum=%.1f%%\n",
+                status.hasTime, now.year, now.month, now.day, now.hour, now.minute,
+                vbatVolts, status.batteryPercent, status.hasTempHumidity, status.tempC,
+                status.humidity);
+
+  status.pendingSyncCount = notes.countPendingSync();
+  return status;
+}
+
+// Desenha a tela de bloqueio (wallpaper sorteado uma vez por periodo de
+// descanso + cartao com hora/bateria/sensores) e desliga a alimentacao
+// do e-paper - o painel e biestavel, entao a imagem fica visivel sem
+// energia. Dois jeitos de acordar: os botoes (ext1, retoma o app) ou um
+// timer curto (so redesenha o relogio e volta a dormir, ver
+// runLockScreenRefreshAndSleep() em setup()).
 static void enterScreensaver() {
   Serial.println("Entrando em modo de descanso (deep sleep)...");
 
-  int idx = random(WALLPAPER_COUNT);
+  if (rtcWallpaperIndex < 0) {
+    rtcWallpaperIndex = settingsStore.get().wallpaperChoice >= 0
+                             ? settingsStore.get().wallpaperChoice % WALLPAPER_COUNT
+                             : random(WALLPAPER_COUNT);
+  }
+
   epd.init(); // recarrega a LUT de refresh completo (o app roda em modo parcial)
-  memcpy_P(epd.buffer(), WALLPAPERS[idx], epd.bufferLen());
-  epd.display();
+  lockScreen.draw(rtcWallpaperIndex, buildLockStatus());
   power.epdOff();
 
   codec.enable(false);
   power.audioOff();
 
-  esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_BTN_BOOT, 0);
+  esp_sleep_enable_ext1_wakeup((1ULL << PIN_BTN_BOOT) | (1ULL << PIN_BTN_PWR),
+                                ESP_EXT1_WAKEUP_ANY_LOW);
+  uint32_t refreshSec = settingsStore.get().lockRefreshSec;
+  if (refreshSec > 0) {
+    esp_sleep_enable_timer_wakeup((uint64_t)refreshSec * 1000000ULL);
+  }
+  esp_deep_sleep_start();
+}
+
+// So roda quando o wake foi por timer (relogio da tela de bloqueio) -
+// religa o minimo (I2C + e-paper), redesenha e volta a dormir sem tocar
+// em codec/Wi-Fi/botoes. Nunca retorna.
+static void runLockScreenRefreshAndSleep() {
+  power.epdOn();
+  delay(10);
+  rtc.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+  shtc3.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+  settingsStore.begin();
+  LittleFS.begin(true);
+  notes.begin();
+
+  epd.init();
+  lockScreen.draw(rtcWallpaperIndex, buildLockStatus());
+  power.epdOff();
+
+  esp_sleep_enable_ext1_wakeup((1ULL << PIN_BTN_BOOT) | (1ULL << PIN_BTN_PWR),
+                                ESP_EXT1_WAKEUP_ANY_LOW);
+  uint32_t refreshSec = settingsStore.get().lockRefreshSec;
+  if (refreshSec > 0) {
+    esp_sleep_enable_timer_wakeup((uint64_t)refreshSec * 1000000ULL);
+  }
   esp_deep_sleep_start();
 }
 
@@ -364,6 +470,14 @@ static void onButtonEvent(BtnId id, BtnAction action) {
 }
 
 void setup() {
+  // Wake por timer (relogio da tela de bloqueio, a cada poucos minutos)
+  // usa um caminho bem mais curto - so I2C+e-paper, sem WiFi/codec/
+  // botoes - pra gastar o minimo de bateria possivel. Precisa ser a
+  // primeira coisa no setup(), antes de qualquer init pesado.
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) {
+    runLockScreenRefreshAndSleep(); // nao retorna
+  }
+
   Serial.begin(115200);
   delay(2000);
   Serial.println("=================================");

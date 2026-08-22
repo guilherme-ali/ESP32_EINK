@@ -83,6 +83,17 @@ bool NotesStore::getAt(int index, NoteEntry &out) {
   return true;
 }
 
+int NotesStore::countPendingSync() {
+  rescan();
+  int pending = 0;
+  for (int i = 0; i < g_cacheCount; i++) {
+    String sncPath = String(g_cache[i].path);
+    sncPath.replace(".wav", ".snc");
+    if (!LittleFS.exists(sncPath)) pending++;
+  }
+  return pending;
+}
+
 uint64_t NotesStore::totalBytes() { return LittleFS.totalBytes(); }
 uint64_t NotesStore::usedBytes() { return LittleFS.usedBytes(); }
 uint64_t NotesStore::freeBytes() { return LittleFS.totalBytes() - LittleFS.usedBytes(); }

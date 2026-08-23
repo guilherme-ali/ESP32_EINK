@@ -34,7 +34,6 @@ struct Settings {
   float micGainDb = 24.0f; // 0-42dB, ver es8311_mic_gain_t
   float speakerVolumeDb = 20.0f;
 
-  uint16_t lockRefreshSec = 300; // intervalo do relogio na tela de bloqueio
   int8_t wallpaperChoice = -1;   // -1 = sorteia a cada vez que dorme; N = fixo
   bool showTempHumidity = true;
 };
@@ -58,7 +57,6 @@ public:
   bool saveVolume(float volumeDb);
   bool saveScreensaverTimeout(uint16_t seconds);
   bool saveAutoSync(bool enabled);
-  bool saveLockRefresh(uint16_t seconds);
   bool saveWallpaperChoice(int8_t choice);
   bool saveShowTempHumidity(bool enabled);
   bool hasWifi() const { return settings_.wifiNetworkCount > 0; }

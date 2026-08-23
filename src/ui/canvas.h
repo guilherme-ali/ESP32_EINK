@@ -1,9 +1,11 @@
 #pragma once
 #include "../display/epaper.h"
+#include "fonts.h"
 
-// Desenho simples de texto e formas sobre o framebuffer do EPaperDisplay.
-// Fonte fixa 5x7 (ver font5x7.h). Sem dependencia de bibliotecas graficas
-// externas - o suficiente para telas de status, listas e texto transcrito.
+// Desenho de texto e formas sobre o framebuffer do EPaperDisplay. Fonte
+// bitmap proporcional (ver fonts.h/tools/font2header.py) em 3 tamanhos -
+// FONT_BODY, FONT_EMPHASIS, FONT_CLOCK. Sem dependencia de bibliotecas
+// graficas externas.
 class Canvas {
 public:
   explicit Canvas(EPaperDisplay &epd) : epd_(epd) {}
@@ -15,18 +17,35 @@ public:
   void drawRect(int x, int y, int w, int h, uint8_t color);
   void fillRect(int x, int y, int w, int h, uint8_t color);
 
-  // scale=1 -> glifo 5x7; scale=2 -> 10x14, etc.
-  void drawChar(int x, int y, char c, uint8_t color, int scale = 1);
-  void drawText(int x, int y, const char *text, uint8_t color, int scale = 1);
+  // r e limitado a min(w,h)/2 internamente - sem checagem de faixa, quem
+  // chama e responsavel por nao pedir um raio maior que a forma.
+  void drawRoundRect(int x, int y, int w, int h, int r, uint8_t color);
+  void fillRoundRect(int x, int y, int w, int h, int r, uint8_t color);
 
-  // Quebra `text` em varias linhas de ate `maxCharsPerLine` caracteres
-  // (quebra em espaco quando possivel) e desenha a partir de (x,y).
+  void drawCircle(int cx, int cy, int r, uint8_t color);
+  void fillCircle(int cx, int cy, int r, uint8_t color);
+  // So os dois quadrantes de cima (icone de wifi: arcos concentricos
+  // sobre um ponto). Sem arco em angulo arbitrario - so essa metade.
+  void drawArcTopHalf(int cx, int cy, int r, uint8_t color);
+
+  void drawLine(int x0, int y0, int x1, int y1, uint8_t color);
+
+  // Contorno arredondado + preenchimento proporcional a value/maxValue
+  // (0 quando maxValue <= 0), sem o contador "N / M" - isso e texto,
+  // fica por conta de quem chama.
+  void drawProgressBar(int x, int y, int w, int h, int value, int maxValue, uint8_t color);
+
+  void drawChar(int x, int y, char c, uint8_t color, const Font &font);
+  void drawText(int x, int y, const char *text, uint8_t color, const Font &font);
+
+  // Quebra `text` em varias linhas de ate `maxWidthPx` pixels (quebra em
+  // espaco quando possivel) e desenha a partir de (x,y). Retorna o numero
+  // de linhas desenhadas.
   int drawWrappedText(int x, int y, const char *text, uint8_t color,
-                       int scale, int maxCharsPerLine, int lineHeight);
+                       const Font &font, int maxWidthPx, int lineHeight);
 
-  static int textWidth(const char *text, int scale = 1);
-  static constexpr int charWidth(int scale = 1) { return 6 * scale; } // 5px + 1 espaco
-  static constexpr int charHeight(int scale = 1) { return 8 * scale; } // 7px + 1 espaco
+  static int textWidth(const char *text, const Font &font);
+  static int charWidth(char c, const Font &font);
 
 private:
   EPaperDisplay &epd_;

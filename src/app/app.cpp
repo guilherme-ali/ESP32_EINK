@@ -1,6 +1,7 @@
 #include "app.h"
 #include "../ui/screens.h"
 #include "../ui/wallpapers.h"
+#include "../board/battery.h"
 #include <LittleFS.h>
 
 namespace {
@@ -36,10 +37,7 @@ constexpr int kVolumeCount = sizeof(kVolumes) / sizeof(kVolumes[0]);
 const uint16_t kScreensaverTimeouts[] = {30, 60, 120, 300, 600};
 constexpr int kScreensaverTimeoutCount = sizeof(kScreensaverTimeouts) / sizeof(kScreensaverTimeouts[0]);
 
-const uint16_t kLockRefreshOptions[] = {0, 60, 180, 300, 600, 900};
-constexpr int kLockRefreshCount = sizeof(kLockRefreshOptions) / sizeof(kLockRefreshOptions[0]);
-
-const char *const kWallpaperNames[] = {"Montanhas", "Topo", "Estrelas"};
+const char *const kWallpaperNames[] = {"Montanhas", "Topo", "Estrelas", "Ondas", "Pontos"};
 
 enum RootIdx { kRootRecord = 0, kRootNotes, kRootSync, kRootWifi, kRootSettings, kRootAbout, kRootCount };
 
@@ -50,7 +48,6 @@ enum SettingsIdx {
   kSetMicGain,
   kSetVolume,
   kSetScreensaver,
-  kSetLockRefresh,
   kSetWallpaper,
   kSetShowTemp,
   kSetAutoSync,
@@ -63,10 +60,10 @@ enum SettingsIdx {
 
 App::App(EPaperDisplay &epd, Canvas &canvas, NotesStore &notes, SettingsStore &settingsStore,
          AudioCodec &codec, Recorder &recorder, Player &player, WifiManager &wifiMgr,
-         SttClient &sttClient, GDriveClient &gdrive, Rtc &rtc)
+         SttClient &sttClient, GDriveClient &gdrive, Rtc &rtc, Shtc3 &shtc3)
     : epd_(epd), canvas_(canvas), notes_(notes), settingsStore_(settingsStore), codec_(codec),
       recorder_(recorder), player_(player), wifiMgr_(wifiMgr), sttClient_(sttClient),
-      gdrive_(gdrive), rtc_(rtc), menu_(canvas, epd), keyboard_(canvas, epd) {}
+      gdrive_(gdrive), rtc_(rtc), shtc3_(shtc3), menu_(canvas, epd), keyboard_(canvas, epd) {}
 
 void App::begin(SleepRequestFn onSleepRequested, ConnectRequestFn onConnectRequested,
                  PortalRequestFn onPortalRequested) {
@@ -141,7 +138,8 @@ void App::goWifiMenu() {
 // Bloqueante - desenha sua propria tela de espera.
 bool App::ensureOnline() {
   if (wifiMgr_.isConnected()) return true;
-  Screens::drawText(canvas_, epd_, "Conectando...", "procurando redes salvas por perto");
+  Screens::drawState(canvas_, epd_, Screens::StateIcon::Wifi, "conectando",
+                      "procurando redes salvas por perto");
   return onConnectRequested_ ? onConnectRequested_() : false;
 }
 
@@ -161,11 +159,17 @@ void App::reportNoNetworkAndGoHome() {
 // ---------------------------------------------------------------------
 
 void App::drawHome() {
-  uint32_t freeSecs = (uint32_t)(notes_.freeBytes() / bytesPerSec());
-  String wifiLine = wifiMgr_.isConnected() ? ("wifi: " + wifiMgr_.statusLine())
-                                            : ("offline: " + wifiMgr_.statusLine());
+  RtcDateTime now;
+  bool timeValid = rtc_.getDateTime(now) && now.year >= 2024;
   int pending = notes_.countPendingSync();
-  Screens::drawHome(canvas_, epd_, freeSecs, wifiLine.c_str(), noteCount_, pending);
+  int batteryPercent = Battery::readPercent();
+
+  float tempC = 0, humidity = 0;
+  bool hasTempHumidity = shtc3_.read(tempC, humidity);
+
+  Screens::drawHome(canvas_, epd_, now, timeValid, batteryPercent,
+                     settingsStore_.get().showTempHumidity, hasTempHumidity, tempC, humidity,
+                     noteCount_, pending);
 }
 
 void App::drawRootMenu() {
@@ -196,15 +200,23 @@ void App::drawNotesList() {
   NoteEntry entries[kMaxUi];
   for (int i = 0; i < shown; i++) notes_.getAt(i, entries[i]);
 
-  MenuItem items[kMaxUi];
+  MenuCard cards[kMaxUi];
   for (int i = 0; i < shown; i++) {
-    items[i].label = entries[i].label;
     char dur[8];
     formatDuration(entries[i].sizeBytes, entries[i].sampleRateHz, dur, sizeof(dur));
-    setVal(items[i].value, sizeof(items[i].value), dur);
+    snprintf(cards[i].line1, sizeof(cards[i].line1), "#%03d  %s", noteCount_ - i, dur);
+
+    // label: "YYYYMMDD-HHMMSS" -> "YYYY-MM-DD HH:MM"
+    const char *l = entries[i].label;
+    if (strlen(l) >= 15) {
+      snprintf(cards[i].line2, sizeof(cards[i].line2), "%.4s-%.2s-%.2s %.2s:%.2s", l, l + 4,
+               l + 6, l + 9, l + 11);
+    } else {
+      setVal(cards[i].line2, sizeof(cards[i].line2), l);
+    }
   }
 
-  menu_.draw("Notas", items, shown, min(notesSel_, shown - 1), "BOOT abre | PWR nav/volta");
+  menu_.drawCards("notes", cards, shown, min(notesSel_, shown - 1), "BOOT abre | PWR nav/volta");
 }
 
 void App::drawNoteDetail() {
@@ -243,14 +255,6 @@ void App::drawSettings() {
   setItem(items[kSetScreensaver], "Tempo p/ dormir");
   snprintf(items[kSetScreensaver].value, sizeof(items[kSetScreensaver].value), "%us",
            cfg.screensaverTimeoutSec);
-
-  setItem(items[kSetLockRefresh], "Intervalo relogio");
-  if (cfg.lockRefreshSec == 0) {
-    setVal(items[kSetLockRefresh].value, sizeof(items[kSetLockRefresh].value), "desligado");
-  } else {
-    snprintf(items[kSetLockRefresh].value, sizeof(items[kSetLockRefresh].value), "%us",
-             cfg.lockRefreshSec);
-  }
 
   setItem(items[kSetWallpaper], "Plano de fundo");
   setVal(items[kSetWallpaper].value, sizeof(items[kSetWallpaper].value),
@@ -363,6 +367,8 @@ void App::stopRecording() {
       transcribeIfPossible(currentRecordingPath_);
       syncIfPossible(currentRecordingPath_);
     }
+    Screens::drawSaved(canvas_, epd_, notes_.count());
+    delay(1200);
   }
   goHome();
 }
@@ -403,7 +409,8 @@ void App::transcribeIfPossible(const char *wavPath) {
   const Settings &cfg = settingsStore_.get();
   if (!wifiMgr_.isConnected() || cfg.sttEndpoint[0] == '\0') return;
 
-  Screens::drawText(canvas_, epd_, "Transcrevendo...", "enviando audio para o servico de STT");
+  Screens::drawState(canvas_, epd_, Screens::StateIcon::Activity, "transcrevendo",
+                      "enviando audio para o servico de STT");
 
   static char textBuf[SttClient::kMaxTextLen];
   if (!sttClient_.transcribe(cfg, wavPath, textBuf, sizeof(textBuf))) {
@@ -429,7 +436,8 @@ void App::syncIfPossible(const char *wavPath) {
   const Settings &cfg = settingsStore_.get();
   if (!wifiMgr_.isConnected() || !cfg.autoSyncEnabled || !settingsStore_.hasDriveAuth()) return;
 
-  Screens::drawText(canvas_, epd_, "Sincronizando...", "enviando para o Google Drive");
+  Screens::drawState(canvas_, epd_, Screens::StateIcon::Activity, "sincronizando",
+                      "enviando para o Google Drive");
   const char *txtPath = lastTxtPath_[0] ? lastTxtPath_ : nullptr;
   if (!gdrive_.uploadNote(settingsStore_, wavPath, txtPath)) {
     Serial.println("Sincronizacao falhou, nota continua so local.");
@@ -447,7 +455,7 @@ void App::syncOneNote(int index) {
     return;
   }
 
-  Screens::drawText(canvas_, epd_, "Sincronizando...", e.label);
+  Screens::drawState(canvas_, epd_, Screens::StateIcon::Activity, "sincronizando", e.label);
 
   String txtPath = String(e.path);
   txtPath.replace(".wav", ".txt");
@@ -505,9 +513,8 @@ void App::runManualSync() {
     if (!needsTxt && !needsUpload) continue;
 
     done++;
-    char body[48];
-    snprintf(body, sizeof(body), "%d/%d: %s", done, pendingTotal, e.label);
-    Screens::drawText(canvas_, epd_, "Sincronizando...", body);
+    Screens::drawState(canvas_, epd_, Screens::StateIcon::Activity, "sincronizando", e.label,
+                        done, pendingTotal);
 
     if (needsTxt && transcribeNote(e.path)) transcribed++;
     if (needsUpload) {
@@ -526,7 +533,7 @@ void App::runManualSync() {
 }
 
 void App::startWifiScanFlow() {
-  Screens::drawText(canvas_, epd_, "Wi-Fi", "Escaneando redes por perto...");
+  Screens::drawState(canvas_, epd_, Screens::StateIcon::Wifi, "wi-fi", "escaneando redes por perto");
   int found = wifiMgr_.scan();
   const Settings &cfg = settingsStore_.get();
 
@@ -777,11 +784,6 @@ void App::onButtonSettings(BtnId id, BtnAction action) {
       settingsStore_.saveScreensaverTimeout(kScreensaverTimeouts[idx]);
       break;
     }
-    case kSetLockRefresh: {
-      int idx = cycleIndex(kLockRefreshOptions, kLockRefreshCount, cfg.lockRefreshSec);
-      settingsStore_.saveLockRefresh(kLockRefreshOptions[idx]);
-      break;
-    }
     case kSetWallpaper: {
       int8_t next = cfg.wallpaperChoice + 1;
       if (next >= WALLPAPER_COUNT) next = -1;
@@ -885,7 +887,8 @@ void App::onButtonWifiNetworkDetail(BtnId id, BtnAction action) {
   const Settings &cfg = settingsStore_.get();
   switch (wifiDetailSel_) {
     case 0: { // Conectar agora
-      Screens::drawText(canvas_, epd_, "Conectando...", cfg.wifiSsid[wifiDetailIndex_]);
+      Screens::drawState(canvas_, epd_, Screens::StateIcon::Wifi, "conectando",
+                          cfg.wifiSsid[wifiDetailIndex_]);
       bool ok = onConnectRequested_ ? onConnectRequested_() : false;
       Screens::drawText(canvas_, epd_, "Wi-Fi", ok ? "Conectado!" : "Nao foi possivel conectar.",
                          "qualquer botao volta");

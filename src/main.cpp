@@ -50,7 +50,7 @@ static LockScreen lockScreen(epd, canvas);
 // caminho do sono (tela de bloqueio, deep sleep), que mexem direto com
 // esp_sleep e ficam fora do loop de botoes do App.
 static App app(epd, canvas, notes, settingsStore, codec, recorder, player, wifiMgr, sttClient,
-               gdrive, rtc);
+               gdrive, rtc, shtc3);
 
 // Sobrevive ao deep sleep (RTC memory) - o wallpaper da tela de
 // descanso fica o mesmo durante todo um periodo de descanso, so muda
@@ -67,13 +67,12 @@ static void onButtonEvent(BtnId id, BtnAction action) {
 
 static void drawWifiSetupScreen(const String &line1, const String &line2) {
   canvas.clear(EPD_WHITE);
-  canvas.drawRect(0, 0, 200, 200, EPD_BLACK);
-  canvas.drawText(8, 8, "Configurar Wi-Fi", EPD_BLACK, 1);
-  canvas.drawFastHLine(4, 20, 192, EPD_BLACK);
-  canvas.drawWrappedText(8, 34, line1.c_str(), EPD_BLACK, 1, 30, 10);
-  canvas.drawWrappedText(8, 90, line2.c_str(), EPD_BLACK, 1, 30, 10);
-  canvas.drawFastHLine(4, 178, 192, EPD_BLACK);
-  canvas.drawText(8, 184, "BOOT longo: usar offline", EPD_BLACK, 1);
+  canvas.drawText(8, 8, "configurar wi-fi", EPD_BLACK, FONT_EMPHASIS);
+  canvas.drawFastHLine(8, 30, 184, EPD_BLACK);
+  canvas.drawWrappedText(8, 42, line1.c_str(), EPD_BLACK, FONT_BODY, 184, 18);
+  canvas.drawWrappedText(8, 96, line2.c_str(), EPD_BLACK, FONT_BODY, 184, 18);
+  canvas.drawFastHLine(8, 178, 184, EPD_BLACK);
+  canvas.drawText(8, 181, "BOOT longo: usar offline", EPD_BLACK, FONT_BODY);
   epd.displayPart();
 }
 
@@ -112,13 +111,12 @@ static void syncRtcFromNtp() {
 
 static void drawDrivePairingScreen(const char *userCode, const char *verificationUrl) {
   canvas.clear(EPD_WHITE);
-  canvas.drawRect(0, 0, 200, 200, EPD_BLACK);
-  canvas.drawText(8, 8, "Autorizar Google Drive", EPD_BLACK, 1);
-  canvas.drawFastHLine(4, 20, 192, EPD_BLACK);
-  canvas.drawText(8, 34, "Acesse:", EPD_BLACK, 1);
-  canvas.drawText(8, 46, verificationUrl, EPD_BLACK, 1);
-  canvas.drawText(8, 66, "Digite o codigo:", EPD_BLACK, 1);
-  canvas.drawText(8, 82, userCode, EPD_BLACK, 2);
+  canvas.drawText(8, 8, "autorizar google drive", EPD_BLACK, FONT_EMPHASIS);
+  canvas.drawFastHLine(8, 30, 184, EPD_BLACK);
+  canvas.drawText(8, 42, "Acesse:", EPD_BLACK, FONT_BODY);
+  canvas.drawText(8, 56, verificationUrl, EPD_BLACK, FONT_BODY);
+  canvas.drawText(8, 78, "Digite o codigo:", EPD_BLACK, FONT_BODY);
+  canvas.drawText(8, 94, userCode, EPD_BLACK, FONT_EMPHASIS);
   epd.displayPart();
 }
 
@@ -131,9 +129,8 @@ static void runDrivePairingIfNeeded() {
 
   if (gdrive.pairDevice(settingsStore, drawDrivePairingScreen)) {
     canvas.clear(EPD_WHITE);
-    canvas.drawRect(0, 0, 200, 200, EPD_BLACK);
-    canvas.drawText(8, 90, "Google Drive", EPD_BLACK, 1);
-    canvas.drawText(8, 102, "autorizado!", EPD_BLACK, 1);
+    canvas.drawText(8, 90, "Google Drive", EPD_BLACK, FONT_EMPHASIS);
+    canvas.drawText(8, 110, "autorizado!", EPD_BLACK, FONT_BODY);
     epd.displayPart();
     delay(2000);
   }
@@ -197,33 +194,18 @@ static void runWifiSetup() {
   onPortalRequested();
 }
 
-// Monta o LockScreenStatus com o que der pra ler rapido (RTC + bateria
-// + SHTC3, todos ja com o barramento I2C ligado pelo chamador).
-static LockScreenStatus buildLockStatus() {
-  LockScreenStatus status = {};
-
-  RtcDateTime now;
-  status.hasTime = rtc.getDateTime(now);
-  if (status.hasTime) status.time = now;
-
-  // VBAT_PWR fica sempre ligado (e o latch de energia da bateria, ver
-  // board/power.h) - o divisor ja esta estavel, sem precisar de delay
-  // nem religar antes de cada leitura.
-  status.batteryPercent = Battery::readPercent();
-
-  status.hasTempHumidity = settingsStore.get().showTempHumidity &&
-                            shtc3.read(status.tempC, status.humidity);
-
-  status.pendingSyncCount = notes.countPendingSync();
-  return status;
-}
-
 // Trava os 3 rails de energia (EPD/AUDIO/VBAT) no estado atual durante
 // o deep sleep. Sem isso nada garante que o pino continua no "off" que
 // acabamos de escrever - GPIOs comuns podem flutuar durante o sono e
 // isso poderia reenergizar EPD/audio por horas de standby. O
 // gpio_hold_dis() correspondente fica no inicio do setup(), antes de
 // qualquer power.XOn()/XOff() - sem ele a tela nunca mais ligaria.
+//
+// VDDSDIO desligado tambem: alimenta a flash E a PSRAM octal (board
+// inteira usa qio_opi). Sem os wakes por timer (nenhuma fonte de wake
+// alem dos botoes, ver enterScreensaver() abaixo), a documentacao da
+// Espressif indica isso como seguro - e era o maior consumo de standby
+// medido (uma noite parada custava 5% de bateria antes desta mudanca).
 static void holdPowerRailsAndSleep() {
   gpio_hold_en((gpio_num_t)PIN_EPD_PWR);
   gpio_hold_en((gpio_num_t)PIN_AUDIO_PWR);
@@ -234,16 +216,17 @@ static void holdPowerRailsAndSleep() {
   // ligado no default (guarda os RTC_DATA_ATTR, ex. rtcWallpaperIndex).
   esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_FAST_MEM, ESP_PD_OPTION_OFF);
   esp_sleep_pd_config(ESP_PD_DOMAIN_XTAL, ESP_PD_OPTION_OFF);
+  esp_sleep_pd_config(ESP_PD_DOMAIN_VDDSDIO, ESP_PD_OPTION_OFF);
 
   esp_deep_sleep_start();
 }
 
-// Desenha a tela de bloqueio (wallpaper sorteado uma vez por periodo de
-// descanso + cartao com hora/bateria/sensores) e desliga a alimentacao
-// do e-paper - o painel e biestavel, entao a imagem fica visivel sem
-// energia. Dois jeitos de acordar: os botoes (ext1, retoma o app) ou um
-// timer curto (so redesenha o relogio e volta a dormir, ver
-// runLockScreenRefreshAndSleep() em setup()).
+// Desenha a tela de bloqueio (so o wallpaper, sorteado uma vez por
+// periodo de descanso - sem cartao/relogio/status, que agora vivem na
+// tela inicial) e desliga a alimentacao do e-paper - o painel e
+// biestavel, entao a imagem fica visivel sem energia. Unico jeito de
+// acordar: os botoes (ext1) - sem wake por timer, o aparelho so liga
+// quando voce mexe nele.
 static void enterScreensaver() {
   Serial.println("Entrando em modo de descanso (deep sleep)...");
 
@@ -254,7 +237,7 @@ static void enterScreensaver() {
   }
 
   epd.init(); // recarrega a LUT de refresh completo (o app roda em modo parcial)
-  lockScreen.draw(rtcWallpaperIndex, buildLockStatus());
+  lockScreen.draw(rtcWallpaperIndex);
   power.epdOff();
 
   codec.enable(false);
@@ -262,53 +245,6 @@ static void enterScreensaver() {
 
   esp_sleep_enable_ext1_wakeup((1ULL << PIN_BTN_BOOT) | (1ULL << PIN_BTN_PWR),
                                 ESP_EXT1_WAKEUP_ANY_LOW);
-  uint32_t refreshSec = settingsStore.get().lockRefreshSec;
-  if (refreshSec > 0) {
-    esp_sleep_enable_timer_wakeup((uint64_t)refreshSec * 1000000ULL);
-  }
-  holdPowerRailsAndSleep();
-}
-
-// Quantos wakes por timer seguidos usam a LUT parcial (mais rapida)
-// antes de forcar um refresh completo pra limpar fantasma acumulado -
-// ~1x/hora no intervalo padrao de 5 minutos.
-constexpr int kLockFullRefreshEvery = 12;
-RTC_DATA_ATTR static int lockPartialRefreshCount = 0;
-
-// So roda quando o wake foi por timer (relogio da tela de bloqueio) -
-// religa o minimo (I2C + e-paper), redesenha e volta a dormir sem tocar
-// em codec/Wi-Fi/botoes. Nunca retorna.
-static void runLockScreenRefreshAndSleep() {
-  power.epdOn();
-  delay(10);
-  rtc.begin(PIN_I2C_SDA, PIN_I2C_SCL);
-  shtc3.begin(PIN_I2C_SDA, PIN_I2C_SCL);
-  settingsStore.begin();
-  LittleFS.begin(true);
-  notes.begin();
-
-  epd.init();
-  // A LUT parcial e bem mais rapida que a cheia (menos ciclos de
-  // waveform) - o painel perde a RAM com a energia cortada de qualquer
-  // jeito, entao o frame inteiro precisa ser reenviado, mas nao precisa
-  // ser com a LUT lenta. Uma passada cheia de vez em quando limpa
-  // fantasma acumulado (mesmo padrao init()->initPartial() do boot).
-  bool fullRefresh = (++lockPartialRefreshCount >= kLockFullRefreshEvery);
-  if (fullRefresh) {
-    lockPartialRefreshCount = 0;
-  } else {
-    epd.initPartial();
-  }
-  lockScreen.draw(rtcWallpaperIndex, buildLockStatus(), fullRefresh);
-  power.epdOff();
-  power.audioOff(); // reafirma - este caminho nunca liga audio, mas o hold (Fase 4a) so cobre o estado que escrevemos aqui
-
-  esp_sleep_enable_ext1_wakeup((1ULL << PIN_BTN_BOOT) | (1ULL << PIN_BTN_PWR),
-                                ESP_EXT1_WAKEUP_ANY_LOW);
-  uint32_t refreshSec = settingsStore.get().lockRefreshSec;
-  if (refreshSec > 0) {
-    esp_sleep_enable_timer_wakeup((uint64_t)refreshSec * 1000000ULL);
-  }
   holdPowerRailsAndSleep();
 }
 
@@ -323,14 +259,6 @@ void setup() {
   gpio_hold_dis((gpio_num_t)PIN_AUDIO_PWR);
   gpio_hold_dis((gpio_num_t)PIN_VBAT_PWR);
   gpio_deep_sleep_hold_dis();
-
-  // Wake por timer (relogio da tela de bloqueio, a cada poucos minutos)
-  // usa um caminho bem mais curto - so I2C+e-paper, sem WiFi/codec/
-  // botoes - pra gastar o minimo de bateria possivel. Precisa ser a
-  // primeira coisa no setup(), antes de qualquer init pesado.
-  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) {
-    runLockScreenRefreshAndSleep(); // nao retorna
-  }
 
   Serial.begin(115200);
   delay(2000);

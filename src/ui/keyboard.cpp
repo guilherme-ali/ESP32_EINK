@@ -76,8 +76,7 @@ void Keyboard::onSelect() {
 
 void Keyboard::draw() {
   canvas_.clear(EPD_WHITE);
-  canvas_.drawRect(0, 0, 200, 200, EPD_BLACK);
-  canvas_.drawText(8, 6, title_, EPD_BLACK, 1);
+  canvas_.drawText(10, 8, title_, EPD_BLACK, FONT_EMPHASIS);
 
   char shown[40];
   if (mask_) {
@@ -86,34 +85,41 @@ void Keyboard::draw() {
     size_t start = len_ > 30 ? len_ - 30 : 0;
     snprintf(shown, sizeof(shown), "%s", buffer_ + start);
   }
-  canvas_.drawText(8, 17, shown, EPD_BLACK, 1);
-  canvas_.drawFastHLine(4, 28, 192, EPD_BLACK);
+  canvas_.drawText(10, 26, shown, EPD_BLACK, FONT_BODY);
+  canvas_.drawFastHLine(10, 32, 180, EPD_BLACK);
 
+  constexpr int kCellPad = 2;
+  constexpr int kCellRadius = 4;
   for (int i = 0; i < kTotalCells; i++) {
     int col = i % kCols;
     int row = i / kCols;
     int x = col * kCellW;
     int y = kGridY0 + row * kCellH;
     bool sel = (i == cursor_);
-    if (sel) canvas_.fillRect(x + 1, y + 1, kCellW - 2, kCellH - 2, EPD_BLACK);
+    if (sel) {
+      canvas_.fillRoundRect(x + kCellPad, y + kCellPad, kCellW - 2 * kCellPad,
+                             kCellH - 2 * kCellPad, kCellRadius, EPD_BLACK);
+    }
     uint8_t color = sel ? EPD_WHITE : EPD_BLACK;
 
     if (i < kCharCount) {
       char buf[2] = {(caseUpper_ ? kUpper : kLower)[i], '\0'};
-      int tw = Canvas::textWidth(buf, 2);
-      canvas_.drawText(x + (kCellW - tw) / 2, y + (kCellH - Canvas::charHeight(2)) / 2, buf, color, 2);
+      int tw = Canvas::textWidth(buf, FONT_EMPHASIS);
+      canvas_.drawText(x + (kCellW - tw) / 2, y + (kCellH - FONT_EMPHASIS.height) / 2, buf, color,
+                        FONT_EMPHASIS);
     } else {
       const char *label = i == kCase ? (caseUpper_ ? "ABC" : "abc")
                            : i == kSpace ? "_"
                            : i == kDel   ? "<-"
                            : i == kOk    ? "OK"
                                          : "X";
-      int tw = Canvas::textWidth(label, 1);
-      canvas_.drawText(x + (kCellW - tw) / 2, y + (kCellH - Canvas::charHeight(1)) / 2, label, color, 1);
+      int tw = Canvas::textWidth(label, FONT_BODY);
+      canvas_.drawText(x + (kCellW - tw) / 2, y + (kCellH - FONT_BODY.height) / 2, label, color,
+                        FONT_BODY);
     }
   }
 
-  canvas_.drawFastHLine(4, 178, 192, EPD_BLACK);
-  canvas_.drawText(8, 184, "BOOT insere | PWR nav/linha", EPD_BLACK, 1);
+  canvas_.drawFastHLine(10, 178, 180, EPD_BLACK);
+  canvas_.drawText(10, 181, "BOOT insere | PWR nav/linha", EPD_BLACK, FONT_BODY);
   epd_.displayPart();
 }

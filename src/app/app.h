@@ -5,6 +5,7 @@
 #include "../ui/keyboard.h"
 #include "../board/rtc.h"
 #include "../board/buttons.h"
+#include "../board/shtc3.h"
 #include "../audio/codec.h"
 #include "../audio/recorder.h"
 #include "../audio/player.h"
@@ -23,7 +24,7 @@ class App {
 public:
   App(EPaperDisplay &epd, Canvas &canvas, NotesStore &notes, SettingsStore &settingsStore,
       AudioCodec &codec, Recorder &recorder, Player &player, WifiManager &wifiMgr,
-      SttClient &sttClient, GDriveClient &gdrive, Rtc &rtc);
+      SttClient &sttClient, GDriveClient &gdrive, Rtc &rtc, Shtc3 &shtc3);
 
   // onSleepRequested e chamado quando o app decide dormir (timeout de
   // inatividade na tela inicial, ou PWR longo na tela inicial). Nao
@@ -77,6 +78,7 @@ private:
   SttClient &sttClient_;
   GDriveClient &gdrive_;
   Rtc &rtc_;
+  Shtc3 &shtc3_;
   Menu menu_;
   Keyboard keyboard_;
 

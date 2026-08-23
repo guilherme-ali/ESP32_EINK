@@ -47,12 +47,6 @@ public:
   // gravacao a cada segundo e verifica o timeout de inatividade.
   void loop();
 
-  // false durante a gravacao - as tasks de audio rodam no core 0 (ver
-  // audio/recorder.cpp) e o light sleep pausa o chip inteiro, os dois
-  // cores, o que interromperia a captura. main.cpp so tenta dormir leve
-  // entre eventos quando isto for true.
-  bool canLightSleep() const { return screen_ != Screen::Recording; }
-
 private:
   enum class Screen {
     Home,

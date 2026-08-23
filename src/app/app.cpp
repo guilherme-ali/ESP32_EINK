@@ -54,7 +54,6 @@ enum SettingsIdx {
   kSetWallpaper,
   kSetShowTemp,
   kSetAutoSync,
-  kSetPowerSaving,
   kSetDeleteAll,
   kSetBack,
   kSettingsItemCount
@@ -265,10 +264,6 @@ void App::drawSettings() {
   setVal(items[kSetAutoSync].value, sizeof(items[kSetAutoSync].value),
          cfg.autoSyncEnabled ? "sim" : "nao");
 
-  setItem(items[kSetPowerSaving], "Economia de energia");
-  setVal(items[kSetPowerSaving].value, sizeof(items[kSetPowerSaving].value),
-         cfg.powerSavingEnabled ? "sim" : "nao");
-
   setItem(items[kSetDeleteAll], "Apagar todas notas");
   setItem(items[kSetBack], "Voltar");
 
@@ -354,7 +349,8 @@ void App::stopRecording() {
   uint32_t bytes = recorder_.stop();
   codec_.enable(false);
   recording_ = false;
-  Serial.printf("Gravacao parada: %u bytes\n", bytes);
+  Serial.printf("Gravacao parada: %u bytes, %u overflow(s) no ring buffer\n", bytes,
+                (unsigned)recorder_.overflowCount());
 
   if (bytes == 0) {
     LittleFS.remove(currentRecordingPath_);
@@ -797,9 +793,6 @@ void App::onButtonSettings(BtnId id, BtnAction action) {
       break;
     case kSetAutoSync:
       settingsStore_.saveAutoSync(!cfg.autoSyncEnabled);
-      break;
-    case kSetPowerSaving:
-      settingsStore_.savePowerSaving(!cfg.powerSavingEnabled);
       break;
     case kSetDeleteAll: {
       confirmDeleteAllStep_ = 0;

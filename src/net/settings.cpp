@@ -56,7 +56,6 @@ void SettingsStore::load() {
   settings_.lockRefreshSec = prefs.getUShort("lockRefresh", 300);
   settings_.wallpaperChoice = (int8_t)prefs.getChar("wallpaper", -1);
   settings_.showTempHumidity = prefs.getBool("showTempHum", true);
-  settings_.powerSavingEnabled = prefs.getBool("powerSaving", true);
 }
 
 bool SettingsStore::saveWifiNetwork(const char *ssid, const char *pass) {
@@ -187,11 +186,5 @@ bool SettingsStore::saveWallpaperChoice(int8_t choice) {
 bool SettingsStore::saveShowTempHumidity(bool enabled) {
   settings_.showTempHumidity = enabled;
   prefs.putBool("showTempHum", enabled);
-  return true;
-}
-
-bool SettingsStore::savePowerSaving(bool enabled) {
-  settings_.powerSavingEnabled = enabled;
-  prefs.putBool("powerSaving", enabled);
   return true;
 }

@@ -26,11 +26,6 @@ public:
   // configuracao de Wi-Fi (so boot) e o app normal.
   void setCallback(ButtonEventFn onEvent);
 
-  // true se BOOT ou PWR estao fisicamente pressionados agora. main.cpp
-  // usa isto pra nao entrar em light sleep com um botao em andamento -
-  // a deteccao de long press depende do polling de 5ms continuar.
-  bool anyPressed();
-
 private:
   Button boot_{};
   Button pwr_{};

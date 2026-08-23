@@ -7,7 +7,7 @@ BoardPower::BoardPower(uint8_t epdPin, uint8_t audioPin, uint8_t vbatPin)
   pinMode(vbatPin_, OUTPUT);
   epdOff();
   audioOff();
-  vbatOff();
+  vbatOn(); // latch de energia da bateria - ver comentario em power.h
 }
 
 void BoardPower::epdOn()    { digitalWrite(epdPin_, LOW); }

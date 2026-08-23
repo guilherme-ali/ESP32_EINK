@@ -59,10 +59,6 @@ void Buttons::setCallback(ButtonEventFn onEvent) {
   onEvent_ = onEvent;
 }
 
-bool Buttons::anyPressed() {
-  return button_is_pressed(&boot_) == 1 || button_is_pressed(&pwr_) == 1;
-}
-
 void Buttons::poll() {
   uint32_t now = millis();
   while (now - lastTickMs_ >= TICKS_INTERVAL) {

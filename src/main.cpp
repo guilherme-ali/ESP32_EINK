@@ -206,10 +206,10 @@ static LockScreenStatus buildLockStatus() {
   status.hasTime = rtc.getDateTime(now);
   if (status.hasTime) status.time = now;
 
-  power.vbatOn();
-  delay(5); // divisor resistivo estabilizar
+  // VBAT_PWR fica sempre ligado (e o latch de energia da bateria, ver
+  // board/power.h) - o divisor ja esta estavel, sem precisar de delay
+  // nem religar antes de cada leitura.
   status.batteryPercent = Battery::readPercent();
-  power.vbatOff();
 
   status.hasTempHumidity = settingsStore.get().showTempHumidity &&
                             shtc3.read(status.tempC, status.humidity);
@@ -363,15 +363,6 @@ void setup() {
 
   buttons.begin(PIN_BTN_BOOT, PIN_BTN_PWR, onButtonEvent);
 
-  // Fonte de wake do light sleep usado no loop() abaixo, pra economizar
-  // bateria parado num menu esperando o proximo clique (240MHz girando
-  // a toa sem isso). Diferente do ext1 usado no deep sleep - convive
-  // sem conflito, e so precisa ser armada uma vez (persiste entre
-  // chamadas de esp_light_sleep_start()).
-  esp_sleep_enable_gpio_wakeup();
-  gpio_wakeup_enable((gpio_num_t)PIN_BTN_BOOT, GPIO_INTR_LOW_LEVEL);
-  gpio_wakeup_enable((gpio_num_t)PIN_BTN_PWR, GPIO_INTR_LOW_LEVEL);
-
   settingsStore.begin();
   runWifiSetup();
   runDrivePairingIfNeeded();
@@ -385,15 +376,4 @@ void loop() {
   buttons.poll();
   wifiMgr.loop();
   app.loop();
-
-  // Light sleep entre eventos: nunca durante a gravacao (as tasks de
-  // audio no core 0 seriam pausadas junto, ver App::canLightSleep()) e
-  // nunca com um botao fisicamente pressionado (a deteccao de long
-  // press depende do polling continuo de 5ms - ver Buttons::anyPressed()).
-  // O timer de 200ms existe so pra continuar reavaliando o timeout de
-  // inatividade da tela mesmo sem nenhum clique.
-  if (settingsStore.get().powerSavingEnabled && app.canLightSleep() && !buttons.anyPressed()) {
-    esp_sleep_enable_timer_wakeup(200000);
-    esp_light_sleep_start();
-  }
 }

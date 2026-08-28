@@ -224,9 +224,47 @@ void Canvas::drawProgressBar(int x, int y, int w, int h, int value, int maxValue
   fillRoundRect(x + pad, y + pad, fillW, innerH, innerR, color);
 }
 
-void Canvas::drawChar(int x, int y, char c, uint8_t color, const Font &font) {
-  if ((uint8_t)c < FONT_FIRST_CHAR || (uint8_t)c > FONT_LAST_CHAR) c = '?';
-  const FontGlyph &glyph = font.glyphs[(uint8_t)c - FONT_FIRST_CHAR];
+uint16_t Canvas::nextUtf8(const char *&p) {
+  if (!p || !*p) return 0;
+  uint8_t c = (uint8_t)*p++;
+  if (c < 0x80) return c; // 1-byte ASCII (0x00 .. 0x7F)
+
+  // 2-byte sequence (0xC0 .. 0xDF) -> codepoints 0x0080 .. 0x07FF (cobre todo o Latin-1: 0xA0..0xFF)
+  if ((c & 0xE0) == 0xC0) {
+    if (*p && ((uint8_t)*p & 0xC0) == 0x80) {
+      uint8_t c2 = (uint8_t)*p++;
+      return ((c & 0x1F) << 6) | (c2 & 0x3F);
+    }
+  }
+  // 3-byte sequence (0xE0 .. 0xEF)
+  if ((c & 0xF0) == 0xE0) {
+    if (*p && ((uint8_t)*p & 0xC0) == 0x80) {
+      p++;
+      if (*p && ((uint8_t)*p & 0xC0) == 0x80) {
+        p++;
+        return '?';
+      }
+    }
+  }
+  // 4-byte sequence (0xF0 .. 0xF7)
+  if ((c & 0xF8) == 0xF0) {
+    if (*p && ((uint8_t)*p & 0xC0) == 0x80) {
+      p++;
+      if (*p && ((uint8_t)*p & 0xC0) == 0x80) {
+        p++;
+        if (*p && ((uint8_t)*p & 0xC0) == 0x80) {
+          p++;
+          return '?';
+        }
+      }
+    }
+  }
+  return '?';
+}
+
+void Canvas::drawChar(int x, int y, uint16_t codepoint, uint8_t color, const Font &font) {
+  if (codepoint < FONT_FIRST_CHAR || codepoint > FONT_LAST_CHAR) codepoint = '?';
+  const FontGlyph &glyph = font.glyphs[codepoint - FONT_FIRST_CHAR];
 
   for (int col = 0; col < glyph.width; col++) {
     const uint8_t *colBytes = glyph.bitmap + (size_t)col * font.bytesPerCol;
@@ -240,82 +278,131 @@ void Canvas::drawChar(int x, int y, char c, uint8_t color, const Font &font) {
 
 void Canvas::drawText(int x, int y, const char *text, uint8_t color, const Font &font) {
   int cx = x;
-  for (const char *p = text; *p; p++) {
+  const char *p = text;
+  while (*p) {
+    if (*p == '\r') {
+      p++;
+      continue;
+    }
     if (*p == '\n') {
+      p++;
       cx = x;
       y += font.height;
       continue;
     }
-    drawChar(cx, y, *p, color, font);
-    cx += charWidth(*p, font);
+    uint16_t cp = nextUtf8(p);
+    drawChar(cx, y, cp, color, font);
+    cx += charWidth(cp, font);
   }
 }
 
-int Canvas::charWidth(char c, const Font &font) {
-  if ((uint8_t)c < FONT_FIRST_CHAR || (uint8_t)c > FONT_LAST_CHAR) c = '?';
-  return font.glyphs[(uint8_t)c - FONT_FIRST_CHAR].width;
+int Canvas::charWidth(uint16_t codepoint, const Font &font) {
+  if (codepoint < FONT_FIRST_CHAR || codepoint > FONT_LAST_CHAR) codepoint = '?';
+  return font.glyphs[codepoint - FONT_FIRST_CHAR].width;
 }
 
 int Canvas::textWidth(const char *text, const Font &font) {
   int w = 0;
-  for (const char *p = text; *p; p++) w += charWidth(*p, font);
+  const char *p = text;
+  while (*p) {
+    if (*p == '\r' || *p == '\n') {
+      p++;
+      continue;
+    }
+    uint16_t cp = nextUtf8(p);
+    w += charWidth(cp, font);
+  }
   return w;
 }
 
 int Canvas::drawWrappedText(int x, int y, const char *text, uint8_t color,
-                             const Font &font, int maxWidthPx, int lineHeight) {
-  int line = 0;
-  char lineBuf[160];
+                             const Font &font, int maxWidthPx, int lineHeight,
+                             int startLine, int maxLines, int *totalLinesOut) {
+  if (!text) return 0;
+  int currentLine = 0;
+  int drawnLines = 0;
+  char lineBuf[256];
   int lineLen = 0;
   int lineWidth = 0;
 
   auto flushLine = [&]() {
     lineBuf[lineLen] = '\0';
-    drawText(x, y + line * lineHeight, lineBuf, color, font);
-    line++;
+    if (currentLine >= startLine && (maxLines <= 0 || drawnLines < maxLines)) {
+      drawText(x, y + drawnLines * lineHeight, lineBuf, color, font);
+      drawnLines++;
+    }
+    currentLine++;
     lineLen = 0;
     lineWidth = 0;
   };
 
-  size_t len = strlen(text);
-  size_t i = 0;
+  const char *p = text;
   int spaceWidth = charWidth(' ', font);
 
-  while (i < len) {
-    size_t wordStart = i;
-    while (i < len && text[i] != ' ') i++;
-    size_t wordLen = i - wordStart;
+  while (*p) {
+    if (*p == '\r') {
+      p++;
+      continue;
+    }
+    if (*p == '\n') {
+      flushLine();
+      p++;
+      continue;
+    }
 
+    if (*p == ' ') {
+      while (*p == ' ') p++;
+      if (*p == '\n' || *p == '\r' || *p == '\0') continue;
+    }
+
+    const char *wordStart = p;
     int wordWidth = 0;
-    for (size_t k = 0; k < wordLen; k++) wordWidth += charWidth(text[wordStart + k], font);
+    while (*p && *p != ' ' && *p != '\n' && *p != '\r') {
+      uint16_t cp = nextUtf8(p);
+      wordWidth += charWidth(cp, font);
+    }
+    size_t wordByteLen = p - wordStart;
 
-    if (lineLen > 0 && lineWidth + spaceWidth + wordWidth > maxWidthPx) flushLine();
+    int neededWidth = wordWidth + (lineLen > 0 ? spaceWidth : 0);
+    if (lineLen > 0 && lineWidth + neededWidth > maxWidthPx) {
+      flushLine();
+    }
 
     if (wordWidth > maxWidthPx && lineLen == 0) {
-      // palavra maior que a linha inteira: forca quebra por caractere
-      for (size_t k = 0; k < wordLen; k++) {
-        char ch = text[wordStart + k];
-        int cw = charWidth(ch, font);
-        if (lineLen > 0 && lineWidth + cw > maxWidthPx) flushLine();
-        if (lineLen < (int)sizeof(lineBuf) - 1) {
-          lineBuf[lineLen++] = ch;
+      const char *wp = wordStart;
+      while (wp < p) {
+        const char *prev = wp;
+        uint16_t cp = nextUtf8(wp);
+        int cw = charWidth(cp, font);
+        size_t cbytes = wp - prev;
+        if (lineLen > 0 && lineWidth + cw > maxWidthPx) {
+          flushLine();
+        }
+        if (lineLen + (int)cbytes < (int)sizeof(lineBuf) - 1) {
+          memcpy(lineBuf + lineLen, prev, cbytes);
+          lineLen += cbytes;
           lineWidth += cw;
         }
       }
     } else {
-      if (lineLen > 0 && lineLen < (int)sizeof(lineBuf) - 1) {
+      if (lineLen > 0 && lineLen + 1 < (int)sizeof(lineBuf) - 1) {
         lineBuf[lineLen++] = ' ';
         lineWidth += spaceWidth;
       }
-      for (size_t k = 0; k < wordLen && lineLen < (int)sizeof(lineBuf) - 1; k++) {
-        lineBuf[lineLen++] = text[wordStart + k];
+      if (lineLen + (int)wordByteLen < (int)sizeof(lineBuf) - 1) {
+        memcpy(lineBuf + lineLen, wordStart, wordByteLen);
+        lineLen += wordByteLen;
+        lineWidth += wordWidth;
       }
-      lineWidth += wordWidth;
     }
-
-    while (i < len && text[i] == ' ') i++;
   }
-  if (lineLen > 0) flushLine();
 
-  return line;
+  if (lineLen > 0) {
+    flushLine();
+  }
+
+  if (totalLinesOut) {
+    *totalLinesOut = currentLine;
+  }
+  return drawnLines;
 }

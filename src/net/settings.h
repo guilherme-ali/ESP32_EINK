@@ -17,7 +17,7 @@ struct Settings {
   char favoriteWifiSsid[33] = "";
 
   char sttEndpoint[128] = "";
-  char sttModel[32] = "whisper-large-v3";
+  char sttModel[32] = "gemini-3.6-flash";
   char sttApiKey[128] = "";
 
   char driveClientId[128] = "";

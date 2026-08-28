@@ -22,7 +22,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 FIRST_CHAR = 0x20
-LAST_CHAR = 0x7E
+LAST_CHAR = 0xFF
 # Pixel do glifo (fundo preto, texto branco) conta como tinta se
 # brilho >= THRESHOLD. Mais baixo = mais generoso com bordas
 # anti-aliased = traco mais grosso/solido, menos serrilhado no 1-bit
@@ -70,9 +70,13 @@ def emit_font(name: str, ttf_path: Path, size_pt: int, comment: str, out):
 
     glyphs = []  # (char, width, [col_bytes...])
     for code in range(FIRST_CHAR, LAST_CHAR + 1):
-        ch = chr(code)
-        width, img = render_glyph(font, ch, height)
-        cols = pack_columns(img, width, height, bytes_per_col)
+        if 0x80 <= code <= 0x9F:
+            width = 1
+            cols = [bytes(bytes_per_col)]
+        else:
+            ch = chr(code)
+            width, img = render_glyph(font, ch, height)
+            cols = pack_columns(img, width, height, bytes_per_col)
         glyphs.append((code, width, cols))
 
     out.write(f"// {name}: {ttf_path.name} @ {size_pt}pt -> altura {height}px "
@@ -92,7 +96,8 @@ def emit_font(name: str, ttf_path: Path, size_pt: int, comment: str, out):
     out.write(f"static const FontGlyph {name}_GLYPHS[FONT_GLYPH_COUNT] = {{\n")
     for code, width, cols in glyphs:
         var = f"{name}_BM_{code:02X}"
-        out.write(f"  {{ {width}, {var} }}, // 0x{code:02X} '{chr(code)}'\n")
+        label = chr(code) if (0x20 <= code <= 0x7E or 0xA0 <= code <= 0xFF) else f"0x{code:02X}"
+        out.write(f"  {{ {width}, {var} }}, // 0x{code:02X} '{label}'\n")
     out.write("};\n")
     out.write(f"static const Font {name} = {{ {height}, {bytes_per_col}, {name}_GLYPHS }};\n\n")
 

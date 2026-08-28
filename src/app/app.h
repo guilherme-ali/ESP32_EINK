@@ -56,7 +56,7 @@ private:
     NotesList,
     NoteDetail,
     ConfirmDeleteOne,
-    TranscriptView,
+    TextViewer,
     Settings,
     ConfirmDeleteAll,
     About,
@@ -112,6 +112,12 @@ private:
   char currentRecordingPath_[48] = "";
   uint32_t recordingStartMs_ = 0;
   char lastTxtPath_[48] = "";
+  char lastMdPath_[48] = "";
+
+  int textViewerPage_ = 0;
+  int textViewerTotalPages_ = 1;
+  char textViewerTitle_[32] = "";
+  char textViewerBuf_[SttClient::kMaxTextLen] = "";
 
   uint32_t lastActivityMs_ = 0;
 
@@ -132,6 +138,7 @@ private:
   void drawRootMenu();
   void drawNotesList();
   void drawNoteDetail();
+  void drawTextViewer();
   void drawSettings();
   void drawWifiMenu();
   void drawWifiNetworkDetail();
@@ -158,7 +165,7 @@ private:
   void onButtonNotesList(BtnId id, BtnAction action);
   void onButtonNoteDetail(BtnId id, BtnAction action);
   void onButtonConfirmDeleteOne(BtnId id, BtnAction action);
-  void onButtonTranscriptView(BtnId id, BtnAction action);
+  void onButtonTextViewer(BtnId id, BtnAction action);
   void onButtonSettings(BtnId id, BtnAction action);
   void onButtonConfirmDeleteAll(BtnId id, BtnAction action);
   void onButtonAbout(BtnId id, BtnAction action);

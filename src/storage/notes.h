@@ -13,6 +13,7 @@ struct NoteEntry {
   uint32_t sampleRateHz; // lido do cabecalho WAV - notas antigas podem
                           // ter sido gravadas numa taxa diferente da atual
   bool hasTxt; // tem NOME.txt (transcrita) do lado
+  bool hasMd;  // tem NOME.md (resumo em topicos) do lado
   bool hasSnc; // tem NOME.snc (ja enviada ao Drive) do lado
 };
 

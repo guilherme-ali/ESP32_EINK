@@ -15,10 +15,11 @@ public:
   using ShowCodeFn = void (*)(const char *userCode, const char *verificationUrl);
   bool pairDevice(SettingsStore &settings, ShowCodeFn showCode);
 
-  // Envia wavPath (e txtPath, se != nullptr) para a pasta do app no
+  // Envia wavPath (e txtPath / mdPath, se existirem) para a pasta do app no
   // Drive, criando a pasta na primeira vez. Renova o access token
   // sozinho a partir do refresh_token salvo.
-  bool uploadNote(SettingsStore &settings, const char *wavPath, const char *txtPath);
+  bool uploadNote(SettingsStore &settings, const char *wavPath, const char *txtPath = nullptr,
+                  const char *mdPath = nullptr);
 
 private:
   bool refreshAccessToken(Settings &cfg, String &outAccessToken);

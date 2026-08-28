@@ -303,7 +303,8 @@ bool GDriveClient::uploadFile(const String &accessToken, const String &folderId,
   return ok;
 }
 
-bool GDriveClient::uploadNote(SettingsStore &settingsStore, const char *wavPath, const char *txtPath) {
+bool GDriveClient::uploadNote(SettingsStore &settingsStore, const char *wavPath,
+                               const char *txtPath, const char *mdPath) {
   Settings &cfg = settingsStore.get();
   if (!settingsStore.hasDriveAuth()) {
     Serial.println("[Drive] ainda nao pareado.");
@@ -328,6 +329,13 @@ bool GDriveClient::uploadNote(SettingsStore &settingsStore, const char *wavPath,
     int s2 = txtName.lastIndexOf('/');
     if (s2 >= 0) txtName = txtName.substring(s2 + 1);
     uploadFile(accessToken, folderId, txtPath, txtName.c_str(), "text/plain; charset=utf-8");
+  }
+
+  if (ok && mdPath && LittleFS.exists(mdPath)) {
+    String mdName = String(mdPath);
+    int s3 = mdName.lastIndexOf('/');
+    if (s3 >= 0) mdName = mdName.substring(s3 + 1);
+    uploadFile(accessToken, folderId, mdPath, mdName.c_str(), "text/markdown; charset=utf-8");
   }
 
   if (ok) {

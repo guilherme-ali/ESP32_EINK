@@ -36,6 +36,7 @@ void rescan() {
         if (dot) *dot = '\0';
         e.sizeBytes = f.size();
         e.hasTxt = false;
+        e.hasMd = false;
         e.hasSnc = false;
 
         WavHeader hdr;
@@ -62,13 +63,15 @@ void rescan() {
         int slash = name.lastIndexOf('/');
         String base = slash >= 0 ? name.substring(slash + 1) : name;
         bool isTxt = base.endsWith(".txt");
+        bool isMd = base.endsWith(".md");
         bool isSnc = base.endsWith(".snc");
-        if (isTxt || isSnc) {
+        if (isTxt || isMd || isSnc) {
           int dot = base.lastIndexOf('.');
           String label = dot >= 0 ? base.substring(0, dot) : base;
           for (int i = 0; i < g_cacheCount; i++) {
             if (label == g_cache[i].label) {
               if (isTxt) g_cache[i].hasTxt = true;
+              else if (isMd) g_cache[i].hasMd = true;
               else g_cache[i].hasSnc = true;
               break;
             }
@@ -138,10 +141,12 @@ bool NotesStore::deleteAt(int index) {
 
   String wavPath = String(g_cache[index].path);
   String txtPath = wavPath; txtPath.replace(".wav", ".txt");
+  String mdPath = wavPath; mdPath.replace(".wav", ".md");
   String sncPath = wavPath; sncPath.replace(".wav", ".snc");
 
   bool ok = LittleFS.remove(wavPath);
   if (g_cache[index].hasTxt) LittleFS.remove(txtPath);
+  if (g_cache[index].hasMd) LittleFS.remove(mdPath);
   if (g_cache[index].hasSnc) LittleFS.remove(sncPath);
   g_dirty = true;
   return ok;
@@ -153,9 +158,11 @@ int NotesStore::deleteAll() {
   for (int i = 0; i < g_cacheCount; i++) {
     String wavPath = String(g_cache[i].path);
     String txtPath = wavPath; txtPath.replace(".wav", ".txt");
+    String mdPath = wavPath; mdPath.replace(".wav", ".md");
     String sncPath = wavPath; sncPath.replace(".wav", ".snc");
     if (LittleFS.remove(wavPath)) removed++;
     if (g_cache[i].hasTxt) LittleFS.remove(txtPath);
+    if (g_cache[i].hasMd) LittleFS.remove(mdPath);
     if (g_cache[i].hasSnc) LittleFS.remove(sncPath);
   }
   g_cacheCount = 0;

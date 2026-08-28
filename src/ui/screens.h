@@ -23,6 +23,10 @@ void drawRecording(Canvas &canvas, EPaperDisplay &epd, uint32_t elapsedSec, uint
 void drawText(Canvas &canvas, EPaperDisplay &epd, const char *title, const char *body,
               const char *footerHint = nullptr);
 
+// Visualizador de texto paginado com suporte a rolagem de paginas.
+void drawPagedText(Canvas &canvas, EPaperDisplay &epd, const char *title, const char *body,
+                   int pageIndex, int &totalPagesOut, const char *footerHint = nullptr);
+
 // Tela de confirmacao de uma acao (apagar nota, apagar tudo, etc.).
 void drawConfirm(Canvas &canvas, EPaperDisplay &epd, const char *title, const char *message);
 

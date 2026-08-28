@@ -110,6 +110,40 @@ void drawText(Canvas &canvas, EPaperDisplay &epd, const char *title, const char 
   epd.displayPart();
 }
 
+void drawPagedText(Canvas &canvas, EPaperDisplay &epd, const char *title, const char *body,
+                   int pageIndex, int &totalPagesOut, const char *footerHint) {
+  canvas.clear(EPD_WHITE);
+
+  constexpr int kLinesPerPage = 7;
+  constexpr int kLineHeight = 18;
+  int startLine = pageIndex * kLinesPerPage;
+  int totalLines = 0;
+
+  canvas.drawWrappedText(kMarginX, 40, body, EPD_BLACK, FONT_BODY, kContentW, kLineHeight,
+                         startLine, kLinesPerPage, &totalLines);
+
+  totalPagesOut = (totalLines + kLinesPerPage - 1) / kLinesPerPage;
+  if (totalPagesOut <= 0) totalPagesOut = 1;
+
+  if (totalPagesOut > 1) {
+    char pageTitle[48];
+    snprintf(pageTitle, sizeof(pageTitle), "%s [%d/%d]", title, pageIndex + 1, totalPagesOut);
+    drawHeader(canvas, pageTitle);
+  } else {
+    drawHeader(canvas, title);
+  }
+
+  if (footerHint) {
+    drawFooter(canvas, footerHint);
+  } else if (totalPagesOut > 1) {
+    drawFooter(canvas, "BOOT pag | PWR volta");
+  } else {
+    drawFooter(canvas, "PWR volta");
+  }
+
+  epd.displayPart();
+}
+
 void drawConfirm(Canvas &canvas, EPaperDisplay &epd, const char *title, const char *message) {
   canvas.clear(EPD_WHITE);
   drawHeader(canvas, title);

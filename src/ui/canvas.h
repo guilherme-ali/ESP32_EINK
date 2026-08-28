@@ -35,17 +35,19 @@ public:
   // fica por conta de quem chama.
   void drawProgressBar(int x, int y, int w, int h, int value, int maxValue, uint8_t color);
 
-  void drawChar(int x, int y, char c, uint8_t color, const Font &font);
+  void drawChar(int x, int y, uint16_t codepoint, uint8_t color, const Font &font);
   void drawText(int x, int y, const char *text, uint8_t color, const Font &font);
 
   // Quebra `text` em varias linhas de ate `maxWidthPx` pixels (quebra em
-  // espaco quando possivel) e desenha a partir de (x,y). Retorna o numero
-  // de linhas desenhadas.
+  // espaco ou \n) e desenha a partir de (x,y). Permite paginacao via
+  // startLine e maxLines. Retorna o numero de linhas desenhadas.
   int drawWrappedText(int x, int y, const char *text, uint8_t color,
-                       const Font &font, int maxWidthPx, int lineHeight);
+                       const Font &font, int maxWidthPx, int lineHeight,
+                       int startLine = 0, int maxLines = 0, int *totalLinesOut = nullptr);
 
   static int textWidth(const char *text, const Font &font);
-  static int charWidth(char c, const Font &font);
+  static int charWidth(uint16_t codepoint, const Font &font);
+  static uint16_t nextUtf8(const char *&p);
 
 private:
   EPaperDisplay &epd_;

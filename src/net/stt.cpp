@@ -24,13 +24,14 @@ bool parseUrl(const String &url, String &host, uint16_t &port, String &path) {
   return host.length() > 0;
 }
 
-// Extrai o valor de "text":"..." de um corpo JSON simples - serve tanto
-// para {"text": "..."} (OpenAI/Groq) quanto para
-// candidates[0].content.parts[0].text (Gemini), ja que os dois usam a
-// mesma chave "text" e so precisamos do primeiro valor.
+// Extrai o valor de "text":"..." ou "content":"..." de um corpo JSON simples - serve
+// tanto para {"text": "..."} (OpenAI/Groq STT), {"choices":[{"message":{"content":"..."}}]} (OpenAI/Groq Chat)
+// quanto para candidates[0].content.parts[0].text (Gemini). Decodifica escapes \n, \t e \uXXXX (incluindo surrogate pairs).
 bool extractJsonText(const String &body, char *out, size_t outLen) {
   int key = body.indexOf("\"text\"");
+  if (key < 0) key = body.indexOf("\"content\"");
   if (key < 0) return false;
+
   int colon = body.indexOf(':', key);
   if (colon < 0) return false;
   int start = body.indexOf('"', colon + 1);
@@ -45,8 +46,45 @@ bool extractJsonText(const String &body, char *out, size_t outLen) {
     if (c == '\\' && i + 1 < (int)body.length()) {
       char next = body[i + 1];
       if (next == 'n') { out[o++] = '\n'; i += 2; continue; }
+      if (next == 'r') { i += 2; continue; }
       if (next == 't') { out[o++] = '\t'; i += 2; continue; }
       if (next == '"' || next == '\\' || next == '/') { out[o++] = next; i += 2; continue; }
+      if (next == 'u' && i + 5 < (int)body.length()) {
+        char hex[5] = {body[i + 2], body[i + 3], body[i + 4], body[i + 5], '\0'};
+        uint32_t cp = strtoul(hex, nullptr, 16);
+        i += 6;
+        if (cp >= 0xD800 && cp <= 0xDBFF && i + 5 < (int)body.length() &&
+            body[i] == '\\' && body[i + 1] == 'u') {
+          char hex2[5] = {body[i + 2], body[i + 3], body[i + 4], body[i + 5], '\0'};
+          uint32_t cp2 = strtoul(hex2, nullptr, 16);
+          if (cp2 >= 0xDC00 && cp2 <= 0xDFFF) {
+            cp = 0x10000 + (((cp & 0x3FF) << 10) | (cp2 & 0x3FF));
+            i += 6;
+          }
+        }
+        if (cp < 0x80) {
+          out[o++] = (char)cp;
+        } else if (cp < 0x800) {
+          if (o + 2 < outLen) {
+            out[o++] = (char)(0xC0 | (cp >> 6));
+            out[o++] = (char)(0x80 | (cp & 0x3F));
+          }
+        } else if (cp < 0x10000) {
+          if (o + 3 < outLen) {
+            out[o++] = (char)(0xE0 | (cp >> 12));
+            out[o++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            out[o++] = (char)(0x80 | (cp & 0x3F));
+          }
+        } else {
+          if (o + 4 < outLen) {
+            out[o++] = (char)(0xF0 | (cp >> 18));
+            out[o++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+            out[o++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            out[o++] = (char)(0x80 | (cp & 0x3F));
+          }
+        }
+        continue;
+      }
       i++;
       continue;
     }
@@ -55,6 +93,28 @@ bool extractJsonText(const String &body, char *out, size_t outLen) {
   }
   out[o] = '\0';
   return o > 0;
+}
+
+void escapeJson(const char *src, String &out) {
+  while (*src) {
+    char c = *src++;
+    if (c == '"') out += "\\\"";
+    else if (c == '\\') out += "\\\\";
+    else if (c == '\n') out += "\\n";
+    else if (c == '\r') continue;
+    else if (c == '\t') out += "\\t";
+    else out += c;
+  }
+}
+
+String resolveGeminiModel(const char *configuredModel) {
+  String m = String(configuredModel);
+  m.trim();
+  if (m.startsWith("models/")) m = m.substring(7);
+  if (m.length() == 0 || m.indexOf("whisper") >= 0) {
+    return "gemini-3.6-flash";
+  }
+  return m;
 }
 
 // Le a resposta HTTP (status + headers + corpo) de um client ja conectado.
@@ -125,7 +185,11 @@ bool readHttpResponse(WiFiClientSecure &client, String &body) {
 // como "gemini-2.5-flash"; a URL completa e montada aqui.
 bool transcribeGemini(const Settings &cfg, const String &host, uint16_t port, File &file,
                        size_t fileSize, char *outText, size_t outLen) {
-  String path = "/v1beta/models/" + String(cfg.sttModel) + ":generateContent";
+  String model = resolveGeminiModel(cfg.sttModel);
+  String path = "/v1beta/models/" + model + ":generateContent";
+  if (cfg.sttApiKey[0] != '\0') {
+    path += "?key=" + String(cfg.sttApiKey);
+  }
 
   const char *kPrefix =
       "{\"contents\":[{\"parts\":[{\"text\":\"Transcreva o audio a seguir literalmente, "
@@ -138,9 +202,9 @@ bool transcribeGemini(const Settings &cfg, const String &host, uint16_t port, Fi
 
   WiFiClientSecure client;
   client.setInsecure();
-  client.setTimeout(20000);
+  client.setTimeout(25000);
 
-  Serial.printf("[STT/Gemini] conectando a %s:%u...\n", host.c_str(), port);
+  Serial.printf("[STT/Gemini] conectando a %s:%u (modelo %s)...\n", host.c_str(), port, model.c_str());
   if (!client.connect(host.c_str(), port)) {
     Serial.println("[STT] falha ao conectar.");
     return false;
@@ -155,9 +219,6 @@ bool transcribeGemini(const Settings &cfg, const String &host, uint16_t port, Fi
 
   client.print(kPrefix);
 
-  // Blocos multiplos de 3 bytes (exceto o ultimo) para que a
-  // concatenacao das codificacoes base64 de cada bloco seja identica a
-  // codificar o arquivo inteiro de uma vez.
   uint8_t buf[768];
   while (file.available()) {
     size_t n = file.read(buf, sizeof(buf));
@@ -287,5 +348,167 @@ bool SttClient::transcribe(const Settings &cfg, const char *wavPath, char *outTe
   }
 
   Serial.println("[STT] desistindo apos todas as tentativas.");
+  return false;
+}
+
+bool generateSummaryGemini(const Settings &cfg, const String &host, uint16_t port,
+                            const char *transcriptText, char *outMarkdown, size_t outLen) {
+  String model = resolveGeminiModel(cfg.sttModel);
+  String path = "/v1beta/models/" + model + ":generateContent";
+  if (cfg.sttApiKey[0] != '\0') {
+    path += "?key=" + String(cfg.sttApiKey);
+  }
+
+  const char *kPrompt =
+      "Voce e um assistente pessoal inteligente especializado em sintetizar notas de voz em portugues do Brasil, "
+      "no formato Markdown estruturado em topicos.\\n\\n"
+      "Analise a transcricao a seguir, identifique o contexto e estruture o documento de forma inteligente conforme o tipo de nota:\\n"
+      "1. Se for Ideia/Projeto/Conceito: # 💡 Ideia: [Titulo Curto]\\n## Conceito Principal\\n## Pontos-Chave\\n## Proximos Passos\\n"
+      "2. Se for Tarefas/Lembretes: # 📋 Tarefas: [Titulo]\\n## Objetivo\\n## Acoes a Realizar (- [ ] item)\\n## Observacoes ou Prazos\\n"
+      "3. Se for Reuniao/Conversa: # 👥 Reuniao: [Tema Principal]\\n## Contexto e Topicos Discutidos\\n## Decisoes Tomadas\\n## Acoes e Responsaveis (- [ ] tarefa)\\n"
+      "4. Se for Nota Rapida/Reflexao: # 📝 Nota: [Assunto]\\n## Sintese em Topicos\\n\\n"
+      "Diretrizes: Seja conciso, direto e limpo. Responda apenas com o texto Markdown formatado, sem preambulos ou introducoes.\\n\\n"
+      "Transcricao:\\n";
+
+  String escapedTranscript;
+  escapedTranscript.reserve(strlen(transcriptText) * 2 + 64);
+  escapeJson(transcriptText, escapedTranscript);
+
+  const char *kPrefix = "{\"contents\":[{\"parts\":[{\"text\":\"";
+  const char *kSuffix = "\"}]}]}";
+  size_t contentLength = strlen(kPrefix) + strlen(kPrompt) + escapedTranscript.length() + strlen(kSuffix);
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(25000);
+
+  Serial.printf("[Summary/Gemini] conectando a %s:%u (modelo %s)...\n", host.c_str(), port, model.c_str());
+  if (!client.connect(host.c_str(), port)) {
+    Serial.println("[Summary] falha ao conectar.");
+    return false;
+  }
+
+  client.printf("POST %s HTTP/1.1\r\n", path.c_str());
+  client.printf("Host: %s\r\n", host.c_str());
+  client.printf("x-goog-api-key: %s\r\n", cfg.sttApiKey);
+  client.print("Content-Type: application/json\r\n");
+  client.printf("Content-Length: %u\r\n", (unsigned)contentLength);
+  client.print("Connection: close\r\n\r\n");
+
+  client.print(kPrefix);
+  client.print(kPrompt);
+  client.print(escapedTranscript);
+  client.print(kSuffix);
+
+  Serial.println("[Summary] aguardando resposta...");
+  String respBody;
+  bool ok = readHttpResponse(client, respBody);
+  if (!ok) {
+    Serial.println("[Summary] resposta HTTP nao-200:");
+    Serial.println(respBody);
+    return false;
+  }
+  if (!extractJsonText(respBody, outMarkdown, outLen)) {
+    Serial.println("[Summary] nao encontrou texto no retorno:");
+    Serial.println(respBody);
+    return false;
+  }
+  return true;
+}
+
+bool generateSummaryOpenAi(const Settings &cfg, const String &host, uint16_t port,
+                           const String &path, const char *transcriptText,
+                           char *outMarkdown, size_t outLen) {
+  (void)path;
+  String chatPath = "/v1/chat/completions";
+  String model = cfg.sttModel;
+  if (model.indexOf("whisper") >= 0) {
+    if (host.indexOf("groq.com") >= 0) model = "llama-3.3-70b-versatile";
+    else model = "gpt-4o-mini";
+  }
+
+  const char *kSystem =
+      "Você é um assistente pessoal inteligente especializado em sintetizar notas de voz em português do Brasil, "
+      "no formato Markdown estruturado em tópicos. Identifique se é ideia, tarefa, reunião ou nota rápida e estruture com tópicos e checkboxes. "
+      "Seja direto e conciso, sem preâmbulos.";
+
+  String escapedSys, escapedTranscript;
+  escapeJson(kSystem, escapedSys);
+  escapeJson(transcriptText, escapedTranscript);
+
+  String body = "{\"model\":\"" + model + "\",\"messages\":["
+                "{\"role\":\"system\",\"content\":\"" + escapedSys + "\"},"
+                "{\"role\":\"user\",\"content\":\"" + escapedTranscript + "\"}]}";
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(20000);
+
+  Serial.printf("[Summary] conectando a %s:%u...\n", host.c_str(), port);
+  if (!client.connect(host.c_str(), port)) {
+    Serial.println("[Summary] falha ao conectar.");
+    return false;
+  }
+
+  client.printf("POST %s HTTP/1.1\r\n", chatPath.c_str());
+  client.printf("Host: %s\r\n", host.c_str());
+  if (cfg.sttApiKey[0] != '\0') {
+    client.printf("Authorization: Bearer %s\r\n", cfg.sttApiKey);
+  }
+  client.print("Content-Type: application/json\r\n");
+  client.printf("Content-Length: %u\r\n", (unsigned)body.length());
+  client.print("Connection: close\r\n\r\n");
+  client.print(body);
+
+  Serial.println("[Summary] aguardando resposta...");
+  String respBody;
+  bool ok = readHttpResponse(client, respBody);
+  if (!ok) {
+    Serial.println("[Summary] resposta HTTP nao-200:");
+    Serial.println(respBody);
+    return false;
+  }
+  if (!extractJsonText(respBody, outMarkdown, outLen)) {
+    Serial.println("[Summary] nao encontrou texto no retorno:");
+    Serial.println(respBody);
+    return false;
+  }
+  return true;
+}
+
+bool SttClient::generateSummary(const Settings &cfg, const char *transcriptText,
+                                char *outMarkdown, size_t outLen) {
+  if (!transcriptText || strlen(transcriptText) == 0) return false;
+  if (cfg.sttEndpoint[0] == '\0') {
+    Serial.println("[Summary] endpoint nao configurado.");
+    return false;
+  }
+
+  String host, path;
+  uint16_t port;
+  if (!parseUrl(cfg.sttEndpoint, host, port, path)) {
+    Serial.println("[Summary] URL invalida.");
+    return false;
+  }
+
+  constexpr int kMaxAttempts = 2;
+  for (int attempt = 1; attempt <= kMaxAttempts; attempt++) {
+    bool ok;
+    if (host == "generativelanguage.googleapis.com") {
+      ok = generateSummaryGemini(cfg, host, port, transcriptText, outMarkdown, outLen);
+    } else {
+      ok = generateSummaryOpenAi(cfg, host, port, path, transcriptText, outMarkdown, outLen);
+    }
+    if (ok) {
+      Serial.printf("[Summary] resumo gerado (%u chars).\n", (unsigned)strlen(outMarkdown));
+      return true;
+    }
+    if (attempt < kMaxAttempts) {
+      Serial.printf("[Summary] tentativa %d falhou, tentando em 2s...\n", attempt);
+      delay(2000);
+    }
+  }
+
+  Serial.println("[Summary] falha ao gerar resumo apos todas as tentativas.");
   return false;
 }

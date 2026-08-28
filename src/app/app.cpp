@@ -41,7 +41,15 @@ const char *const kWallpaperNames[] = {"Montanhas", "Topo", "Estrelas", "Ondas",
 
 enum RootIdx { kRootRecord = 0, kRootNotes, kRootSync, kRootWifi, kRootSettings, kRootAbout, kRootCount };
 
-enum NoteDetailIdx { kNdPlay = 0, kNdTranscript, kNdSync, kNdDelete, kNdBack, kNoteDetailCount };
+enum NoteDetailIdx {
+  kNdSummary = 0,
+  kNdTranscript,
+  kNdPlay,
+  kNdSync,
+  kNdDelete,
+  kNdBack,
+  kNoteDetailCount
+};
 
 enum SettingsIdx {
   kSetAudio = 0,
@@ -227,15 +235,22 @@ void App::drawNoteDetail() {
   }
 
   MenuItem items[kNoteDetailCount];
-  setItem(items[kNdPlay], "Reproduzir");
+  setItem(items[kNdSummary], "Ver resumo (.md)");
+  setVal(items[kNdSummary].value, sizeof(items[kNdSummary].value), e.hasMd ? "ok" : "sem");
   setItem(items[kNdTranscript], "Ver transcricao");
   setVal(items[kNdTranscript].value, sizeof(items[kNdTranscript].value), e.hasTxt ? "ok" : "sem");
+  setItem(items[kNdPlay], "Reproduzir");
   setItem(items[kNdSync], "Sincronizar esta");
   setVal(items[kNdSync].value, sizeof(items[kNdSync].value), e.hasSnc ? "enviada" : "pendente");
   setItem(items[kNdDelete], "Apagar");
   setItem(items[kNdBack], "Voltar");
 
   menu_.draw(e.label, items, kNoteDetailCount, noteDetailSel_, "BOOT sel | PWR nav/volta");
+}
+
+void App::drawTextViewer() {
+  Screens::drawPagedText(canvas_, epd_, textViewerTitle_, textViewerBuf_,
+                         textViewerPage_, textViewerTotalPages_);
 }
 
 void App::drawSettings() {
@@ -388,17 +403,59 @@ void App::playSelected(int index) {
 
 bool App::transcribeNote(const char *wavPath) {
   const Settings &cfg = settingsStore_.get();
-  if (cfg.sttEndpoint[0] == '\0') return false;
-
-  static char textBuf[SttClient::kMaxTextLen];
-  if (!sttClient_.transcribe(cfg, wavPath, textBuf, sizeof(textBuf))) return false;
+  if (cfg.sttEndpoint[0] == '\0') {
+    Serial.println("[App] STT endpoint nao configurado.");
+    return false;
+  }
 
   String txtPath = String(wavPath);
   txtPath.replace(".wav", ".txt");
-  File f = LittleFS.open(txtPath, FILE_WRITE);
-  if (!f) return false;
-  f.print(textBuf);
-  f.close();
+  String mdPath = String(wavPath);
+  mdPath.replace(".wav", ".md");
+
+  static char textBuf[SttClient::kMaxTextLen];
+  bool hasText = false;
+
+  if (LittleFS.exists(txtPath)) {
+    File f = LittleFS.open(txtPath, FILE_READ);
+    if (f) {
+      size_t n = f.readBytes(textBuf, sizeof(textBuf) - 1);
+      textBuf[n] = '\0';
+      f.close();
+      hasText = (n > 0);
+    }
+  }
+
+  if (!hasText) {
+    Serial.printf("[App] Transcrevendo %s...\n", wavPath);
+    if (!sttClient_.transcribe(cfg, wavPath, textBuf, sizeof(textBuf))) {
+      Serial.println("[App] Transcricao falhou.");
+      return false;
+    }
+    File f = LittleFS.open(txtPath, FILE_WRITE);
+    if (f) {
+      f.print(textBuf);
+      f.close();
+      hasText = true;
+      Serial.printf("[App] Transcricao gravada em %s\n", txtPath.c_str());
+    }
+  }
+
+  if (hasText && !LittleFS.exists(mdPath)) {
+    Serial.printf("[App] Gerando resumo .md para %s...\n", wavPath);
+    static char summaryBuf[SttClient::kMaxTextLen];
+    if (sttClient_.generateSummary(cfg, textBuf, summaryBuf, sizeof(summaryBuf))) {
+      File mf = LittleFS.open(mdPath, FILE_WRITE);
+      if (mf) {
+        mf.print(summaryBuf);
+        mf.close();
+        Serial.printf("[App] Resumo .md salvo em %s (%u bytes)\n", mdPath.c_str(), (unsigned)strlen(summaryBuf));
+      }
+    } else {
+      Serial.println("[App] Falha ao gerar resumo .md.");
+    }
+  }
+
   return true;
 }
 
@@ -406,6 +463,7 @@ bool App::transcribeNote(const char *wavPath) {
 // pendente ate o usuario apertar "Sincronizar" no menu (runManualSync()).
 void App::transcribeIfPossible(const char *wavPath) {
   lastTxtPath_[0] = '\0';
+  lastMdPath_[0] = '\0';
   const Settings &cfg = settingsStore_.get();
   if (!wifiMgr_.isConnected() || cfg.sttEndpoint[0] == '\0') return;
 
@@ -428,7 +486,27 @@ void App::transcribeIfPossible(const char *wavPath) {
     notes_.markDirty();
   }
 
-  Screens::drawText(canvas_, epd_, "Nota transcrita:", textBuf, "BOOT grava | PWR menu");
+  Screens::drawState(canvas_, epd_, Screens::StateIcon::Activity, "resumindo",
+                      "gerando resumo em topicos via IA");
+
+  static char summaryBuf[SttClient::kMaxTextLen];
+  if (sttClient_.generateSummary(cfg, textBuf, summaryBuf, sizeof(summaryBuf))) {
+    String mdPath = String(wavPath);
+    mdPath.replace(".wav", ".md");
+    File mf = LittleFS.open(mdPath, FILE_WRITE);
+    if (mf) {
+      mf.print(summaryBuf);
+      mf.close();
+      strncpy(lastMdPath_, mdPath.c_str(), sizeof(lastMdPath_) - 1);
+      notes_.markDirty();
+    }
+  }
+
+  if (lastMdPath_[0] != '\0') {
+    Screens::drawText(canvas_, epd_, "Resumo gerado:", summaryBuf, "BOOT grava | PWR menu");
+  } else {
+    Screens::drawText(canvas_, epd_, "Nota transcrita:", textBuf, "BOOT grava | PWR menu");
+  }
   delay(3000); // da tempo de ler antes de seguir pra tela inicial
 }
 
@@ -439,7 +517,8 @@ void App::syncIfPossible(const char *wavPath) {
   Screens::drawState(canvas_, epd_, Screens::StateIcon::Activity, "sincronizando",
                       "enviando para o Google Drive");
   const char *txtPath = lastTxtPath_[0] ? lastTxtPath_ : nullptr;
-  if (!gdrive_.uploadNote(settingsStore_, wavPath, txtPath)) {
+  const char *mdPath = lastMdPath_[0] ? lastMdPath_ : nullptr;
+  if (!gdrive_.uploadNote(settingsStore_, wavPath, txtPath, mdPath)) {
     Serial.println("Sincronizacao falhou, nota continua so local.");
   }
   notes_.markDirty(); // uploadNote() cria o .snc quando da certo
@@ -459,12 +538,17 @@ void App::syncOneNote(int index) {
 
   String txtPath = String(e.path);
   txtPath.replace(".wav", ".txt");
-  if (!LittleFS.exists(txtPath) && settingsStore_.get().sttEndpoint[0] != '\0') {
+  String mdPath = String(e.path);
+  mdPath.replace(".wav", ".md");
+
+  if (settingsStore_.get().sttEndpoint[0] != '\0') {
     transcribeNote(e.path);
   }
   bool hasTxt = LittleFS.exists(txtPath);
+  bool hasMd = LittleFS.exists(mdPath);
   bool ok = settingsStore_.hasDriveAuth() &&
-            gdrive_.uploadNote(settingsStore_, e.path, hasTxt ? txtPath.c_str() : nullptr);
+            gdrive_.uploadNote(settingsStore_, e.path, hasTxt ? txtPath.c_str() : nullptr,
+                               hasMd ? mdPath.c_str() : nullptr);
   notes_.markDirty();
 
   if (wasOffline) wifiMgr_.disconnect();
@@ -473,7 +557,7 @@ void App::syncOneNote(int index) {
                      "qualquer botao volta");
 }
 
-// Varre /notes procurando o que falta transcrever (sem .txt) ou subir
+// Varre /notes procurando o que falta transcrever (sem .txt/.md) ou subir
 // (sem .snc) e resolve tudo numa passada so, com progresso na tela.
 void App::runManualSync() {
   bool wasOffline = !wifiMgr_.isConnected();
@@ -490,10 +574,11 @@ void App::runManualSync() {
     NoteEntry e;
     if (!notes_.getAt(i, e)) continue;
     String txtPath = String(e.path); txtPath.replace(".wav", ".txt");
+    String mdPath = String(e.path); mdPath.replace(".wav", ".md");
     String sncPath = String(e.path); sncPath.replace(".wav", ".snc");
-    bool needsTxt = settingsStore_.get().sttEndpoint[0] != '\0' && !LittleFS.exists(txtPath);
-    bool needsUpload = settingsStore_.hasDriveAuth() && !LittleFS.exists(sncPath);
-    if (needsTxt || needsUpload) pendingTotal++;
+    bool needsAi = settingsStore_.get().sttEndpoint[0] != '\0' && (!LittleFS.exists(txtPath) || !LittleFS.exists(mdPath));
+    bool needsUpload = settingsStore_.hasDriveAuth() && (!LittleFS.exists(sncPath) || needsAi);
+    if (needsAi || needsUpload) pendingTotal++;
   }
 
   if (pendingTotal == 0) {
@@ -507,19 +592,28 @@ void App::runManualSync() {
     NoteEntry e;
     if (!notes_.getAt(i, e)) continue;
     String txtPath = String(e.path); txtPath.replace(".wav", ".txt");
+    String mdPath = String(e.path); mdPath.replace(".wav", ".md");
     String sncPath = String(e.path); sncPath.replace(".wav", ".snc");
-    bool needsTxt = settingsStore_.get().sttEndpoint[0] != '\0' && !LittleFS.exists(txtPath);
-    bool needsUpload = settingsStore_.hasDriveAuth() && !LittleFS.exists(sncPath);
-    if (!needsTxt && !needsUpload) continue;
+    bool needsAi = settingsStore_.get().sttEndpoint[0] != '\0' && (!LittleFS.exists(txtPath) || !LittleFS.exists(mdPath));
+    bool needsUpload = settingsStore_.hasDriveAuth() && (!LittleFS.exists(sncPath) || needsAi);
+    if (!needsAi && !needsUpload) continue;
 
     done++;
     Screens::drawState(canvas_, epd_, Screens::StateIcon::Activity, "sincronizando", e.label,
                         done, pendingTotal);
 
-    if (needsTxt && transcribeNote(e.path)) transcribed++;
-    if (needsUpload) {
+    bool aiGenerated = false;
+    if (needsAi) {
+      if (transcribeNote(e.path)) {
+        transcribed++;
+        aiGenerated = true;
+      }
+    }
+    if (needsUpload || aiGenerated) {
       bool hasTxt = LittleFS.exists(txtPath);
-      if (gdrive_.uploadNote(settingsStore_, e.path, hasTxt ? txtPath.c_str() : nullptr)) {
+      bool hasMd = LittleFS.exists(mdPath);
+      if (gdrive_.uploadNote(settingsStore_, e.path, hasTxt ? txtPath.c_str() : nullptr,
+                             hasMd ? mdPath.c_str() : nullptr)) {
         uploaded++;
       } else {
         failed++;
@@ -588,7 +682,7 @@ void App::onButton(BtnId id, BtnAction action) {
     case Screen::NotesList: onButtonNotesList(id, action); break;
     case Screen::NoteDetail: onButtonNoteDetail(id, action); break;
     case Screen::ConfirmDeleteOne: onButtonConfirmDeleteOne(id, action); break;
-    case Screen::TranscriptView: onButtonTranscriptView(id, action); break;
+    case Screen::TextViewer: onButtonTextViewer(id, action); break;
     case Screen::Settings: onButtonSettings(id, action); break;
     case Screen::ConfirmDeleteAll: onButtonConfirmDeleteAll(id, action); break;
     case Screen::About: onButtonAbout(id, action); break;
@@ -693,29 +787,48 @@ void App::onButtonNoteDetail(BtnId id, BtnAction action) {
   if (id != BtnId::Boot || action != BtnAction::ShortClick) return;
 
   switch (noteDetailSel_) {
-    case kNdPlay:
-      playSelected(notesSel_);
-      drawNoteDetail();
+    case kNdSummary: {
+      NoteEntry e;
+      if (!notes_.getAt(notesSel_, e)) break;
+      String mdPath = String(e.path);
+      mdPath.replace(".wav", ".md");
+      File f = LittleFS.open(mdPath, FILE_READ);
+      screen_ = Screen::TextViewer;
+      textViewerPage_ = 0;
+      strncpy(textViewerTitle_, "Resumo", sizeof(textViewerTitle_) - 1);
+      if (f) {
+        size_t n = f.readBytes(textViewerBuf_, sizeof(textViewerBuf_) - 1);
+        textViewerBuf_[n] = '\0';
+        f.close();
+      } else {
+        strncpy(textViewerBuf_, "Esta nota ainda nao possui resumo gerado.", sizeof(textViewerBuf_) - 1);
+      }
+      drawTextViewer();
       break;
+    }
     case kNdTranscript: {
       NoteEntry e;
       if (!notes_.getAt(notesSel_, e)) break;
       String txtPath = String(e.path);
       txtPath.replace(".wav", ".txt");
       File f = LittleFS.open(txtPath, FILE_READ);
-      screen_ = Screen::TranscriptView;
+      screen_ = Screen::TextViewer;
+      textViewerPage_ = 0;
+      strncpy(textViewerTitle_, "Transcricao", sizeof(textViewerTitle_) - 1);
       if (f) {
-        static char buf[SttClient::kMaxTextLen];
-        size_t n = f.readBytes(buf, sizeof(buf) - 1);
-        buf[n] = '\0';
+        size_t n = f.readBytes(textViewerBuf_, sizeof(textViewerBuf_) - 1);
+        textViewerBuf_[n] = '\0';
         f.close();
-        Screens::drawText(canvas_, epd_, "Transcricao", buf, "PWR volta");
       } else {
-        Screens::drawText(canvas_, epd_, "Transcricao", "Esta nota ainda nao foi transcrita.",
-                           "PWR volta");
+        strncpy(textViewerBuf_, "Esta nota ainda nao foi transcrita.", sizeof(textViewerBuf_) - 1);
       }
+      drawTextViewer();
       break;
     }
+    case kNdPlay:
+      playSelected(notesSel_);
+      drawNoteDetail();
+      break;
     case kNdSync:
       syncOneNote(notesSel_);
       break;
@@ -743,11 +856,18 @@ void App::onButtonConfirmDeleteOne(BtnId id, BtnAction action) {
   deleteSelectedNote();
 }
 
-void App::onButtonTranscriptView(BtnId id, BtnAction action) {
-  (void)id;
-  if (action != BtnAction::ShortClick && action != BtnAction::LongPress) return;
-  screen_ = Screen::NoteDetail;
-  drawNoteDetail();
+void App::onButtonTextViewer(BtnId id, BtnAction action) {
+  if (id == BtnId::Pwr) {
+    screen_ = Screen::NoteDetail;
+    drawNoteDetail();
+    return;
+  }
+  if (id == BtnId::Boot && action == BtnAction::ShortClick) {
+    if (textViewerTotalPages_ > 1) {
+      textViewerPage_ = (textViewerPage_ + 1) % textViewerTotalPages_;
+      drawTextViewer();
+    }
+  }
 }
 
 void App::onButtonSettings(BtnId id, BtnAction action) {

@@ -169,7 +169,9 @@ void App::reportNoNetworkAndGoHome() {
 void App::drawHome() {
   RtcDateTime now;
   bool timeValid = rtc_.getDateTime(now) && now.year >= 2024;
-  int pending = notes_.countPendingSync();
+  bool hasDrive = settingsStore_.hasDriveAuth();
+  bool hasStt = (settingsStore_.get().sttEndpoint[0] != '\0');
+  int pending = notes_.countPendingSync(hasStt, hasDrive);
   int batteryPercent = Battery::readPercent();
 
   float tempC = 0, humidity = 0;
@@ -181,13 +183,19 @@ void App::drawHome() {
 }
 
 void App::drawRootMenu() {
-  int pending = notes_.countPendingSync();
+  bool hasDrive = settingsStore_.hasDriveAuth();
+  bool hasStt = (settingsStore_.get().sttEndpoint[0] != '\0');
+  int pending = notes_.countPendingSync(hasStt, hasDrive);
   MenuItem items[kRootCount];
   setItem(items[kRootRecord], "Gravar");
   setItem(items[kRootNotes], "Notas");
   snprintf(items[kRootNotes].value, sizeof(items[kRootNotes].value), "%d", noteCount_);
   setItem(items[kRootSync], "Sincronizar");
-  if (pending > 0) snprintf(items[kRootSync].value, sizeof(items[kRootSync].value), "%d", pending);
+  if (pending > 0) {
+    snprintf(items[kRootSync].value, sizeof(items[kRootSync].value), "%d", pending);
+  } else if (!hasDrive && !hasStt) {
+    strncpy(items[kRootSync].value, "bloq", sizeof(items[kRootSync].value) - 1);
+  }
   setItem(items[kRootWifi], "Wi-Fi");
   setItem(items[kRootSettings], "Configuracoes");
   setItem(items[kRootAbout], "Sobre");
@@ -453,6 +461,7 @@ bool App::transcribeNote(const char *wavPath) {
       }
     } else {
       Serial.println("[App] Falha ao gerar resumo .md.");
+      return false;
     }
   }
 
@@ -514,6 +523,14 @@ void App::syncIfPossible(const char *wavPath) {
   const Settings &cfg = settingsStore_.get();
   if (!wifiMgr_.isConnected() || !cfg.autoSyncEnabled || !settingsStore_.hasDriveAuth()) return;
 
+  // REGRA DO USUARIO: Esperar transcricao e resumo antes de enviar ao Drive!
+  if (cfg.sttEndpoint[0] != '\0') {
+    if (lastTxtPath_[0] == '\0' || lastMdPath_[0] == '\0') {
+      Serial.println("[App] Sincronizacao retida: aguardando transcricao e resumo completos.");
+      return;
+    }
+  }
+
   Screens::drawState(canvas_, epd_, Screens::StateIcon::Activity, "sincronizando",
                       "enviando para o Google Drive");
   const char *txtPath = lastTxtPath_[0] ? lastTxtPath_ : nullptr;
@@ -521,12 +538,23 @@ void App::syncIfPossible(const char *wavPath) {
   if (!gdrive_.uploadNote(settingsStore_, wavPath, txtPath, mdPath)) {
     Serial.println("Sincronizacao falhou, nota continua so local.");
   }
-  notes_.markDirty(); // uploadNote() cria o .snc quando da certo
+  notes_.markDirty(); // uploadNote() cria o .snc/.sync quando da certo
 }
 
 void App::syncOneNote(int index) {
   NoteEntry e;
   if (!notes_.getAt(index, e)) return;
+
+  const Settings &cfg = settingsStore_.get();
+  bool hasDrive = settingsStore_.hasDriveAuth();
+  bool hasStt = (cfg.sttEndpoint[0] != '\0');
+
+  if (!hasDrive && !hasStt) {
+    Screens::drawText(canvas_, epd_, "Sincronizacao",
+                       "Nenhum servico configurado. Configure STT ou Drive no menu.",
+                       "PWR volta");
+    return;
+  }
 
   bool wasOffline = !wifiMgr_.isConnected();
   if (!ensureOnline()) {
@@ -534,32 +562,57 @@ void App::syncOneNote(int index) {
     return;
   }
 
-  Screens::drawState(canvas_, epd_, Screens::StateIcon::Activity, "sincronizando", e.label);
-
   String txtPath = String(e.path);
   txtPath.replace(".wav", ".txt");
   String mdPath = String(e.path);
   mdPath.replace(".wav", ".md");
 
-  if (settingsStore_.get().sttEndpoint[0] != '\0') {
-    transcribeNote(e.path);
+  bool sttOk = true;
+  if (hasStt) {
+    if (!LittleFS.exists(txtPath) || !LittleFS.exists(mdPath)) {
+      Screens::drawState(canvas_, epd_, Screens::StateIcon::Activity, "transcrevendo", e.label);
+      sttOk = transcribeNote(e.path);
+    }
   }
-  bool hasTxt = LittleFS.exists(txtPath);
-  bool hasMd = LittleFS.exists(mdPath);
-  bool ok = settingsStore_.hasDriveAuth() &&
-            gdrive_.uploadNote(settingsStore_, e.path, hasTxt ? txtPath.c_str() : nullptr,
-                               hasMd ? mdPath.c_str() : nullptr);
-  notes_.markDirty();
 
+  bool driveOk = true;
+  if (hasDrive) {
+    if (hasStt && !sttOk) {
+      Serial.println("[App] STT pendente/falhou. Upload retido conforme configuracao.");
+      driveOk = false;
+    } else {
+      Screens::drawState(canvas_, epd_, Screens::StateIcon::Activity, "enviando Drive", e.label);
+      bool hasTxt = LittleFS.exists(txtPath);
+      bool hasMd = LittleFS.exists(mdPath);
+      driveOk = gdrive_.uploadNote(settingsStore_, e.path,
+                                   hasTxt ? txtPath.c_str() : nullptr,
+                                   hasMd ? mdPath.c_str() : nullptr);
+    }
+  }
+
+  notes_.markDirty();
   if (wasOffline) wifiMgr_.disconnect();
 
-  Screens::drawText(canvas_, epd_, "Sincronizar", ok ? "Nota enviada." : "Falha ao enviar.",
+  bool success = (hasDrive ? driveOk : sttOk);
+  Screens::drawText(canvas_, epd_, "Sincronizar",
+                     success ? "Nota sincronizada com sucesso!" : "Falha na sincronizacao.",
                      "qualquer botao volta");
 }
 
 // Varre /notes procurando o que falta transcrever (sem .txt/.md) ou subir
-// (sem .snc) e resolve tudo numa passada so, com progresso na tela.
+// (sem .sync/.snc) e resolve tudo numa passada so, com progresso na tela.
 void App::runManualSync() {
+  const Settings &cfg = settingsStore_.get();
+  bool hasDrive = settingsStore_.hasDriveAuth();
+  bool hasStt = (cfg.sttEndpoint[0] != '\0');
+
+  if (!hasDrive && !hasStt) {
+    Screens::drawText(canvas_, epd_, "Sincronizacao",
+                       "Nenhum servico configurado. Configure STT ou Drive no menu.",
+                       "PWR volta");
+    return;
+  }
+
   bool wasOffline = !wifiMgr_.isConnected();
   if (!ensureOnline()) {
     reportNoNetworkAndGoHome();
@@ -576,8 +629,11 @@ void App::runManualSync() {
     String txtPath = String(e.path); txtPath.replace(".wav", ".txt");
     String mdPath = String(e.path); mdPath.replace(".wav", ".md");
     String sncPath = String(e.path); sncPath.replace(".wav", ".snc");
-    bool needsAi = settingsStore_.get().sttEndpoint[0] != '\0' && (!LittleFS.exists(txtPath) || !LittleFS.exists(mdPath));
-    bool needsUpload = settingsStore_.hasDriveAuth() && (!LittleFS.exists(sncPath) || needsAi);
+    String syncPath = String(e.path); syncPath.replace(".wav", ".sync");
+
+    bool isSynced = LittleFS.exists(sncPath);
+    bool needsAi = hasStt && (!LittleFS.exists(txtPath) || !LittleFS.exists(mdPath));
+    bool needsUpload = hasDrive && !isSynced;
     if (needsAi || needsUpload) pendingTotal++;
   }
 
@@ -587,32 +643,62 @@ void App::runManualSync() {
     return;
   }
 
+  // Limite de 10 minutos por sessao de sincronizacao
+  uint32_t sessionDeadline = millis() + 10 * 60 * 1000UL;
+
   int transcribed = 0, uploaded = 0, failed = 0, done = 0;
   for (int i = 0; i < total; i++) {
+    if ((int32_t)(sessionDeadline - millis()) <= 0) {
+      Serial.println("[Sync] Limite de 10 minutos atingido na sessao.");
+      break;
+    }
+
     NoteEntry e;
     if (!notes_.getAt(i, e)) continue;
     String txtPath = String(e.path); txtPath.replace(".wav", ".txt");
     String mdPath = String(e.path); mdPath.replace(".wav", ".md");
     String sncPath = String(e.path); sncPath.replace(".wav", ".snc");
-    bool needsAi = settingsStore_.get().sttEndpoint[0] != '\0' && (!LittleFS.exists(txtPath) || !LittleFS.exists(mdPath));
-    bool needsUpload = settingsStore_.hasDriveAuth() && (!LittleFS.exists(sncPath) || needsAi);
+    String syncPath = String(e.path); syncPath.replace(".wav", ".sync");
+
+    bool isSynced = LittleFS.exists(sncPath);
+    bool needsAi = hasStt && (!LittleFS.exists(txtPath) || !LittleFS.exists(mdPath));
+    bool needsUpload = hasDrive && !isSynced;
     if (!needsAi && !needsUpload) continue;
 
     done++;
-    Screens::drawState(canvas_, epd_, Screens::StateIcon::Activity, "sincronizando", e.label,
-                        done, pendingTotal);
 
-    bool aiGenerated = false;
-    if (needsAi) {
-      if (transcribeNote(e.path)) {
-        transcribed++;
-        aiGenerated = true;
+    // Reconecta Wi-Fi se tiver caido durante o lote
+    if (!wifiMgr_.isConnected()) {
+      Serial.println("[Sync] Conexao perdida; tentando reconectar...");
+      if (!wifiMgr_.connect(settingsStore_)) {
+        Serial.println("[Sync] Nao foi possivel reconectar ao Wi-Fi.");
+        failed += (pendingTotal - done + 1);
+        break;
       }
     }
-    if (needsUpload || aiGenerated) {
+
+    bool aiOk = !needsAi;
+    if (needsAi) {
+      Screens::drawState(canvas_, epd_, Screens::StateIcon::Activity, "transcrevendo", e.label,
+                          done, pendingTotal);
+      if (transcribeNote(e.path)) {
+        transcribed++;
+        aiOk = true;
+      } else {
+        Serial.printf("[Sync] Transcricao falhou para %s\n", e.label);
+        failed++;
+        // Conforme escolha: nao envia ao Drive se STT falhou
+        continue;
+      }
+    }
+
+    if (hasDrive && aiOk && needsUpload) {
+      Screens::drawState(canvas_, epd_, Screens::StateIcon::Activity, "enviando Drive", e.label,
+                          done, pendingTotal);
       bool hasTxt = LittleFS.exists(txtPath);
       bool hasMd = LittleFS.exists(mdPath);
-      if (gdrive_.uploadNote(settingsStore_, e.path, hasTxt ? txtPath.c_str() : nullptr,
+      if (gdrive_.uploadNote(settingsStore_, e.path,
+                             hasTxt ? txtPath.c_str() : nullptr,
                              hasMd ? mdPath.c_str() : nullptr)) {
         uploaded++;
       } else {

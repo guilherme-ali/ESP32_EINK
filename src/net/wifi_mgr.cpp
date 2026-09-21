@@ -9,54 +9,86 @@ bool WifiManager::connect(SettingsStore &settings, uint32_t timeoutMs) {
   WiFi.mode(WIFI_STA);
   int found = WiFi.scanNetworks();
 
-  // Escaneia uma vez e compara contra TODAS as redes salvas (equivale a
-  // "tentar" cada uma, sem gastar bateria com timeouts de conexao em
-  // redes fora de alcance). A favorita, se estiver por perto, vence
-  // mesmo sem ser a de sinal mais forte.
-  int bestIdx = -1;
-  int bestRssi = -1000;
-  int favoriteIdx = -1;
+  // Encontra todas as redes salvas visiveis e seus melhores sinais.
+  struct VisibleSaved {
+    int configIdx;
+    int rssi;
+    bool isFavorite;
+  };
+  VisibleSaved candidates[Settings::kMaxWifiNetworks];
+  int candidateCount = 0;
+
   for (int i = 0; i < cfg.wifiNetworkCount; i++) {
+    int bestRssi = -1000;
+    bool visible = false;
     for (int j = 0; j < found; j++) {
-      if (WiFi.SSID(j) != cfg.wifiSsid[i]) continue;
-      if (WiFi.RSSI(j) > bestRssi) {
-        bestRssi = WiFi.RSSI(j);
-        bestIdx = i;
+      if (WiFi.SSID(j) == cfg.wifiSsid[i]) {
+        visible = true;
+        if (WiFi.RSSI(j) > bestRssi) bestRssi = WiFi.RSSI(j);
       }
-      if (cfg.favoriteWifiSsid[0] != '\0' && strcmp(cfg.wifiSsid[i], cfg.favoriteWifiSsid) == 0) {
-        favoriteIdx = i;
-      }
+    }
+    if (visible) {
+      bool isFav = (cfg.favoriteWifiSsid[0] != '\0' &&
+                    strcmp(cfg.wifiSsid[i], cfg.favoriteWifiSsid) == 0);
+      candidates[candidateCount++] = {i, bestRssi, isFav};
     }
   }
   WiFi.scanDelete();
 
-  int chosen = favoriteIdx >= 0 ? favoriteIdx : bestIdx;
-  if (chosen < 0) {
-    Serial.println("Nenhuma rede salva por perto.");
-    WiFi.mode(WIFI_OFF);
-    return false;
-  }
-
-  Serial.printf("Conectando a '%s'%s...\n", cfg.wifiSsid[chosen],
-                chosen == favoriteIdx ? " (favorita)" : "");
-  WiFi.begin(cfg.wifiSsid[chosen], cfg.wifiPass[chosen]);
-
-  uint32_t start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
-    delay(250);
-  }
-
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("Falha ao conectar.");
+  if (candidateCount == 0) {
+    Serial.println("[Wi-Fi] Nenhuma rede salva por perto.");
     WiFi.mode(WIFI_OFF);
     mode_ = Mode::Off;
     return false;
   }
 
-  mode_ = Mode::Station;
-  Serial.printf("Wi-Fi conectado: %s\n", WiFi.localIP().toString().c_str());
-  startServerOnce();
-  return true;
+  // Ordena: favorita primeiro; depois por sinal (RSSI) decrescente.
+  for (int i = 0; i < candidateCount - 1; i++) {
+    for (int j = i + 1; j < candidateCount; j++) {
+      bool swap = false;
+      if (!candidates[i].isFavorite && candidates[j].isFavorite) {
+        swap = true;
+      } else if (candidates[i].isFavorite == candidates[j].isFavorite &&
+                 candidates[j].rssi > candidates[i].rssi) {
+        swap = true;
+      }
+      if (swap) {
+        VisibleSaved tmp = candidates[i];
+        candidates[i] = candidates[j];
+        candidates[j] = tmp;
+      }
+    }
+  }
+
+  // Tenta cada rede visivel em ordem de preferencia.
+  for (int c = 0; c < candidateCount; c++) {
+    int idx = candidates[c].configIdx;
+    Serial.printf("[Wi-Fi] Conectando a '%s'%s (RSSI %d)...\n",
+                  cfg.wifiSsid[idx], candidates[c].isFavorite ? " (favorita)" : "",
+                  candidates[c].rssi);
+
+    WiFi.disconnect(false);
+    WiFi.begin(cfg.wifiSsid[idx], cfg.wifiPass[idx]);
+
+    uint32_t start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
+      delay(250);
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+      mode_ = Mode::Station;
+      Serial.printf("[Wi-Fi] Conectado a '%s': %s\n", cfg.wifiSsid[idx],
+                    WiFi.localIP().toString().c_str());
+      startServerOnce();
+      return true;
+    }
+    Serial.printf("[Wi-Fi] Falha ao conectar em '%s'.\n", cfg.wifiSsid[idx]);
+  }
+
+  Serial.println("[Wi-Fi] Nenhuma rede conectou.");
+  WiFi.mode(WIFI_OFF);
+  mode_ = Mode::Off;
+  return false;
 }
 
 void WifiManager::disconnect() {

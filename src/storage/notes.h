@@ -27,10 +27,10 @@ public:
   int count();
   bool getAt(int index, NoteEntry &out); // 0 = mais recente
 
-  // Quantos .wav em /notes NAO tem um NOME.snc do lado (ainda nao
-  // subiram pro Drive). O marcador .snc e criado pelo cliente do Drive
-  // depois de um upload bem-sucedido.
-  int countPendingSync();
+  // Quantas notas estao pendentes de sincronizacao (STT e/ou Drive).
+  // Unifica a definicao entre home, menu e fluxo de sincronizacao.
+  int countPendingSync(bool sttConfigured, bool driveConfigured);
+  int countPendingSync(); // padrao: assume ambos servicos ativos
 
   // Remove o .wav do indice e os irmaos .txt/.snc, se existirem.
   bool deleteAt(int index);

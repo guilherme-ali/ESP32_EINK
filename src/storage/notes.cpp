@@ -126,13 +126,21 @@ bool NotesStore::getAt(int index, NoteEntry &out) {
   return true;
 }
 
-int NotesStore::countPendingSync() {
+int NotesStore::countPendingSync(bool sttConfigured, bool driveConfigured) {
   rescanIfDirty();
+  if (!sttConfigured && !driveConfigured) return 0;
+
   int pending = 0;
   for (int i = 0; i < g_cacheCount; i++) {
-    if (!g_cache[i].hasSnc) pending++;
+    bool needsAi = sttConfigured && (!g_cache[i].hasTxt || !g_cache[i].hasMd);
+    bool needsDrive = driveConfigured && !g_cache[i].hasSnc;
+    if (needsAi || needsDrive) pending++;
   }
   return pending;
+}
+
+int NotesStore::countPendingSync() {
+  return countPendingSync(true, true);
 }
 
 bool NotesStore::deleteAt(int index) {
@@ -143,11 +151,17 @@ bool NotesStore::deleteAt(int index) {
   String txtPath = wavPath; txtPath.replace(".wav", ".txt");
   String mdPath = wavPath; mdPath.replace(".wav", ".md");
   String sncPath = wavPath; sncPath.replace(".wav", ".snc");
+  String syncPath = wavPath; syncPath.replace(".wav", ".sync");
+  String syncTmp = wavPath; syncTmp.replace(".wav", ".sync.tmp");
 
   bool ok = LittleFS.remove(wavPath);
   if (g_cache[index].hasTxt) LittleFS.remove(txtPath);
   if (g_cache[index].hasMd) LittleFS.remove(mdPath);
-  if (g_cache[index].hasSnc) LittleFS.remove(sncPath);
+  if (g_cache[index].hasSnc) {
+    LittleFS.remove(sncPath);
+    LittleFS.remove(syncPath);
+    LittleFS.remove(syncTmp);
+  }
   g_dirty = true;
   return ok;
 }
@@ -160,10 +174,16 @@ int NotesStore::deleteAll() {
     String txtPath = wavPath; txtPath.replace(".wav", ".txt");
     String mdPath = wavPath; mdPath.replace(".wav", ".md");
     String sncPath = wavPath; sncPath.replace(".wav", ".snc");
+    String syncPath = wavPath; syncPath.replace(".wav", ".sync");
+    String syncTmp = wavPath; syncTmp.replace(".wav", ".sync.tmp");
     if (LittleFS.remove(wavPath)) removed++;
     if (g_cache[i].hasTxt) LittleFS.remove(txtPath);
     if (g_cache[i].hasMd) LittleFS.remove(mdPath);
-    if (g_cache[i].hasSnc) LittleFS.remove(sncPath);
+    if (g_cache[i].hasSnc) {
+      LittleFS.remove(sncPath);
+      LittleFS.remove(syncPath);
+      LittleFS.remove(syncTmp);
+    }
   }
   g_cacheCount = 0;
   g_dirty = true;

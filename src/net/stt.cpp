@@ -1,4 +1,6 @@
 #include "stt.h"
+#include "http_client.h"
+#include "json_utils.h"
 #include <WiFiClientSecure.h>
 #include <LittleFS.h>
 #include <base64.h>
@@ -111,8 +113,8 @@ String resolveGeminiModel(const char *configuredModel) {
   String m = String(configuredModel);
   m.trim();
   if (m.startsWith("models/")) m = m.substring(7);
-  if (m.length() == 0 || m.indexOf("whisper") >= 0) {
-    return "gemini-3.6-flash";
+  if (m.length() == 0 || m.indexOf("whisper") >= 0 || m == "gemini-3.6-flash") {
+    return "gemini-3.5-flash-lite";
   }
   return m;
 }
@@ -210,33 +212,37 @@ bool transcribeGemini(const Settings &cfg, const String &host, uint16_t port, Fi
     return false;
   }
 
-  client.printf("POST %s HTTP/1.1\r\n", path.c_str());
-  client.printf("Host: %s\r\n", host.c_str());
-  client.printf("x-goog-api-key: %s\r\n", cfg.sttApiKey);
-  client.print("Content-Type: application/json\r\n");
-  client.printf("Content-Length: %u\r\n", (unsigned)contentLength);
-  client.print("Connection: close\r\n\r\n");
+  String reqHeaders = "POST " + path + " HTTP/1.1\r\n" +
+                      "Host: " + host + "\r\n" +
+                      "x-goog-api-key: " + String(cfg.sttApiKey) + "\r\n" +
+                      "Content-Type: application/json\r\n" +
+                      "Content-Length: " + String((unsigned)contentLength) + "\r\n" +
+                      "Connection: close\r\n\r\n";
 
-  client.print(kPrefix);
+  if (!HttpClient::writeAll(client, reqHeaders)) { client.stop(); return false; }
+  if (!HttpClient::writeAll(client, kPrefix)) { client.stop(); return false; }
 
   uint8_t buf[768];
   while (file.available()) {
     size_t n = file.read(buf, sizeof(buf));
-    client.print(base64::encode(buf, n));
+    if (!HttpClient::writeAll(client, base64::encode(buf, n))) { client.stop(); return false; }
   }
-  client.print(kSuffix);
+  if (!HttpClient::writeAll(client, kSuffix)) { client.stop(); return false; }
 
   Serial.println("[STT] aguardando resposta...");
-  String body;
-  bool ok = readHttpResponse(client, body);
-  if (!ok) {
-    Serial.println("[STT] resposta HTTP nao-200:");
-    Serial.println(body);
+  HttpResponse resp;
+  if (!HttpClient::readResponse(client, resp, HttpClient::kMaxResponseBody, 25000)) {
+    Serial.println("[STT] resposta HTTP falhou.");
     return false;
   }
-  if (!extractJsonText(body, outText, outLen)) {
-    Serial.println("[STT] nao encontrei \"text\" na resposta:");
-    Serial.println(body);
+  if (resp.statusCode != 200) {
+    Serial.printf("[STT] HTTP %d: %s\n", resp.statusCode, resp.body.c_str());
+    return false;
+  }
+  if (!jsonGetString(resp.body, "candidates.0.content.parts.0.text", outText, outLen) &&
+      !extractJsonText(resp.body, outText, outLen)) {
+    Serial.println("[STT] nao encontrou texto na resposta:");
+    Serial.println(resp.body);
     return false;
   }
   return true;
@@ -258,7 +264,7 @@ bool transcribeOpenAiCompatible(const Settings &cfg, const String &host, uint16_
 
   WiFiClientSecure client;
   client.setInsecure();
-  client.setTimeout(15000);
+  client.setTimeout(20000);
 
   Serial.printf("[STT] conectando a %s:%u...\n", host.c_str(), port);
   if (!client.connect(host.c_str(), port)) {
@@ -266,36 +272,40 @@ bool transcribeOpenAiCompatible(const Settings &cfg, const String &host, uint16_
     return false;
   }
 
-  client.printf("POST %s HTTP/1.1\r\n", path.c_str());
-  client.printf("Host: %s\r\n", host.c_str());
+  String reqHeaders = "POST " + path + " HTTP/1.1\r\n" +
+                      "Host: " + host + "\r\n";
   if (cfg.sttApiKey[0] != '\0') {
-    client.printf("Authorization: Bearer %s\r\n", cfg.sttApiKey);
+    reqHeaders += "Authorization: Bearer " + String(cfg.sttApiKey) + "\r\n";
   }
-  client.printf("Content-Type: multipart/form-data; boundary=%s\r\n", boundary.c_str());
-  client.printf("Content-Length: %u\r\n", (unsigned)contentLength);
-  client.print("Connection: close\r\n\r\n");
+  reqHeaders += "Content-Type: multipart/form-data; boundary=" + boundary + "\r\n" +
+                "Content-Length: " + String((unsigned)contentLength) + "\r\n" +
+                "Connection: close\r\n\r\n";
 
-  client.print(partModel);
-  client.print(partFileHeader);
+  if (!HttpClient::writeAll(client, reqHeaders)) { client.stop(); return false; }
+  if (!HttpClient::writeAll(client, partModel)) { client.stop(); return false; }
+  if (!HttpClient::writeAll(client, partFileHeader)) { client.stop(); return false; }
 
   uint8_t buf[1024];
   while (file.available()) {
     size_t n = file.read(buf, sizeof(buf));
-    client.write(buf, n);
+    if (!HttpClient::writeAll(client, buf, n)) { client.stop(); return false; }
   }
-  client.print(partFooter);
+  if (!HttpClient::writeAll(client, partFooter)) { client.stop(); return false; }
 
   Serial.println("[STT] aguardando resposta...");
-  String body;
-  bool ok = readHttpResponse(client, body);
-  if (!ok) {
-    Serial.println("[STT] resposta HTTP nao-200:");
-    Serial.println(body);
+  HttpResponse resp;
+  if (!HttpClient::readResponse(client, resp, HttpClient::kMaxResponseBody, 20000)) {
+    Serial.println("[STT] resposta HTTP falhou.");
     return false;
   }
-  if (!extractJsonText(body, outText, outLen)) {
-    Serial.println("[STT] nao encontrei \"text\" na resposta:");
-    Serial.println(body);
+  if (resp.statusCode != 200) {
+    Serial.printf("[STT] HTTP %d: %s\n", resp.statusCode, resp.body.c_str());
+    return false;
+  }
+  if (!jsonGetString(resp.body, "text", outText, outLen) &&
+      !extractJsonText(resp.body, outText, outLen)) {
+    Serial.println("[STT] nao encontrou \"text\" na resposta:");
+    Serial.println(resp.body);
     return false;
   }
   return true;
@@ -311,16 +321,13 @@ bool SttClient::transcribe(const Settings &cfg, const char *wavPath, char *outTe
 
   String host, path;
   uint16_t port;
-  if (!parseUrl(cfg.sttEndpoint, host, port, path)) {
+  if (!HttpClient::parseHttpsUrl(cfg.sttEndpoint, host, port, path)) {
     Serial.println("[STT] URL invalida (precisa comecar com https://).");
     return false;
   }
 
-  // Erros 503/sobrecarga do provedor sao comuns no tier gratuito e
-  // costumam sumir sozinhos - vale uma segunda tentativa antes de
-  // desistir e deixar a nota sem transcricao.
-  constexpr int kMaxAttempts = 2;
-  for (int attempt = 1; attempt <= kMaxAttempts; attempt++) {
+  constexpr int kMaxAttempts = 4;
+  for (int attempt = 0; attempt < kMaxAttempts; attempt++) {
     File file = LittleFS.open(wavPath, FILE_READ);
     if (!file) {
       Serial.println("[STT] nao foi possivel abrir o WAV.");
@@ -341,9 +348,10 @@ bool SttClient::transcribe(const Settings &cfg, const char *wavPath, char *outTe
       return true;
     }
 
-    if (attempt < kMaxAttempts) {
-      Serial.printf("[STT] tentativa %d falhou, tentando de novo em 2s...\n", attempt);
-      delay(2000);
+    if (attempt + 1 < kMaxAttempts) {
+      uint32_t delayMs = HttpClient::retryDelayMs(attempt, 0);
+      Serial.printf("[STT] tentativa %d falhou, esperando %ums...\n", attempt + 1, (unsigned)delayMs);
+      delay(delayMs);
     }
   }
 
@@ -388,29 +396,33 @@ bool generateSummaryGemini(const Settings &cfg, const String &host, uint16_t por
     return false;
   }
 
-  client.printf("POST %s HTTP/1.1\r\n", path.c_str());
-  client.printf("Host: %s\r\n", host.c_str());
-  client.printf("x-goog-api-key: %s\r\n", cfg.sttApiKey);
-  client.print("Content-Type: application/json\r\n");
-  client.printf("Content-Length: %u\r\n", (unsigned)contentLength);
-  client.print("Connection: close\r\n\r\n");
+  String reqHeaders = "POST " + path + " HTTP/1.1\r\n" +
+                      "Host: " + host + "\r\n" +
+                      "x-goog-api-key: " + String(cfg.sttApiKey) + "\r\n" +
+                      "Content-Type: application/json\r\n" +
+                      "Content-Length: " + String((unsigned)contentLength) + "\r\n" +
+                      "Connection: close\r\n\r\n";
 
-  client.print(kPrefix);
-  client.print(kPrompt);
-  client.print(escapedTranscript);
-  client.print(kSuffix);
+  if (!HttpClient::writeAll(client, reqHeaders)) { client.stop(); return false; }
+  if (!HttpClient::writeAll(client, kPrefix)) { client.stop(); return false; }
+  if (!HttpClient::writeAll(client, kPrompt)) { client.stop(); return false; }
+  if (!HttpClient::writeAll(client, escapedTranscript)) { client.stop(); return false; }
+  if (!HttpClient::writeAll(client, kSuffix)) { client.stop(); return false; }
 
   Serial.println("[Summary] aguardando resposta...");
-  String respBody;
-  bool ok = readHttpResponse(client, respBody);
-  if (!ok) {
-    Serial.println("[Summary] resposta HTTP nao-200:");
-    Serial.println(respBody);
+  HttpResponse resp;
+  if (!HttpClient::readResponse(client, resp, HttpClient::kMaxResponseBody, 25000)) {
+    Serial.println("[Summary] resposta HTTP falhou.");
     return false;
   }
-  if (!extractJsonText(respBody, outMarkdown, outLen)) {
+  if (resp.statusCode != 200) {
+    Serial.printf("[Summary] HTTP %d: %s\n", resp.statusCode, resp.body.c_str());
+    return false;
+  }
+  if (!jsonGetString(resp.body, "candidates.0.content.parts.0.text", outMarkdown, outLen) &&
+      !extractJsonText(resp.body, outMarkdown, outLen)) {
     Serial.println("[Summary] nao encontrou texto no retorno:");
-    Serial.println(respBody);
+    Serial.println(resp.body);
     return false;
   }
   return true;
@@ -450,27 +462,32 @@ bool generateSummaryOpenAi(const Settings &cfg, const String &host, uint16_t por
     return false;
   }
 
-  client.printf("POST %s HTTP/1.1\r\n", chatPath.c_str());
-  client.printf("Host: %s\r\n", host.c_str());
+  String reqHeaders = "POST " + chatPath + " HTTP/1.1\r\n" +
+                      "Host: " + host + "\r\n";
   if (cfg.sttApiKey[0] != '\0') {
-    client.printf("Authorization: Bearer %s\r\n", cfg.sttApiKey);
+    reqHeaders += "Authorization: Bearer " + String(cfg.sttApiKey) + "\r\n";
   }
-  client.print("Content-Type: application/json\r\n");
-  client.printf("Content-Length: %u\r\n", (unsigned)body.length());
-  client.print("Connection: close\r\n\r\n");
-  client.print(body);
+  reqHeaders += String("Content-Type: application/json\r\n") +
+                "Content-Length: " + String((unsigned)body.length()) + "\r\n" +
+                "Connection: close\r\n\r\n";
+
+  if (!HttpClient::writeAll(client, reqHeaders)) { client.stop(); return false; }
+  if (!HttpClient::writeAll(client, body)) { client.stop(); return false; }
 
   Serial.println("[Summary] aguardando resposta...");
-  String respBody;
-  bool ok = readHttpResponse(client, respBody);
-  if (!ok) {
-    Serial.println("[Summary] resposta HTTP nao-200:");
-    Serial.println(respBody);
+  HttpResponse resp;
+  if (!HttpClient::readResponse(client, resp, HttpClient::kMaxResponseBody, 20000)) {
+    Serial.println("[Summary] resposta HTTP falhou.");
     return false;
   }
-  if (!extractJsonText(respBody, outMarkdown, outLen)) {
+  if (resp.statusCode != 200) {
+    Serial.printf("[Summary] HTTP %d: %s\n", resp.statusCode, resp.body.c_str());
+    return false;
+  }
+  if (!jsonGetString(resp.body, "choices.0.message.content", outMarkdown, outLen) &&
+      !extractJsonText(resp.body, outMarkdown, outLen)) {
     Serial.println("[Summary] nao encontrou texto no retorno:");
-    Serial.println(respBody);
+    Serial.println(resp.body);
     return false;
   }
   return true;
@@ -486,13 +503,13 @@ bool SttClient::generateSummary(const Settings &cfg, const char *transcriptText,
 
   String host, path;
   uint16_t port;
-  if (!parseUrl(cfg.sttEndpoint, host, port, path)) {
+  if (!HttpClient::parseHttpsUrl(cfg.sttEndpoint, host, port, path)) {
     Serial.println("[Summary] URL invalida.");
     return false;
   }
 
-  constexpr int kMaxAttempts = 2;
-  for (int attempt = 1; attempt <= kMaxAttempts; attempt++) {
+  constexpr int kMaxAttempts = 4;
+  for (int attempt = 0; attempt < kMaxAttempts; attempt++) {
     bool ok;
     if (host == "generativelanguage.googleapis.com") {
       ok = generateSummaryGemini(cfg, host, port, transcriptText, outMarkdown, outLen);
@@ -503,9 +520,10 @@ bool SttClient::generateSummary(const Settings &cfg, const char *transcriptText,
       Serial.printf("[Summary] resumo gerado (%u chars).\n", (unsigned)strlen(outMarkdown));
       return true;
     }
-    if (attempt < kMaxAttempts) {
-      Serial.printf("[Summary] tentativa %d falhou, tentando em 2s...\n", attempt);
-      delay(2000);
+    if (attempt + 1 < kMaxAttempts) {
+      uint32_t delayMs = HttpClient::retryDelayMs(attempt, 0);
+      Serial.printf("[Summary] tentativa %d falhou, esperando %ums...\n", attempt + 1, (unsigned)delayMs);
+      delay(delayMs);
     }
   }
 

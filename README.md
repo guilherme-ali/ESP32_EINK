@@ -144,8 +144,12 @@ as gravações — sem cartão SD isso dá poucos minutos de áudio no total.
   com tamanho e MD5 iguais ao local, além de persistência local bem-sucedida.
 - Marcadores antigos `.snc`/`.sync` são reconciliados por nome, pasta,
   tamanho e hash. Nova autorização exige nova verificação do destino.
-- A sincronização manual também verifica os arquivos remotos já enviados,
-  permitindo recuperar arquivo/pasta apagados. Não apaga áudio local.
+- **Sincronizar** processa somente notas pendentes. O estado, tamanho e hash
+  locais selecionam a fila; notas já confirmadas não são consultadas no Drive
+  nem incluídas no contador. Se seis notas estão prontas e uma é nova, a barra
+  mostra **1 / 1** na transcrição, no Markdown e no envio.
+- **Sincronizar esta**, no detalhe de uma nota, permite conferir novamente o
+  backup remoto daquela nota e recuperar arquivos/pasta apagados.
 - O portal oferece **Refazer autorização do Drive**. Alterar as credenciais
   OAuth invalida a autorização anterior; PWR cancela a espera de pareamento.
 - A tela final informa a etapa/erro e reinicia o contador de inatividade.
@@ -183,7 +187,7 @@ antes de cada sessão**; o console não tenta reconectar indefinidamente:
 ```
 
 `status` mostra espaço, modelos, flags e erros sem chaves/tokens. `sync-one`
-processa a nota mais recente; `sync` processa todas. As chamadas são
+processa a nota mais recente; `sync` processa somente as pendentes. As chamadas são
 síncronas e têm tentativas e prazos limitados; o botão não cancela inferência
 TLS em andamento. O ambiente `battery` é o destinado a uso fora do cabo.
 

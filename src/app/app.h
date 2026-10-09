@@ -156,7 +156,7 @@ private:
 
   void transcribeIfPossible(const char *wavPath);
   void syncIfPossible(const char *wavPath);
-  bool transcribeNote(const char *wavPath);
+  bool transcribeNote(const char *wavPath, int progress = 0, int totalPending = 0);
   void runManualSync();
   void syncOneNote(int index);
   void deleteSelectedNote();

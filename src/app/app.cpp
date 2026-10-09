@@ -71,6 +71,15 @@ bool aiMetadataReady(const char *wavPath) {
   return ok;
 }
 
+bool needsAiForSync(const char *wavPath, bool hasStt, bool hasDrive, bool needsUpload) {
+  if (!hasStt) return false;
+  String txtPath(wavPath); txtPath.replace(".wav", ".txt");
+  String mdPath(wavPath); mdPath.replace(".wav", ".md");
+  if (!NoteFiles::validText(txtPath) || !NoteFiles::validText(mdPath)) return true;
+  // Metadados auxiliares nao colocam um backup ja confirmado na fila novamente.
+  return (needsUpload || !hasDrive) && !aiMetadataReady(wavPath);
+}
+
 void setVal(char *dst, size_t n, const char *src) {
   strncpy(dst, src, n - 1);
   dst[n - 1] = '\0';
@@ -486,7 +495,7 @@ void App::playSelected(int index) {
 // Transcricao e sincronizacao
 // ---------------------------------------------------------------------
 
-bool App::transcribeNote(const char *wavPath) {
+bool App::transcribeNote(const char *wavPath, int progress, int totalPending) {
   pipelineError_ = "";
   const Settings &cfg = settingsStore_.get();
   if (cfg.sttEndpoint[0] == '\0') {
@@ -531,7 +540,8 @@ bool App::transcribeNote(const char *wavPath) {
 
   if (hasText && !NoteFiles::validText(mdPath)) {
     Serial.printf("[App] Gerando resumo .md para %s...\n", wavPath);
-    Screens::drawState(canvas_, epd_, Screens::StateIcon::Activity, "resumindo", "criando Markdown fiel a transcricao");
+    Screens::drawState(canvas_, epd_, Screens::StateIcon::Activity, "resumindo",
+                       "gerando Markdown", progress, totalPending);
     if (sttClient_.generateSummary(cfg, textBuf, summaryBuf, SttClient::kMaxTextLen)) {
       if (!recordAiResult(wavPath, "resumo", sttClient_.lastModel(), "gravacao do Markdown pendente", sttClient_.lastStatusCode())) {
         pipelineError_ = "Falha ao salvar modelo/estado antes do Markdown"; return false;
@@ -665,8 +675,8 @@ void App::syncOneNote(int index) {
   showSyncResult(message, true);
 }
 
-// Varre /notes procurando o que falta transcrever (sem .txt/.md) ou subir
-// (sem .sync/.snc) e resolve tudo numa passada so, com progresso na tela.
+// Conta e processa apenas notas com IA ou upload pendentes. Notas concluidas
+// sao conferidas localmente; nao entram na barra nem fazem requisicoes ao Drive.
 void App::runManualSync() {
   pipelineError_ = "";
   const Settings &cfg = settingsStore_.get();
@@ -698,11 +708,8 @@ void App::runManualSync() {
   for (int i = 0; i < total; i++) {
     NoteEntry e;
     if (!notes_.getAt(i, e)) continue;
-    String txtPath = String(e.path); txtPath.replace(".wav", ".txt");
-    String mdPath = String(e.path); mdPath.replace(".wav", ".md");
-
-    bool needsAi = hasStt && (!NoteFiles::validText(txtPath) || !NoteFiles::validText(mdPath) || !aiMetadataReady(e.path));
-    bool needsUpload = hasDrive; // Sincronizacao explicita tambem confere backups remotos.
+    bool needsUpload = hasDrive && GDriveClient::needsUpload(e.path, hasStt);
+    bool needsAi = needsAiForSync(e.path, hasStt, hasDrive, needsUpload);
     if (needsAi || needsUpload) pendingTotal++;
   }
 
@@ -728,8 +735,8 @@ void App::runManualSync() {
     String txtPath = String(e.path); txtPath.replace(".wav", ".txt");
     String mdPath = String(e.path); mdPath.replace(".wav", ".md");
 
-    bool needsAi = hasStt && (!NoteFiles::validText(txtPath) || !NoteFiles::validText(mdPath) || !aiMetadataReady(e.path));
-    bool needsUpload = hasDrive;
+    bool needsUpload = hasDrive && GDriveClient::needsUpload(e.path, hasStt);
+    bool needsAi = needsAiForSync(e.path, hasStt, hasDrive, needsUpload);
     if (!needsAi && !needsUpload) continue;
 
     done++;
@@ -748,7 +755,7 @@ void App::runManualSync() {
     if (needsAi) {
       Screens::drawState(canvas_, epd_, Screens::StateIcon::Activity, "transcrevendo", e.label,
                           done, pendingTotal);
-      if (transcribeNote(e.path)) {
+      if (transcribeNote(e.path, done, pendingTotal)) {
         transcribed++;
         aiOk = true;
       } else {

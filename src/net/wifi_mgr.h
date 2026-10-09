@@ -45,6 +45,7 @@ private:
   Mode mode_ = Mode::Off;
   String apName_;
   bool serverStarted_ = false;
+  bool routesRegistered_ = false;
 
   void startServerOnce();
   void handleRoot();

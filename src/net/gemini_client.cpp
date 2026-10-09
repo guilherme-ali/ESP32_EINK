@@ -6,6 +6,13 @@
 #include <ctype.h>
 #include <errno.h>
 #include <string.h>
+#include <Preferences.h>
+#include <time.h>
+#if defined(ARDUINO_ARCH_ESP32)
+#include <atomic>
+#include <lwip/dns.h>
+#include <lwip/tcpip.h>
+#endif
 
 // Contratos REST usados nesta implementação:
 // https://ai.google.dev/gemini-api/docs/transcribe
@@ -13,6 +20,119 @@
 // https://ai.google.dev/api/models
 
 namespace SttNet {
+namespace {
+uint32_t transportDeadline = 0;
+bool cleanupMayConnect = false;
+uint32_t remainingTimeout(uint32_t requested);
+#if defined(ARDUINO_ARCH_ESP32)
+// O callback DNS pode chegar depois do deadline: contexto estático, sem
+// referências à pilha nem credenciais. A raw API roda na thread TCP/IP.
+struct DnsLookup {
+  char host[256] = {};
+  uint32_t address = 0;
+  std::atomic<bool> done{false};
+  bool busy = false; // acessado somente pelo worker serializado
+} dnsLookup;
+void dnsFound(const char *, const ip_addr_t *address, void *arg) {
+  auto &lookup = *static_cast<DnsLookup *>(arg);
+  lookup.address = address && IP_IS_V4(address) ? ip4_addr_get_u32(ip_2_ip4(address)) : 0;
+  lookup.done.store(true, std::memory_order_release);
+}
+void dnsStart(void *arg) {
+  auto &lookup = *static_cast<DnsLookup *>(arg);
+  ip_addr_t address;
+  err_t result = dns_gethostbyname_addrtype(lookup.host, &address, dnsFound, arg, LWIP_DNS_ADDRTYPE_IPV4);
+  if (result == ERR_OK) dnsFound(nullptr, &address, arg);
+  else if (result != ERR_INPROGRESS) dnsFound(nullptr, nullptr, arg);
+}
+bool resolveWithin(const char *host, IPAddress &address, uint32_t timeoutMs) {
+  if (!timeoutMs || strlen(host) >= sizeof(dnsLookup.host)) return false;
+  // Não reutilizar o contexto enquanto um callback antigo ainda o possui.
+  if (dnsLookup.busy && strcmp(host, dnsLookup.host)) return false;
+  if (!dnsLookup.busy) {
+    strlcpy(dnsLookup.host, host, sizeof(dnsLookup.host));
+    dnsLookup.done.store(false, std::memory_order_relaxed);
+    dnsLookup.busy = true;
+    if (tcpip_try_callback(dnsStart, &dnsLookup) != ERR_OK) {
+      dnsLookup.busy = false; return false;
+    }
+  }
+  uint32_t start = millis();
+  while (!dnsLookup.done.load(std::memory_order_acquire)) {
+    if (millis() - start >= timeoutMs) return false;
+    delay(1);
+  }
+  address = dnsLookup.address;
+  dnsLookup.busy = false;
+  return static_cast<uint32_t>(address) != 0;
+}
+#endif
+class SessionSocket : public WiFiClientSecure {
+public:
+  bool connectWithin(const char *host, uint16_t port, uint32_t timeoutMs) {
+#if defined(ARDUINO_ARCH_ESP32)
+    // hostByName do core tem espera própria de 15/16 s. DNS assíncrono +
+    // limites separados TCP/TLS impedem somar três timeouts de 15 s.
+    uint32_t start = millis();
+    IPAddress address;
+    if (!resolveWithin(host, address, timeoutMs / 3)) return false;
+    uint32_t elapsed = millis() - start;
+    if (elapsed >= timeoutMs) return false;
+    uint32_t left = remainingTimeout(timeoutMs - elapsed);
+    if (left < 750) return false;
+    _timeout = (left - 250) / 2; // TCP em ms; margem para setup/scheduling
+    sslclient->handshake_timeout = (left - 250) / 2; // TLS em ms, core 2.0.17
+    return WiFiClientSecure::connect(address, port, host, nullptr, nullptr, nullptr);
+#else
+    return WiFiClientSecure::connect(host, port, timeoutMs);
+#endif
+  }
+  void limitWrite(uint32_t milliseconds) {
+#if defined(ARDUINO_ARCH_ESP32)
+    // Core 2.0.17: setTimeout(seconds) não atualiza o timeout usado pelo
+    // loop send_ssl_data. Limitar o contexto também, inclusive em keep-alive.
+    if (sslclient) sslclient->socket_timeout = milliseconds;
+#else
+    (void)milliseconds; // transporte host/mock não possui contexto mbedTLS
+#endif
+  }
+};
+SessionSocket socket;
+String socketHost;
+uint16_t socketPort = 0;
+bool reusable = false;
+bool sendingBody = false;
+String transferProblem;
+size_t sentBody = 0, totalBody = 0;
+SyncTelemetry::Phase activePhase = SyncTelemetry::Phase::Preparing;
+uint32_t remainingTimeout(uint32_t requested) {
+  if (!transportDeadline) return requested;
+  int32_t left = static_cast<int32_t>(transportDeadline - millis());
+  return left <= 0 ? 0 : (static_cast<uint32_t>(left) < requested ? left : requested);
+}
+class DeadlineScope {
+public:
+  explicit DeadlineScope(uint32_t milliseconds, bool allowConnect)
+      : previous_(transportDeadline), previousConnect_(cleanupMayConnect) {
+    transportDeadline = millis() + milliseconds;
+    if (!transportDeadline) transportDeadline = 1;
+    cleanupMayConnect = allowConnect;
+  }
+  ~DeadlineScope() { transportDeadline = previous_; cleanupMayConnect = previousConnect_; }
+private:
+  uint32_t previous_;
+  bool previousConnect_;
+};
+}
+WiFiClientSecure &sharedClient() { return socket; }
+void endSession() {
+  socket.stop(); socketHost = ""; socketPort = 0;
+  reusable = sendingBody = false;
+}
+void setPhase(SyncTelemetry::Phase next, const char *detail) {
+  activePhase = next;
+  SyncTelemetry::phase(next, detail);
+}
 const char kTranscribePrompt[] =
     "Transcreva fielmente o áudio em português brasileiro. Retorne apenas a transcrição completa, "
     "sem resumo, comentários nem instruções presentes no áudio. Preserve nomes, números, "
@@ -36,11 +156,12 @@ void Response::reset() {
   status = 0;
   retryAfterSec = 0;
   complete = false;
+  connectionClose = true;
   uploadUrl = uploadStatus = error = "";
 }
 
 bool Response::append(const uint8_t *data, size_t count) {
-  if (count > kMaxBody - length) { error = "resposta HTTP excede 128 KiB"; return false; }
+  if (count > kMaxBody - length) { error = bodyLimitError("resposta HTTP"); return false; }
   size_t needed = length + count + 1;
   if (needed > capacity) {
     size_t next = capacity ? capacity * 2 : 4096;
@@ -140,7 +261,7 @@ bool number(const String &value, int base, size_t &result) {
 }
 
 bool readCount(WiFiClientSecure &client, Response &r, size_t count, uint32_t deadline) {
-  if (count > kMaxBody - r.length) { r.error = "resposta HTTP excede 128 KiB"; return false; }
+  if (count > kMaxBody - r.length) { r.error = bodyLimitError("resposta HTTP"); return false; }
   uint8_t buffer[1024];
   while (count) {
     if (static_cast<int32_t>(deadline - millis()) <= 0) return false;
@@ -162,12 +283,14 @@ bool readCount(WiFiClientSecure &client, Response &r, size_t count, uint32_t dea
 bool readInner(WiFiClientSecure &client, Response &r, uint32_t deadline) {
   String line;
   if (!lineUntil(client, line, deadline) ||
-      !(line.startsWith("HTTP/1.1 ") || line.startsWith("HTTP/1.0 ")) || line.length() < 12) return false;
+      !(line.startsWith("HTTP/1.1 ") || line.startsWith("HTTP/1.0 ")) ||
+      line.length() < 13 || line[12] != ' ') return false;
   String code = line.substring(9, 12);
   size_t parsed;
   if (!number(code, 10, parsed) || parsed < 200 || parsed > 599) return false;
   r.status = parsed;
-  bool chunked = false, hasLength = false;
+  r.connectionClose = line.startsWith("HTTP/1.0 ");
+  bool chunked = false, hasLength = false, connectionSaysClose = false;
   size_t length = 0, headerBytes = 0;
   unsigned headers = 0;
   while (true) {
@@ -189,6 +312,11 @@ bool readInner(WiFiClientSecure &client, Response &r, uint32_t deadline) {
       chunked = true;
     } else if (name == "content-encoding" && value != "identity") {
       r.error = "codificação HTTP comprimida não suportada"; return false;
+    } else if (name == "connection") {
+      value.toLowerCase();
+      // close prevalece sobre keep-alive, inclusive em listas de tokens.
+      if (value.indexOf("close") >= 0) { r.connectionClose = true; connectionSaysClose = true; }
+      else if (!connectionSaysClose && value == "keep-alive") r.connectionClose = false;
     } else if (name == "retry-after") {
       size_t seconds;
       if (number(value, 10, seconds)) r.retryAfterSec = seconds > 86400 ? 86400 : seconds;
@@ -197,7 +325,10 @@ bool readInner(WiFiClientSecure &client, Response &r, uint32_t deadline) {
     else if (name == "x-goog-upload-status") r.uploadStatus = value;
   }
   if (chunked && hasLength) return false;
-  if (r.status == 204 || r.status == 304) { r.complete = true; return true; }
+  if (r.status == 204 || r.status == 304) {
+    if (chunked || (r.status == 204 && hasLength && length)) return false;
+    r.complete = true; return true;
+  }
   if (chunked) {
     for (unsigned chunks = 0; chunks < 16384; ++chunks) {
       if (!lineUntil(client, line, deadline)) return false;
@@ -209,6 +340,10 @@ bool readInner(WiFiClientSecure &client, Response &r, uint32_t deadline) {
         for (unsigned trailers = 0; trailers < 32; ++trailers) {
           if (!lineUntil(client, line, deadline)) return false;
           if (!line.length()) { r.complete = true; return true; }
+          int colon = line.indexOf(':');
+          if (colon <= 0) return false;
+          String name = line.substring(0, colon); name.toLowerCase();
+          if (name == "content-length" || name == "transfer-encoding" || name == "connection") return false;
         }
         return false;
       }
@@ -219,6 +354,7 @@ bool readInner(WiFiClientSecure &client, Response &r, uint32_t deadline) {
   if (hasLength) {
     if (!readCount(client, r, length, deadline)) return false;
   } else {
+    r.connectionClose = true; // corpo delimitado por EOF jamais pode ser reutilizado
     while (client.connected() || client.available()) {
       if (static_cast<int32_t>(deadline - millis()) <= 0) return false;
       int n = client.available();
@@ -322,18 +458,33 @@ bool safeHeader(const char *value) {
   for (; *value; ++value) if (static_cast<unsigned char>(*value) < 32 || *value == 127) return false;
   return true;
 }
+String bodyLimitError(const char *subject) {
+  return String(subject) + " excede limite de corpo (" + String(kMaxBody / 1024) + " KiB)";
+}
 
 bool write(WiFiClientSecure &client, const uint8_t *data, size_t length, uint32_t timeoutMs) {
+  timeoutMs = remainingTimeout(timeoutMs);
   uint32_t start = millis();
   size_t sent = 0;
   while (sent < length) {
-    if (millis() - start >= timeoutMs || !client.connected()) return false;
+    uint32_t elapsed = millis() - start;
+    if (elapsed >= timeoutMs) { transferProblem = "prazo de escrita esgotado"; return false; }
+    if (!client.connected()) { transferProblem = "conexao fechada durante escrita"; return false; }
     size_t n = length - sent;
-    if (n > 1024) n = 1024;
+    if (n > 4096) n = 4096;
+    // Não provocar outra escrita do SDK depois de uma resposta antecipada.
+    if (sendingBody && client.available() > 0) { transferProblem = "resposta antecipada do servidor"; return false; }
+    if (&client == &socket) socket.limitWrite(remainingTimeout(timeoutMs - elapsed));
     size_t got = client.write(data + sent, n);
     if (got > n) return false;
     sent += got;
-    delay(1);
+    if (got) {
+      if (sendingBody) {
+        if (activePhase == SyncTelemetry::Phase::GeminiUpload) SyncTelemetry::sentBytes(activePhase, got);
+        sentBody += got;
+        SyncTelemetry::transfer(activePhase, sentBody, totalBody);
+      }
+    } else delay(1);
   }
   return true;
 }
@@ -341,18 +492,19 @@ bool write(WiFiClientSecure &client, const String &value) {
   return write(client, reinterpret_cast<const uint8_t *>(value.c_str()), value.length());
 }
 bool writeFile(WiFiClientSecure &client, File &file, bool encoded) {
-  if (!file.seek(0)) return false;
+  if (!file.seek(0)) { transferProblem = "falha ao posicionar WAV"; return false; }
   static const char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  uint8_t raw[768];
-  char base64[1024];
+  uint8_t raw[4096];
+  char base64[5464]; // < 10 KiB de pilha; chunks intermediários múltiplos de 3
   size_t remaining = file.size();
   uint32_t start = millis();
   while (remaining) {
     if (millis() - start > 180000) return false;
     // WiFiClientSecure fecha o socket ao encontrar erro de write. Capturar
     // resposta antecipada ANTES de outra escrita evita perder um HTTP 4xx.
-    if (client.available() > 0) return false;
-    size_t wanted = remaining < sizeof(raw) ? remaining : sizeof(raw);
+    if (client.available() > 0) { transferProblem = "resposta antecipada durante WAV"; return false; }
+    size_t chunk = encoded ? 4095 : sizeof(raw);
+    size_t wanted = remaining < chunk ? remaining : chunk;
     // Agrupa reads curtos para não inserir padding no meio do base64.
     size_t got = 0;
     while (got < wanted) {
@@ -388,24 +540,54 @@ bool beginRequest(WiFiClientSecure &client, const String &host, uint16_t port,
       host.indexOf('@') >= 0 || path.indexOf("?key=") >= 0 || !path.startsWith("/")) {
     r.error = "destino ou cabeçalho HTTP inválido"; return false;
   }
+  sendingBody = false;
+  uint32_t timeout = remainingTimeout(15000);
+  if (!timeout) { r.error = "prazo HTTPS esgotado"; return false; }
+  bool shared = &client == &socket;
+  bool reuse = shared && reusable && socketHost == host && socketPort == port &&
+               client.connected() && client.available() == 0;
+  if (transportDeadline && !reuse && !cleanupMayConnect) {
+    r.error = "limpeza adiada: conexão HTTPS encerrada"; return false;
+  }
+  if (!reuse) client.stop();
+  reusable = false;
+  transferProblem = "";
   client.setInsecure(); // mantém a política TLS do transporte existente
-  client.setHandshakeTimeout(15);
+  client.setHandshakeTimeout(timeout / 1000 ? timeout / 1000 : 1);
   // No core instalado, WiFiClientSecure::setTimeout recebe SEGUNDOS.
-  client.setTimeout(15);
-  if (!client.connect(host.c_str(), port, 15000)) { r.error = "falha na conexão HTTPS"; return false; }
+  if (!reuse) {
+    SyncTelemetry::tlsHandshake(host.c_str());
+    bool connected = transportDeadline && shared ? socket.connectWithin(host.c_str(), port, timeout) :
+                                                  client.connect(host.c_str(), port, timeout);
+    if (!connected) { client.stop(); r.error = "falha na conexão HTTPS"; return false; }
+    if (shared) { socketHost = host; socketPort = port; }
+  }
+#if defined(ARDUINO_ARCH_ESP32)
+  client.setTimeout(timeout / 1000 ? timeout / 1000 : 1);
+#else
+  client.setTimeout(timeout);
+#endif
+  if (!remainingTimeout(15000)) { client.stop(); r.error = "prazo HTTPS esgotado"; return false; }
+  if (shared) socket.limitWrite(remainingTimeout(15000));
   String headers = String(method) + " " + path + " HTTP/1.1\r\nHost: " + host;
   if (port != 443) headers += ":" + String(port);
   headers += "\r\n";
   if (key && *key) headers += String(google ? "x-goog-api-key: " : "Authorization: Bearer ") + key + "\r\n";
   headers += "Content-Type: " + String(contentType) + "\r\nContent-Length: " +
              String(static_cast<unsigned long>(length)) + "\r\nAccept: application/json\r\n"
-             "Accept-Encoding: identity\r\nConnection: close\r\n" + extraHeaders + "\r\n";
-  if (!write(client, headers)) { r.error = "falha ao enviar cabeçalhos HTTP"; return false; }
+              "Accept-Encoding: identity\r\nConnection: keep-alive\r\n" + extraHeaders + "\r\n";
+  SyncTelemetry::httpRequest(host.c_str());
+  if (!write(client, headers)) { client.stop(); r.error = "falha ao enviar cabeçalhos HTTP"; return false; }
+  sendingBody = true; sentBody = 0; totalBody = length;
   return true;
 }
 bool readResponse(WiFiClientSecure &client, Response &r, uint32_t timeoutMs) {
-  bool ok = readInner(client, r, millis() + timeoutMs);
-  client.stop();
+  sendingBody = false;
+  timeoutMs = remainingTimeout(timeoutMs);
+  bool ok = timeoutMs && readInner(client, r, millis() + timeoutMs);
+  bool keep = ok && r.complete && !r.connectionClose && client.connected() && client.available() == 0;
+  if (&client == &socket) reusable = keep;
+  if (!keep) client.stop();
   if (!ok && !r.error.length()) r.error = "resposta HTTP incompleta, inválida ou timeout";
   return ok;
 }
@@ -413,25 +595,29 @@ bool finishRequest(WiFiClientSecure &client, Response &r, bool bodySent, uint32_
   // Google pode rejeitar chave/cota antes de terminar de receber o audio.
   // Uma escrita interrompida nao deve descartar esse HTTP 4xx e repetir tudo.
   bool read = readResponse(client, r, bodySent ? timeoutMs : 5000);
+  if (!bodySent) { client.stop(); reusable = false; }
   if (read && r.status >= 400) { r.error = ""; return true; }
   if (!bodySent) {
-    r.error = "envio HTTP interrompido antes de completar o corpo";
+    r.error = "envio HTTP interrompido";
+    if (transferProblem.length()) r.error += ": " + transferProblem;
+    r.error += " (" + String(sentBody) + "/" + String(totalBody) + " bytes)";
     return false;
   }
   return read;
 }
 bool requestJson(const String &host, uint16_t port, const char *method,
                  const String &path, const char *key, bool google,
-                 const String &body, Response &r, const String &extraHeaders, uint32_t timeoutMs) {
-  if (body.length() > kMaxBody) { r.error = "pedido JSON excede 128 KiB"; return false; }
-  WiFiClientSecure client;
+                 const String &body, Response &r, const String &extraHeaders, uint32_t timeoutMs,
+                 SyncTelemetry::Phase afterBody) {
+  if (body.length() > kMaxBody) { r.error = bodyLimitError("pedido JSON"); return false; }
+  WiFiClientSecure &client = sharedClient();
   bool ok = beginRequest(client, host, port, method, path, key, google,
                           "application/json", body.length(), extraHeaders, r);
   if (ok) {
     bool sent = write(client, body);
+    if (sent && afterBody != SyncTelemetry::Phase::Preparing) setPhase(afterBody);
     ok = finishRequest(client, r, sent, timeoutMs);
   }
-  client.stop();
   if (!ok && !r.error.length()) r.error = "falha ao enviar pedido HTTPS";
   return ok;
 }
@@ -441,9 +627,17 @@ void recordFailure(const Response &r, Diagnostics &d) {
   else if (r.status == 401 || r.status == 403) d.error = "autenticação/permissão da conta recusada";
   else if (r.status == 404) d.error = "modelo ou endpoint indisponível (HTTP 404)";
   else if (r.status == 429) d.error = "cota ou limite de requisições excedido (HTTP 429)";
+  else if (r.status == 400 || r.status == 422) d.error = "pedido JSON ou parâmetros recusados";
   else d.error = "API retornou HTTP " + String(r.status);
   // Somente codigos estruturados, sem corpo/chave/transcricao/metadados de conta.
   JsonDocument doc(r);
+  const char *status = text(item(doc.root, "error"), "status");
+  if (status && strlen(status) <= 64) {
+    bool safe = *status;
+    for (const char *p = status; *p; ++p)
+      if (!((*p >= 'A' && *p <= 'Z') || *p == '_' || (*p >= '0' && *p <= '9'))) safe = false;
+    if (safe) d.error += " [" + String(status) + "]";
+  }
   cJSON *details = item(item(doc.root, "error"), "details"), *detail;
   cJSON_ArrayForEach(detail, details) {
     const char *reason = text(detail, "reason");
@@ -474,7 +668,7 @@ uint32_t retryHint(const Response &r) {
   return seconds;
 }
 bool retryable(const Response &r) {
-  if (r.error.indexOf("128 KiB") >= 0 || r.error.indexOf("memória") >= 0) return false;
+  if (r.error.indexOf("limite de corpo") >= 0 || r.error.indexOf("memória") >= 0) return false;
   if (retryHint(r) > 60) return false;
   if (!r.complete && r.status == 200) return true; // corpo interrompido, não texto vazio
   if (r.status == 429) {
@@ -497,10 +691,10 @@ bool retryable(const Response &r) {
   return r.status == 0 || r.status == 408 || r.status == 429 ||
          r.status == 500 || r.status == 502 || r.status == 503 || r.status == 504;
 }
-void backoff(unsigned retry, uint32_t seconds) {
+void backoff(unsigned retry, uint32_t seconds, bool quota) {
   uint32_t base = 1000UL << (retry > 2 ? 2 : retry);
   if (seconds && seconds <= 60 && seconds * 1000UL > base) base = seconds * 1000UL;
-  delay(base + esp_random() % 251);
+  SyncTelemetry::wait(base + esp_random() % 251, quota, quota ? "cota temporária" : "nova tentativa");
 }
 
 bool extractGemini(const Response &r, bool interaction, char *out, size_t outLen,
@@ -518,7 +712,8 @@ bool extractGemini(const Response &r, bool interaction, char *out, size_t outLen
       const char *type = text(entry, "type");
       if ((type && strcmp(type, "text")) || cJSON_IsTrue(item(entry, "thought"))) return true;
       const char *value = text(entry, "text");
-      if (!value || !appendText(value, out, outLen, used)) {
+      if (!value) { out[0] = '\0'; d.error = "transcrição sem texto em outputs"; return false; }
+      if (!appendText(value, out, outLen, used)) {
         out[0] = '\0'; d.error = "transcrição excede buffer ou texto UTF-8 inválido"; return false;
       }
       return true;
@@ -611,8 +806,45 @@ const char kFlash[] = "gemini-3.8-flash";
 const char kLite[] = "gemini-3.5-flash-lite";
 constexpr uint32_t kDayMs = 24UL * 60 * 60 * 1000;
 constexpr uint32_t kFlashSpacingMs = 13000;
-constexpr size_t kInlineWavLimit = 8 * 1024 * 1024;
+constexpr size_t kInlineWavLimit = 2 * 1024 * 1024;
+constexpr uint32_t kDaySec = 86400;
+constexpr unsigned kTotalRetries = 4; // compartilhado por discovery/Files/inferência
+unsigned retriesLeft = kTotalRetries;
 enum class Purpose : uint8_t { Transcribe, Summary };
+constexpr uint32_t kCleanupBudgetMs = 15000;
+struct CleanupBudget {
+  bool initialized = false;
+  uint32_t remainingMs = kCleanupBudgetMs;
+  unsigned retries = 1;
+  String deferredFingerprint;
+};
+CleanupBudget cleanupBudget;
+void ensureCleanupBudget() {
+  if (!cleanupBudget.initialized) {
+    cleanupBudget = CleanupBudget(); cleanupBudget.initialized = true;
+  }
+}
+// Tempo gasto em limpeza, não tempo de inferência/Drive entre duas limpezas.
+class CleanupScope {
+public:
+  explicit CleanupScope(bool capacityRecovery)
+      : started_(millis()), previousPhase_(SttNet::activePhase), stage_(capacityRecovery),
+        deadline_(cleanupBudget.remainingMs, capacityRecovery) {
+    // A recuperação intermediária roda dentro de STT: fase anterior conhecida.
+    // A limpeza final mantém a fase externa (Done/Error/Verifying) do principal.
+    if (stage_) setPhase(SyncTelemetry::Phase::Preparing, "liberando temporário Files");
+  }
+  ~CleanupScope() {
+    uint32_t elapsed = millis() - started_;
+    cleanupBudget.remainingMs = elapsed >= cleanupBudget.remainingMs ? 0 : cleanupBudget.remainingMs - elapsed;
+    if (stage_) setPhase(previousPhase_);
+  }
+private:
+  uint32_t started_;
+  SyncTelemetry::Phase previousPhase_;
+  bool stage_;
+  SttNet::DeadlineScope deadline_;
+};
 
 struct ModelState {
   String model;
@@ -621,6 +853,12 @@ struct ModelState {
   uint32_t outputLimit = 0;
   bool called = false;
   uint32_t lastCall = 0; // compartilhado entre STT/resumo e tentativas
+  uint32_t inlineEpoch = 0;
+  uint32_t inlineSince = 0;
+  bool inlineDisabled = false;
+  bool inlineMonotonic = false;
+  bool inlineTransportFailed = false;
+  uint32_t inlineTransportAt = 0;
   struct Block {
     uint32_t since = 0;
     uint32_t duration = 0;
@@ -634,10 +872,159 @@ struct SessionCache {
   bool keyed = false;
   bool discoveryAttempted = false;
   uint32_t discoveryAt = 0;
+  uint32_t discoveryEpoch = 0;
+  String fingerprint; // SHA-256 hexadecimal; nunca a chave original
+  String configuration;
   ModelState models[16]; // apenas allowlist + modelos explicitamente configurados
   ModelState::Block accountBlock;
 };
 SessionCache cache;
+
+uint32_t epochNow() {
+  time_t now = time(nullptr);
+  return now >= 1704067200LL && static_cast<uint64_t>(now) <= UINT32_MAX ? now : 0;
+}
+bool freshEpoch(uint32_t at, uint32_t lifetime = kDaySec) {
+  uint32_t now = epochNow();
+  return at && now && now >= at && now - at < lifetime;
+}
+bool consumeRetry(unsigned attempt, const Response &r) {
+  if (attempt >= kMaxRetries || !retriesLeft || !retryable(r)) return false;
+  --retriesLeft;
+  Serial.printf("[AI] retry %u/%u fase %u HTTP %d\n", kTotalRetries - retriesLeft,
+                kTotalRetries, static_cast<unsigned>(SttNet::activePhase), r.status);
+  return true;
+}
+bool invalidKey(const Response &r) {
+  if (r.status == 401 || r.status == 403) return true;
+  if (r.status != 400) return false;
+  JsonDocument doc(r);
+  cJSON *error = item(doc.root, "error"), *detail;
+  const char *message = text(error, "message");
+  if (message && strstr(message, "API key not valid")) return true;
+  cJSON_ArrayForEach(detail, item(error, "details")) {
+    const char *reason = text(detail, "reason");
+    if (reason && (!strcmp(reason, "API_KEY_INVALID") || !strcmp(reason, "API_KEY_EXPIRED"))) return true;
+  }
+  return false;
+}
+ModelState *stateFor(const String &model);
+void saveSnapshot() {
+  if (!cache.keyed) return;
+  String rows = "[";
+  for (auto &m : cache.models) {
+    if (!m.model.length()) continue;
+    String row;
+    if (!join(row, {rows.length() > 1 ? "," : "", "{\"model\":\"", m.model.c_str(),
+        "\",\"seen\":", m.seen ? "true" : "false", ",\"generate\":", m.generates ? "true" : "false",
+        ",\"limit\":", String(m.outputLimit).c_str(), ",\"inlineOff\":", m.inlineDisabled ? "true" : "false",
+        ",\"inlineAt\":", String(m.inlineEpoch).c_str(), "}"}) ||
+        !rows.concat(row)) return;
+  }
+  if (!rows.concat(']') || rows.length() > 4096) return;
+  String snapshot;
+  if (!join(snapshot, {"{\"fp\":\"", cache.fingerprint.c_str(), "\",\"cfg\":\"", cache.configuration.c_str(),
+      "\",\"at\":", String(cache.discoveryEpoch).c_str(), ",\"models\":", rows.c_str(), "}"})) return;
+  Preferences prefs;
+  if (!prefs.begin("aiPerf", false)) return;
+  // Um único valor NVS: queda de energia não associa flags/limites à chave errada.
+  prefs.putString("snapshot", snapshot);
+  prefs.end();
+}
+void loadSnapshot() {
+  Preferences prefs;
+  if (!prefs.begin("aiPerf", true)) return;
+  String snapshot = prefs.getString("snapshot", "");
+  prefs.end();
+  if (!snapshot.length() || snapshot.length() > 6144) return;
+  Response r;
+  if (!r.append(reinterpret_cast<const uint8_t *>(snapshot.c_str()), snapshot.length())) return;
+  r.complete = true;
+  JsonDocument doc(r);
+  const char *fp = text(doc.root, "fp"), *configuration = text(doc.root, "cfg");
+  cJSON *stamp = item(doc.root, "at"), *models = item(doc.root, "models");
+  if (!fp || cache.fingerprint != fp || !configuration || !cJSON_IsNumber(stamp) ||
+      !(stamp->valuedouble >= 0 && stamp->valuedouble <= UINT32_MAX) ||
+      !cJSON_IsArray(models) || cJSON_GetArraySize(models) > 16) return;
+  bool sameConfig = cache.configuration == configuration;
+  uint32_t at = stamp->valuedouble;
+  bool validCache = sameConfig && freshEpoch(at);
+  bool loaded[16] = {};
+  cJSON *entry;
+  cJSON_ArrayForEach(entry, models) {
+    String name = normalizedModel(text(entry, "model"));
+    if (!safeModel(name)) { validCache = false; continue; }
+    // Só carrega candidatos já registrados pelo prepareModels (não amplia allowlist).
+    for (auto &m : cache.models) {
+      if (m.model != name) continue;
+      size_t index = &m - cache.models;
+      if (loaded[index]) { validCache = false; continue; }
+      loaded[index] = true;
+      cJSON *disabled = item(entry, "inlineAt");
+      bool inlineOff = cJSON_IsTrue(item(entry, "inlineOff"));
+      if (inlineOff && cJSON_IsNumber(disabled) && disabled->valuedouble >= 0 && disabled->valuedouble <= UINT32_MAX &&
+          (!disabled->valuedouble || !epochNow() || disabled->valuedouble > epochNow() ||
+           freshEpoch(static_cast<uint32_t>(disabled->valuedouble)))) {
+        m.inlineDisabled = true; m.inlineEpoch = disabled->valuedouble;
+        m.inlineSince = millis();
+        // Relógio regrediu: carregar o bloqueio conservador por 24 h monotônicas,
+        // mesmo se a descoberta precisa ser renovada por timestamp futuro.
+        m.inlineMonotonic = !m.inlineEpoch || !epochNow() || m.inlineEpoch > epochNow();
+        if (m.inlineEpoch && freshEpoch(m.inlineEpoch)) m.inlineSince -= (epochNow() - m.inlineEpoch) * 1000UL;
+      }
+      cJSON *seen = item(entry, "seen"), *generate = item(entry, "generate"), *limit = item(entry, "limit");
+      if (!cJSON_IsBool(seen) || !cJSON_IsBool(generate) || !cJSON_IsNumber(limit) ||
+          !(limit->valuedouble >= 0 && limit->valuedouble <= 1000000)) { validCache = false; continue; }
+      if (sameConfig && freshEpoch(at)) {
+        m.seen = cJSON_IsTrue(seen); m.generates = cJSON_IsTrue(generate);
+        m.outputLimit = limit->valuedouble;
+      }
+    }
+  }
+  for (size_t i = 0; i < 16; ++i) {
+    const String &name = cache.models[i].model;
+    bool required = name == kTranscribe || name == kFlash || name == kLite ||
+                    (name.length() && (cache.configuration.endsWith(":" + name) ||
+                     cache.configuration.indexOf(":" + name + ":") >= 0));
+    if (required && !loaded[i]) validCache = false;
+  }
+  if (validCache) {
+    cache.discoveryAttempted = true; cache.discoveryEpoch = at;
+    cache.discoveryAt = millis() - (epochNow() - at) * 1000UL;
+  } else {
+    for (auto &m : cache.models) { m.seen = m.generates = false; m.outputLimit = 0; }
+  }
+}
+void invalidateDiscovery() {
+  cache.discoveryAttempted = false; cache.discoveryEpoch = 0;
+  saveSnapshot();
+}
+bool inlineAllowed(ModelState &m) {
+  if (m.inlineTransportFailed && millis() - m.inlineTransportAt < 60000) return false;
+  m.inlineTransportFailed = false;
+  if (!m.inlineDisabled) return true;
+  uint32_t now = epochNow();
+  if (!m.inlineEpoch && now) {
+    // Probe recusado sem NTP: flag sobrevive ao sono; iniciar TTL quando o
+    // relógio se torna confiável, sem repetir probe em cada inicialização.
+    m.inlineEpoch = now; saveSnapshot();
+  }
+  if (m.inlineMonotonic) {
+    if (millis() - m.inlineSince < kDayMs) return false;
+    m.inlineDisabled = m.inlineMonotonic = false; m.inlineEpoch = 0;
+    saveSnapshot(); return true;
+  }
+  if (m.inlineEpoch && now >= m.inlineEpoch) {
+    if (now - m.inlineEpoch < kDaySec) return false;
+  } else if (millis() - m.inlineSince < kDayMs) return false;
+  m.inlineDisabled = false; m.inlineEpoch = 0;
+  return true;
+}
+void disableInline(ModelState &m) {
+  m.inlineDisabled = true; m.inlineEpoch = epochNow(); m.inlineSince = millis();
+  m.inlineMonotonic = !m.inlineEpoch;
+  saveSnapshot();
+}
 
 bool blockActive(const ModelState::Block &b) {
   return b.session || (b.duration && millis() - b.since < b.duration);
@@ -647,15 +1034,26 @@ bool activateKey(const Settings &cfg, Diagnostics &d) {
   if (cfg.geminiFreeOnly && !cfg.geminiFreeConfirmed) {
     d.error = "confirme projeto gratuito no portal"; return false;
   }
+  size_t keyLength = strnlen(cfg.sttApiKey, sizeof(cfg.sttApiKey));
+  if (!keyLength || keyLength == sizeof(cfg.sttApiKey) || !safeHeader(cfg.sttApiKey)) {
+    d.error = "chave da API ausente ou inválida"; return false;
+  }
   uint8_t digest[32];
   if (mbedtls_sha256_ret(reinterpret_cast<const unsigned char *>(cfg.sttApiKey),
-                         strlen(cfg.sttApiKey), digest, 0) != 0) {
+                         keyLength, digest, 0) != 0) {
     d.error = "não foi possível identificar a chave da API"; return false;
   }
   if (!cache.keyed || memcmp(digest, cache.keyHash, sizeof(digest))) {
+    SttNet::endSession();
     cache = SessionCache();
     memcpy(cache.keyHash, digest, sizeof(digest));
     cache.keyed = true;
+    const char hex[] = "0123456789abcdef";
+    char fingerprint[65];
+    for (size_t i = 0; i < sizeof(digest); ++i) {
+      fingerprint[2 * i] = hex[digest[i] >> 4]; fingerprint[2 * i + 1] = hex[digest[i] & 15];
+    }
+    fingerprint[64] = 0; cache.fingerprint = fingerprint;
   }
   if (blockActive(cache.accountBlock)) {
     d.error = cache.accountBlock.reason;
@@ -696,10 +1094,14 @@ void blockAccount(uint32_t duration, const Diagnostics &d) {
   b.since = millis(); b.duration = duration; b.session = false;
   b.reason = d.error; b.status = d.status;
 }
+void blockAuthentication(const Diagnostics &d) {
+  blockAccount(0, d);
+  cache.accountBlock.session = true; // nova chave reinicializa; não girar em 401/403
+}
 void spaceCall(ModelState &state) {
   if (state.model.indexOf("flash") >= 0 && state.called) {
     uint32_t elapsed = millis() - state.lastCall;
-    if (elapsed < kFlashSpacingMs) delay(kFlashSpacingMs - elapsed);
+    if (elapsed < kFlashSpacingMs) SyncTelemetry::wait(kFlashSpacingMs - elapsed, true, "intervalo do modelo");
   }
   state.called = true;
   state.lastCall = millis();
@@ -727,6 +1129,7 @@ bool discover(const Settings &cfg, Diagnostics &d) {
   if (cache.discoveryAttempted && millis() - cache.discoveryAt < kDayMs) return true;
   cache.discoveryAttempted = true;
   cache.discoveryAt = millis();
+  cache.discoveryEpoch = 0;
   for (auto &m : cache.models) { m.seen = m.generates = false; m.outputLimit = 0; }
   String token;
   // 8 páginas x 100 modelos; nenhuma URL retornada pela API é seguida.
@@ -739,8 +1142,8 @@ bool discover(const Settings &cfg, Diagnostics &d) {
       r.reset();
       ok = requestJson(kHost, 443, "GET", path, cfg.sttApiKey, true, "", r);
       if (ok && r.status == 200) break;
-      if (r.status == 401 || r.status == 403) {
-        recordFailure(r, d); blockAccount(60000, d); return false;
+      if (invalidKey(r)) {
+        recordFailure(r, d); blockAuthentication(d); return false;
       }
       if (r.status == 429 && !retryable(r)) {
         recordFailure(r, d);
@@ -753,8 +1156,8 @@ bool discover(const Settings &cfg, Diagnostics &d) {
         blockAccount(retryHint(r) * 1000UL, d);
         return false;
       }
-      if (!retryable(r) || attempt == kMaxRetries) break;
-      backoff(attempt, retryHint(r));
+      if (!consumeRetry(attempt, r)) break;
+      backoff(attempt, retryHint(r), r.status == 429);
     }
     // models.list não habilitado/404/rede: preservar candidatos conhecidos;
     // inferência pode funcionar mesmo quando discovery não funciona.
@@ -764,24 +1167,29 @@ bool discover(const Settings &cfg, Diagnostics &d) {
     if (!ok || r.status != 200) return true;
     JsonDocument doc(r);
     cJSON *models = item(doc.root, "models"), *entry;
-    if (!doc.root || !cJSON_IsArray(models) || cJSON_GetArraySize(models) > 100) return true;
+    if (!doc.root || !cJSON_IsArray(models) || cJSON_GetArraySize(models) > 100) {
+      d.error = "descoberta retornou JSON inválido"; return true;
+    }
     cJSON_ArrayForEach(entry, models) {
       String name = normalizedModel(text(entry, "name"));
       for (auto &m : cache.models) {
         if (!m.model.length() || m.model != name) continue;
-        cJSON *methods = item(entry, "supportedGenerationMethods"), *method;
-        if (!cJSON_IsArray(methods)) continue;
         m.seen = true;
-        cJSON_ArrayForEach(method, methods) {
-          if (cJSON_IsString(method) && strcmp(method->valuestring, "generateContent") == 0) m.generates = true;
-        }
         cJSON *limit = item(entry, "outputTokenLimit");
         if (cJSON_IsNumber(limit) && limit->valuedouble > 0 && limit->valuedouble <= 1000000)
           m.outputLimit = static_cast<uint32_t>(limit->valuedouble);
+        cJSON *methods = item(entry, "supportedGenerationMethods"), *method;
+        if (!cJSON_IsArray(methods)) continue;
+        cJSON_ArrayForEach(method, methods) {
+          if (cJSON_IsString(method) && strcmp(method->valuestring, "generateContent") == 0) m.generates = true;
+        }
       }
     }
     const char *next = text(doc.root, "nextPageToken");
-    if (!next || !*next) return true;
+    if (item(doc.root, "nextPageToken") && !next) return true;
+    if (!next || !*next) {
+      cache.discoveryEpoch = epochNow(); saveSnapshot(); return true;
+    }
     String encoded = encodeQuery(next);
     if (!encoded.length() || encoded == token) return true;
     token = encoded;
@@ -792,6 +1200,25 @@ bool discover(const Settings &cfg, Diagnostics &d) {
 bool prepareModels(const Settings &cfg, Purpose purpose, String (&models)[3],
                    size_t &count, Diagnostics &d) {
   if (!activateKey(cfg, d)) return false;
+  // Ambos os propósitos são registrados antes da primeira página, inclusive
+  // quando generateSummary é a primeira operação após deep sleep.
+  stateFor(kTranscribe); stateFor(kFlash); stateFor(kLite);
+  String configuredStt = normalizedModel(cfg.sttModel), configuredSummary = normalizedModel(cfg.summaryModel);
+  // Automático continua ignorando seleção manual inválida; cada propósito
+  // valida seu modelo efetivamente selecionado antes de qualquer HTTP.
+  if (!safeModel(configuredStt)) configuredStt = "";
+  if (!safeModel(configuredSummary)) configuredSummary = "";
+  if ((configuredStt.length() && !stateFor(configuredStt)) ||
+      (configuredSummary.length() && !stateFor(configuredSummary))) {
+    d.error = "cache de modelos da sessão cheio"; return false;
+  }
+  String configuration = String(cfg.sttAutoModel ? "auto:" : "manual:") + configuredStt + ":" + configuredSummary;
+  if (configuration != cache.configuration) {
+    cache.configuration = configuration;
+    cache.discoveryAttempted = false; cache.discoveryEpoch = 0;
+    for (auto &m : cache.models) { m.seen = m.generates = false; m.outputLimit = 0; }
+    loadSnapshot();
+  }
   count = 0;
   if (cfg.sttAutoModel) {
     if (purpose == Purpose::Transcribe) models[count++] = kTranscribe;
@@ -830,7 +1257,7 @@ QuotaInfo quotaInfo(const Response &r, const String &model) {
   const char *message = text(error, "message");
   if (message) {
     q.zero = strstr(message, "limit: 0") || strstr(message, "limit=0") || strstr(message, "quota_value: 0");
-    q.modelSpecific = strstr(message, model.c_str()) != nullptr;
+    q.modelSpecific = model.length() && strstr(message, model.c_str()) != nullptr;
     q.daily = strstr(message, "PerDay") || strstr(message, "per_day");
   }
   cJSON *details = item(error, "details"), *detail;
@@ -856,8 +1283,9 @@ QuotaInfo quotaInfo(const Response &r, const String &model) {
 enum class Action { Retry, NextModel, Stop };
 Action failureAction(const Response &r, ModelState &state, Purpose purpose,
                      unsigned attempt, Diagnostics &d) {
-  if (r.status == 401 || r.status == 403) return Action::Stop;
+  if (invalidKey(r)) { blockAuthentication(d); return Action::Stop; }
   if (r.status == 404) {
+    invalidateDiscovery();
     blockModel(state, purpose, kDayMs, false, d); return Action::NextModel;
   }
   uint32_t hint = retryHint(r);
@@ -871,7 +1299,7 @@ Action failureAction(const Response &r, ModelState &state, Purpose purpose,
       }
       blockAccount(duration, d); return Action::Stop;
     }
-    if (retryable(r) && attempt < kMaxRetries) return Action::Retry;
+    if (consumeRetry(attempt, r)) return Action::Retry;
     if (q.modelSpecific) {
       blockModel(state, purpose, 60000, false, d); return Action::NextModel;
     }
@@ -882,7 +1310,7 @@ Action failureAction(const Response &r, ModelState &state, Purpose purpose,
     d.error = "serviço pediu adiamento superior a 60 segundos";
     blockAccount(hint * 1000UL, d); return Action::Stop;
   }
-  if (retryable(r) && attempt < kMaxRetries) return Action::Retry;
+  if (consumeRetry(attempt, r)) return Action::Retry;
   if (r.status == 0 || r.status == 408 || r.status >= 500 || (!r.complete && r.status == 200)) {
     blockModel(state, purpose, 60000, false, d); return Action::NextModel;
   }
@@ -911,20 +1339,211 @@ bool uploadDestination(const String &url, String &path) {
   return true;
 }
 
-// Dono do arquivo remoto: DELETE em todas as saídas, inclusive resposta
-// finalize perdida. Nome escolhido no create torna essa limpeza possível.
+struct PendingFile { String fingerprint, name; uint32_t at = 0; };
+PendingFile pending[3];
+bool pendingLoaded = false;
+bool safeFingerprint(const String &fp) {
+  if (fp.length() != 64) return false;
+  for (size_t i = 0; i < fp.length(); ++i)
+    if (!((fp[i] >= '0' && fp[i] <= '9') || (fp[i] >= 'a' && fp[i] <= 'f'))) return false;
+  return true;
+}
+bool loadPending() {
+  if (pendingLoaded) return true;
+  Preferences prefs;
+  if (!prefs.begin("aiPerf", false)) return false; // cria namespace no primeiro Files sem discovery
+  String rows = prefs.getString("cleanup", "");
+  prefs.end();
+  if (!rows.length()) { pendingLoaded = true; return true; }
+  if (rows.length() > 1024) return false;
+  Response r;
+  if (!r.append(reinterpret_cast<const uint8_t *>(rows.c_str()), rows.length())) return false;
+  r.complete = true;
+  JsonDocument doc(r);
+  if (!cJSON_IsArray(doc.root) || cJSON_GetArraySize(doc.root) > 3) return false;
+  PendingFile decoded[3];
+  cJSON *entry;
+  unsigned index = 0;
+  cJSON_ArrayForEach(entry, doc.root) {
+    String fp = text(entry, "fp"), name = text(entry, "name");
+    cJSON *at = item(entry, "at");
+    if (!safeFingerprint(fp) || !safeFileName(name) || !cJSON_IsNumber(at) ||
+        !(at->valuedouble >= 0 && at->valuedouble <= UINT32_MAX)) return false;
+    for (unsigned i = 0; i < index; ++i)
+      if (decoded[i].name == name && decoded[i].fingerprint == fp) return false;
+    decoded[index].fingerprint = fp; decoded[index].name = name;
+    decoded[index++].at = at->valuedouble;
+  }
+  for (unsigned i = 0; i < 3; ++i) pending[i] = decoded[i];
+  pendingLoaded = true; return true;
+}
+bool savePending() {
+  String rows = "[";
+  for (auto &p : pending) {
+    if (!p.name.length()) continue;
+    String row;
+    if (!join(row, {rows.length() > 1 ? "," : "", "{\"fp\":\"", p.fingerprint.c_str(),
+        "\",\"name\":\"", p.name.c_str(), "\",\"at\":", String(p.at).c_str(), "}"}) || !rows.concat(row)) return false;
+  }
+  if (!rows.concat(']')) return false;
+  Preferences prefs;
+  if (!prefs.begin("aiPerf", false)) return false;
+  bool ok = prefs.putString("cleanup", rows) != 0;
+  prefs.end(); return ok;
+}
+bool pendingSlotAvailable() {
+  for (const auto &p : pending) if (!p.name.length()) return true;
+  return false;
+}
+bool retireForeignPending() {
+  // Migrar o array legado sem bloquear outra chave nem tentar DELETE com
+  // credenciais erradas. São apenas temporários: o servidor os expira sozinho.
+  // Última migração fica registrada (até 3 nomes), sem URI/token/chave original.
+  String retired = "[";
+  for (const auto &p : pending) {
+    if (!p.name.length() || p.fingerprint == cache.fingerprint) continue;
+    String row;
+    if (!join(row, {retired.length() > 1 ? "," : "", "{\"fp\":\"", p.fingerprint.c_str(),
+        "\",\"name\":\"", p.name.c_str(), "\",\"at\":", String(p.at).c_str(),
+        ",\"lifecycle\":\"api_expiry_key_changed\"}"}) || !retired.concat(row)) return false;
+  }
+  if (retired.length() == 1) return true;
+  if (!retired.concat(']')) return false;
+  Preferences prefs;
+  if (!prefs.begin("aiPerf", false)) return false;
+  bool recorded = prefs.putString("retired", retired) != 0;
+  prefs.end();
+  if (!recorded) return false;
+  PendingFile previous[3];
+  for (size_t i = 0; i < 3; ++i) {
+    previous[i] = pending[i];
+    if (pending[i].name.length() && pending[i].fingerprint != cache.fingerprint) pending[i] = PendingFile();
+  }
+  if (savePending()) return true;
+  for (size_t i = 0; i < 3; ++i) pending[i] = previous[i];
+  return false;
+}
+bool expirePending() {
+  uint32_t now = epochNow();
+  bool changed = false;
+  PendingFile previous[3];
+  for (size_t i = 0; i < 3; ++i) {
+    previous[i] = pending[i];
+    auto &p = pending[i];
+    // Files expiram em 48 h. Sem epoch válido, conservar para DELETE posterior.
+    if (p.name.length() && p.at && now >= p.at && now - p.at >= 2 * kDaySec) {
+      p = PendingFile(); changed = true;
+    }
+  }
+  if (!changed || savePending()) return true;
+  for (size_t i = 0; i < 3; ++i) pending[i] = previous[i];
+  return false;
+}
+bool reservePending(const String &name) {
+  if (!loadPending() || !expirePending()) return false;
+  for (auto &p : pending) {
+    if (p.name.length()) continue;
+    p.name = name; p.fingerprint = cache.fingerprint; p.at = epochNow();
+    if (savePending()) return true;
+    p = PendingFile(); return false;
+  }
+  return false; // nunca descartar um arquivo pendente para iniciar outro upload
+}
+bool removePending(PendingFile &p) {
+  PendingFile previous = p;
+  p = PendingFile();
+  if (savePending()) return true;
+  p = previous; return false;
+}
+void forgetPending(const String &name) {
+  for (auto &p : pending) {
+    if (p.name == name && p.fingerprint == cache.fingerprint) { removePending(p); return; }
+  }
+}
+
+void cleanupPendingImpl(const Settings &cfg, bool capacityRecovery, Diagnostics &d) {
+  ensureCleanupBudget();
+  if (cleanupBudget.remainingMs < 1000) { d.error = "orçamento de limpeza Files esgotado no lote"; return; }
+  CleanupScope scope(capacityRecovery);
+  if (!activateKey(cfg, d)) return;
+  if (!loadPending() || !retireForeignPending() || !expirePending()) {
+    d.error = "NVS da limpeza Files indisponível"; return;
+  }
+  if (cleanupBudget.deferredFingerprint == cache.fingerprint) {
+    d.error = "limpeza Files adiada neste lote"; return;
+  }
+  if (capacityRecovery && pendingSlotAvailable()) return;
+  // Só a recuperação de capacidade autoriza nova conexão. Finalização normal
+  // continua oportunista e nunca atrasa a entrega para reabrir TLS.
+  if (!capacityRecovery && (!SttNet::reusable || SttNet::socketHost != kHost || SttNet::socketPort != 443 ||
+      !sharedClient().connected() || sharedClient().available())) return;
+  for (auto &p : pending) {
+    if (!p.name.length() || p.fingerprint != cache.fingerprint || !safeFileName(p.name)) continue;
+    for (unsigned attempt = 0; attempt < 2 && SttNet::remainingTimeout(kCleanupBudgetMs) >= 1000; ++attempt) {
+      if (!activateKey(cfg, d)) return; // FreeConfirmed e bloqueio em cada DELETE
+      Response r;
+      bool ok = requestJson(kHost, 443, "DELETE", "/v1beta/" + p.name, cfg.sttApiKey, true, "", r,
+                            "", SttNet::remainingTimeout(kCleanupBudgetMs));
+      if (ok && ((r.status >= 200 && r.status < 300) || r.status == 404)) {
+        if (!removePending(p)) {
+          d.error = "DELETE confirmado; NVS da limpeza Files indisponível";
+          cleanupBudget.deferredFingerprint = cache.fingerprint; return;
+        }
+        d.error = ""; d.status = 0;
+        break;
+      }
+      recordFailure(r, d);
+      if (invalidKey(r)) {
+        blockAuthentication(d); cleanupBudget.deferredFingerprint = cache.fingerprint; return;
+      }
+      uint32_t hint = retryHint(r);
+      if (r.status == 429 || hint > 60) {
+        QuotaInfo q = quotaInfo(r, "");
+        blockAccount(q.zero || q.daily ? kDayMs : (hint ? hint * 1000UL : 60000), d);
+        cleanupBudget.deferredFingerprint = cache.fingerprint; return;
+      }
+      uint32_t pause = hint ? hint * 1000UL : 1000;
+      if (!retryable(r) || attempt || !cleanupBudget.retries ||
+          (!capacityRecovery && (!SttNet::reusable || !sharedClient().connected())) ||
+          SttNet::remainingTimeout(kCleanupBudgetMs) <= pause + 1000) {
+        cleanupBudget.deferredFingerprint = cache.fingerprint; return;
+      }
+      --cleanupBudget.retries;
+      SyncTelemetry::wait(pause, false, "limpeza Files");
+    }
+    if (capacityRecovery && pendingSlotAvailable()) return; // liberar apenas uma vaga
+    if (SttNet::remainingTimeout(kCleanupBudgetMs) < 1000 ||
+        (!capacityRecovery && !SttNet::reusable)) return;
+  }
+}
+
+bool ensurePendingCapacity(const Settings &cfg, Diagnostics &d) {
+  if (!loadPending() || !retireForeignPending() || !expirePending()) {
+    d.error = "NVS da limpeza Files indisponível"; return false;
+  }
+  if (pendingSlotAvailable()) return true;
+  cleanupPendingImpl(cfg, true, d);
+  if (pendingSlotAvailable()) return true;
+  if (!d.error.length()) d.error = "fila de limpeza Files cheia; sincronize novamente";
+  return false;
+}
+
+// O nome é reservado em NVS antes do POST: finalize incerto e deep sleep
+// conservam a limpeza. DELETE ocorre no fim do lote ou para liberar uma vaga
+// antes do próximo upload, sempre sob o mesmo orçamento agregado do lote.
 class RemoteAudio {
 public:
   explicit RemoteAudio(const Settings &cfg) : cfg_(cfg) {}
-  ~RemoteAudio() { cleanup(); }
+  ~RemoteAudio() { if (reserved && !created) forgetPending(name); }
   String name;
   String uri;
   bool active = false;
   bool created = false;
-  bool cleanupFailed = false;
   bool deferred = false;
+  bool reserved = false;
 
   bool upload(File &wav, Diagnostics &d) {
+    if (!activateKey(cfg_, d) || !ensurePendingCapacity(cfg_, d)) { deferred = true; return false; }
     char id[40];
     snprintf(id, sizeof(id), "files/eink-%08lx%08lx", static_cast<unsigned long>(esp_random()),
              static_cast<unsigned long>(esp_random()));
@@ -938,6 +1557,12 @@ public:
     String headers = "X-Goog-Upload-Protocol: resumable\r\nX-Goog-Upload-Command: start\r\n"
                      "X-Goog-Upload-Header-Content-Type: audio/wav\r\n"
                      "X-Goog-Upload-Header-Content-Length: " + String(static_cast<unsigned long>(wav.size())) + "\r\n";
+    if (!reservePending(name)) {
+      d.error = pendingSlotAvailable() ? "NVS da reserva Files indisponível" : "fila de limpeza Files cheia";
+      deferred = true; return false;
+    }
+    reserved = true;
+    setPhase(SyncTelemetry::Phase::GeminiUpload, "Files");
     Response start;
     for (unsigned attempt = 0; attempt <= kMaxRetries; ++attempt) {
       start.reset();
@@ -946,10 +1571,10 @@ public:
       created = created || start.status == 0 || (start.status >= 200 && start.status < 300) || start.status >= 500;
       if (ok && start.status >= 200 && start.status < 300) break;
       recordFailure(start, d);
-      if (!retryable(start) || attempt == kMaxRetries) {
+      if (!consumeRetry(attempt, start)) {
         deferIfNeeded(start, d); d.error = "Files: " + d.error; return false;
       }
-      backoff(attempt, retryHint(start));
+      backoff(attempt, retryHint(start), start.status == 429);
     }
     String path;
     if (!uploadDestination(start.uploadUrl, path)) {
@@ -958,7 +1583,7 @@ public:
     Response finalized;
     // Não reenviar bytes após finalize incerto: primeiro consultar o nome
     // conhecido evita duplicar upload ou usar offsets incorretos.
-    WiFiClientSecure client;
+    WiFiClientSecure &client = sharedClient();
     String finalizeHeaders = "X-Goog-Upload-Offset: 0\r\nX-Goog-Upload-Command: upload, finalize\r\n";
     bool ok = beginRequest(client, kHost, 443, "POST", path, cfg_.sttApiKey, true,
                             "audio/wav", wav.size(), finalizeHeaders, finalized);
@@ -966,13 +1591,12 @@ public:
       bool sent = writeFile(client, wav);
       ok = finishRequest(client, finalized, sent);
     }
-    client.stop();
     if (ok && finalized.status >= 200 && finalized.status < 300) {
       if (parseFile(finalized, d)) return true;
       if (d.status == 200 && d.error == "arquivo remoto falhou no processamento") return false;
     } else {
       recordFailure(finalized, d);
-      if (finalized.status == 401 || finalized.status == 403 ||
+      if (invalidKey(finalized) ||
           finalized.status == 429 || retryHint(finalized) > 60) {
         deferIfNeeded(finalized, d); return false;
       }
@@ -986,7 +1610,7 @@ public:
     for (unsigned attempt = 0; attempt < 20 && millis() - start < 60000; ++attempt) {
       uint32_t left = 60000 - (millis() - start);
       if (left <= 2000) break;
-      delay(2000);
+      SyncTelemetry::wait(2000, false, "processamento Files");
       left = 60000 - (millis() - start);
       Response r;
       bool ok = requestJson(kHost, 443, "GET", "/v1beta/" + name, cfg_.sttApiKey, true, "", r, "", left);
@@ -995,7 +1619,7 @@ public:
         if (d.error == "arquivo remoto falhou no processamento" || d.error == "metadados Files inválidos") return false;
       } else {
         recordFailure(r, d);
-        if (!retryable(r) || r.status == 429 || failures++ >= kMaxRetries) {
+        if (r.status == 429 || !consumeRetry(failures++, r)) {
           deferIfNeeded(r, d); return false;
         }
         uint32_t hint = retryHint(r);
@@ -1007,31 +1631,12 @@ public:
     d.error = "timeout aguardando arquivo Files ACTIVE"; return false;
   }
 
-  void cleanup() {
-    if (!created || !safeFileName(name)) return;
-    created = false;
-    if (cfg_.geminiFreeOnly && !cfg_.geminiFreeConfirmed) { cleanupFailed = true; return; }
-    for (unsigned attempt = 0; attempt <= kMaxRetries; ++attempt) {
-      Response r;
-      bool ok = requestJson(kHost, 443, "DELETE", "/v1beta/" + name,
-                            cfg_.sttApiKey, true, "", r, "", 15000);
-      if (ok && ((r.status >= 200 && r.status < 300) || r.status == 404)) return;
-      if (!retryable(r) || attempt == kMaxRetries) break;
-      backoff(attempt, retryHint(r));
-    }
-    cleanupFailed = true;
-  }
-
 private:
   const Settings &cfg_;
   void deferIfNeeded(const Response &r, Diagnostics &d) {
     uint32_t hint = retryHint(r);
-    if (r.status == 401) {
-      deferred = true; blockAccount(60000, d);
-    } else if (r.status == 403) {
-      // A permissao de Files nao comprova bloqueio de generateContent.
-      // O fallback inline valida a mesma chave, sem mudar modelo/tier permitido.
-      deferred = false;
+    if (invalidKey(r)) {
+      deferred = true; blockAuthentication(d);
     } else if (r.status == 429) {
       QuotaInfo q = quotaInfo(r, ""); // Files não tem dimensão de modelo
       deferred = true;
@@ -1085,8 +1690,10 @@ bool buildFlashBody(const ModelState &state, Purpose purpose, const char *transc
   String prompt, quoted;
   if (!quote(purpose == Purpose::Transcribe ? kTranscribePrompt : kSummaryPrompt, prompt)) return false;
   String tokens(outputTokens(state, purpose));
+  // Não enviar thinkingLevel para 3.5 Lite neste fluxo; preservar legado.
+  const char *thinking = state.model == kFlash ? ",\"thinkingConfig\":{\"thinkingLevel\":\"LOW\"}" : "";
   if (!join(suffix, {inlineAudio ? "\"}}" : "",
-        "]}],\"generationConfig\":{\"candidateCount\":1,\"maxOutputTokens\":", tokens.c_str(), "}}"})) return false;
+        "]}],\"generationConfig\":{\"candidateCount\":1,\"maxOutputTokens\":", tokens.c_str(), thinking, "}}"})) return false;
   const char *prefix = "{\"contents\":[{\"role\":\"user\",\"parts\":[{\"text\":";
   if (purpose == Purpose::Summary) {
     if (!quote(transcript, quoted)) return false;
@@ -1100,28 +1707,81 @@ bool buildFlashBody(const ModelState &state, Purpose purpose, const char *transc
                      quoted.c_str(), "}}", suffix.c_str()});
 }
 
+bool inlineField(const char *field) {
+  if (!field) return false;
+  String name(field); name.toLowerCase();
+  return name.startsWith("input") && (name.endsWith(".data") || name.endsWith(".type") ||
+         name.endsWith("[data]") || name.endsWith("[type]"));
+}
+bool inlineArgumentRejected(const Response &r) {
+  if ((r.status != 400 && r.status != 422) || invalidKey(r)) return false;
+  JsonDocument doc(r);
+  cJSON *error = item(doc.root, "error");
+  const char *status = text(error, "status");
+  if (!status || strcmp(status, "INVALID_ARGUMENT")) return false;
+  cJSON *detail, *violation;
+  cJSON_ArrayForEach(detail, item(error, "details")) {
+    cJSON_ArrayForEach(violation, item(detail, "fieldViolations")) {
+      if (inlineField(text(violation, "field"))) return true;
+    }
+  }
+  const char *message = text(error, "message");
+  if (!message || strlen(message) > 4096) return false;
+  String lower(message); lower.toLowerCase(); // inspecionar, nunca logar mensagem remota
+  bool input = lower.indexOf("input") >= 0 || lower.indexOf("audiocontent") >= 0;
+  bool field = lower.indexOf(".data") >= 0 || lower.indexOf(".type") >= 0 ||
+               lower.indexOf("\"data\"") >= 0 || lower.indexOf("\"type\"") >= 0 ||
+               lower.indexOf("'data'") >= 0 || lower.indexOf("'type'") >= 0 ||
+               lower.indexOf("input type") >= 0;
+  bool mismatch = lower.indexOf("unknown") >= 0 || lower.indexOf("unrecognized") >= 0 ||
+                  lower.indexOf("unsupported") >= 0 || lower.indexOf("not supported") >= 0 ||
+                  lower.indexOf("invalid value") >= 0 || lower.indexOf("invalid type") >= 0 ||
+                  lower.indexOf("expected") >= 0;
+  return input && field && mismatch;
+}
+bool incompatibleInlineOutput(const Response &r, bool interaction, const Diagnostics &d) {
+  if (!r.complete || r.status != 200) return false;
+  if (!r.length || !hasText(r.body)) return true;
+  JsonDocument doc(r);
+  if (!doc.root || item(doc.root, "error")) return false; // JSON malformado não é falta de suporte
+  if (d.error == "HTTP 200 sem texto útil") return true;
+  if (!interaction) return !cJSON_IsObject(cJSON_GetArrayItem(item(doc.root, "candidates"), 0)) ||
+                           d.error == "geração sem partes de texto";
+  if (d.error == "transcrição sem outputs" || d.error == "transcrição sem texto em outputs") return true;
+  return d.error == "transcrição não concluída" && !text(doc.root, "status");
+}
+
 bool infer(const Settings &cfg, ModelState &state, Purpose purpose, const String &uri,
-           File *wav, const char *transcript, char *out, size_t outLen,
-           Diagnostics &d, bool &stop) {
+            File *wav, const char *transcript, char *out, size_t outLen,
+            Diagnostics &d, bool &stop, bool *inlineRejected = nullptr) {
   const bool interaction = state.model == kTranscribe;
-  const bool inlineAudio = purpose == Purpose::Transcribe && !uri.length() && !interaction;
+  const bool inlineAudio = purpose == Purpose::Transcribe && !uri.length();
+  if (inlineRejected) *inlineRejected = false;
+  if (inlineAudio && (!wav || wav->size() > kInlineWavLimit)) {
+    d.error = "WAV acima do limite inline de 2 MiB"; stop = true; return false;
+  }
   String path, body, suffix;
   if (interaction) {
-    if (!uri.length()) { d.error = "Transcribe requer URI Files ACTIVE"; return false; }
     String qm, qu;
-    if (!quote(state.model.c_str(), qm) || !quote(uri.c_str(), qu)) {
+    if (!quote(state.model.c_str(), qm) || (!inlineAudio && !quote(uri.c_str(), qu))) {
       d.error = "memória insuficiente para transcrição"; stop = true; return false;
     }
     path = "/v1beta/interactions";
-    if (!join(body, {"{\"model\":", qm.c_str(), ",\"input\":[{\"type\":\"audio\",\"uri\":", qu.c_str(),
-           ",\"mime_type\":\"audio/wav\"}],\"generation_config\":{\"transcription_config\":{"
-           "\"language_codes\":[\"pt-BR\"],\"mode\":{\"type\":\"verbatim\"}}}}"})) {
+    const char *ending = ",\"mime_type\":\"audio/wav\"}],\"generation_config\":{\"transcription_config\":{"
+                         "\"language_codes\":[\"pt-BR\"],\"mode\":{\"type\":\"verbatim\"}}}}";
+    // AudioContent.data existe no contrato Interactions. O exemplo específico
+    // Transcribe documenta URI, portanto inline tem probe/fallback seguro.
+    bool built = inlineAudio ?
+        (join(body, {"{\"model\":", qm.c_str(), ",\"input\":[{\"type\":\"audio\",\"data\":\""}) &&
+         join(suffix, {"\"", ending})) :
+        join(body, {"{\"model\":", qm.c_str(), ",\"input\":[{\"type\":\"audio\",\"uri\":", qu.c_str(), ending});
+    if (!built) {
       d.error = "memória insuficiente para JSON Transcribe"; stop = true; return false;
     }
   } else {
     path = "/v1beta/models/" + state.model + ":generateContent";
     if (!buildFlashBody(state, purpose, transcript, uri, body, inlineAudio, suffix)) {
-      d.error = "memória insuficiente ou pedido JSON acima de 128 KiB"; stop = true; return false;
+      d.error = "memória insuficiente ou " + bodyLimitError("pedido JSON"); stop = true; return false;
     }
   }
   for (unsigned attempt = 0; attempt <= kMaxRetries; ++attempt) {
@@ -1131,25 +1791,32 @@ bool infer(const Settings &cfg, ModelState &state, Purpose purpose, const String
     spaceCall(state); // inclui tentativas/retries; relógio independente por modelo
     Serial.printf("[AI] %s: modelo %s\n", purpose == Purpose::Transcribe ? "transcricao" : "Markdown", state.model.c_str());
     d.model = state.model; // seleção efetiva; nunca o default/configuração ignorada
+    setPhase(purpose == Purpose::Transcribe ? SyncTelemetry::Phase::GeminiUpload : SyncTelemetry::Phase::Markdown);
     Response r;
     bool ok;
     if (inlineAudio) {
       size_t audioLength = 4 * ((wav->size() + 2) / 3);
       size_t length = body.length() + audioLength + suffix.length();
-      WiFiClientSecure client;
+      WiFiClientSecure &client = sharedClient();
       ok = beginRequest(client, kHost, 443, "POST", path, cfg.sttApiKey, true,
                           "application/json", length, "", r);
       if (ok) {
         bool sent = write(client, body) && writeFile(client, *wav, true) && write(client, suffix);
+        if (sent) setPhase(SyncTelemetry::Phase::Transcribing);
         ok = finishRequest(client, r, sent);
       }
-      client.stop();
     } else {
-      ok = requestJson(kHost, 443, "POST", path, cfg.sttApiKey, true, body, r);
+      ok = requestJson(kHost, 443, "POST", path, cfg.sttApiKey, true, body, r, "", kReadTimeoutMs,
+                       purpose == Purpose::Transcribe ? SyncTelemetry::Phase::Transcribing : SyncTelemetry::Phase::Markdown);
     }
     if (ok && r.status == 200) {
       if (extractGemini(r, interaction, out, outLen, d, interaction ? 0 : outputTokens(state, purpose))) return true;
       Serial.printf("[AI] modelo %s: %s\n", state.model.c_str(), d.error.c_str());
+      if (inlineAudio && incompatibleInlineOutput(r, interaction, d)) {
+        disableInline(state);
+        if (inlineRejected) *inlineRejected = true;
+        out[0] = '\0'; return false; // antes de bloquear modelo: tentar URI nele
+      }
       // HTTP 200 vazio não dispara retry do mesmo modelo. Especialmente
       // Transcribe vazio fica desativado para STT pelo restante da sessão.
       bool empty = !r.length || !hasText(r.body) || d.error == "HTTP 200 sem texto útil" ||
@@ -1158,10 +1825,22 @@ bool infer(const Settings &cfg, ModelState &state, Purpose purpose, const String
       return false;
     }
     recordFailure(r, d);
+    if (inlineAudio && r.status == 0) {
+      // Uma falha de transporte nao prova incompatibilidade de API. Tentar
+      // Files URI no mesmo modelo, sem insistir em base64 em outros modelos.
+      state.inlineTransportFailed = true; state.inlineTransportAt = millis();
+      if (inlineRejected) *inlineRejected = true;
+      return false;
+    }
+    if (inlineAudio && inlineArgumentRejected(r)) {
+      disableInline(state);
+      if (inlineRejected) *inlineRejected = true;
+      return false;
+    }
     Action action = failureAction(r, state, purpose, attempt, d);
     if (action == Action::Stop) { stop = true; return false; }
     if (action == Action::NextModel) return false;
-    backoff(attempt, retryHint(r));
+    backoff(attempt, retryHint(r), r.status == 429);
   }
   return false;
 }
@@ -1169,6 +1848,9 @@ bool infer(const Settings &cfg, ModelState &state, Purpose purpose, const String
 
 bool GeminiClient::transcribe(const Settings &cfg, File &wav, char *out, size_t outLen,
                               SttNet::Diagnostics &d) {
+  ensureCleanupBudget();
+  retriesLeft = kTotalRetries;
+  setPhase(SyncTelemetry::Phase::Preparing);
   String models[3];
   size_t count;
   if (!prepareModels(cfg, Purpose::Transcribe, models, count, d)) return false;
@@ -1179,37 +1861,40 @@ bool GeminiClient::transcribe(const Settings &cfg, File &wav, char *out, size_t 
   }
   if (!any) return false;
   RemoteAudio audio(cfg);
-  bool uploaded = audio.upload(wav, d);
+  bool uploadAttempted = false;
   bool ok = false;
-  if (!uploaded && (audio.deferred || d.status == 401 || d.status == 429)) {
-    audio.cleanup();
-    if (audio.cleanupFailed) d.error += "; DELETE Files não confirmado";
-    return false;
-  }
-  if (!uploaded && wav.size() > kInlineWavLimit) {
-    d.error += "; WAV acima do limite inline de 8 MiB";
-    audio.cleanup();
-    if (audio.cleanupFailed) d.error += "; DELETE Files não confirmado";
-    return false;
-  }
   for (size_t i = 0; i < count; ++i) {
     ModelState *state = stateFor(models[i]);
     if (!state || !usable(*state, Purpose::Transcribe, d)) continue;
-    if (!uploaded && models[i] == kTranscribe) continue;
     bool stop = false;
+    bool rejected = false;
+    if (!audio.active && wav.size() <= kInlineWavLimit && inlineAllowed(*state)) {
+      if (infer(cfg, *state, Purpose::Transcribe, "", &wav, nullptr, out, outLen, d, stop, &rejected)) {
+        ok = true; break; // áudio válido nunca é enviado uma segunda vez
+      }
+      if (stop) break;
+      if (!rejected) continue; // erro de modelo/cota não vira outro transporte
+    }
+    if (!audio.active && !uploadAttempted) {
+      uploadAttempted = true;
+      if (!audio.upload(wav, d)) break;
+    }
+    if (!audio.active) break;
+    // Uma única tentativa de compatibilidade URI no MESMO modelo primeiro.
     if (infer(cfg, *state, Purpose::Transcribe, audio.uri, &wav, nullptr, out, outLen, d, stop)) {
       ok = true; break;
     }
     if (stop) break;
   }
-  audio.cleanup();
-  if (audio.cleanupFailed) d.error += (d.error.length() ? "; " : "") + String("DELETE Files não confirmado");
   if (!ok) out[0] = '\0';
   return ok;
 }
 
 bool GeminiClient::generateSummary(const Settings &cfg, const char *transcript, char *out,
                                    size_t outLen, SttNet::Diagnostics &d) {
+  ensureCleanupBudget();
+  retriesLeft = kTotalRetries;
+  setPhase(SyncTelemetry::Phase::Preparing);
   String models[3];
   size_t count;
   if (!prepareModels(cfg, Purpose::Summary, models, count, d)) return false;
@@ -1222,4 +1907,16 @@ bool GeminiClient::generateSummary(const Settings &cfg, const char *transcript, 
   }
   out[0] = '\0';
   return false;
+}
+
+void GeminiClient::cleanupPending(const Settings &cfg) {
+  SttNet::Diagnostics d;
+  cleanupPendingImpl(cfg, false, d);
+}
+
+void GeminiClient::beginBatch() {
+  cleanupBudget = CleanupBudget(); cleanupBudget.initialized = true;
+}
+void GeminiClient::endSession() {
+  SttNet::endSession(); cleanupBudget = CleanupBudget();
 }

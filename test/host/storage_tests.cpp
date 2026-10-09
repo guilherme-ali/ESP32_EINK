@@ -9,6 +9,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <vector>
+#include "../../src/sync/telemetry.h"
 
 namespace {
 struct Test { const char *name; std::function<void()> run; };
@@ -41,12 +42,12 @@ NoteSyncState uploaded(bool text = false) {
 }
 NoteSyncState load() { NoteSyncState s; CHECK(s.load(wav)); return s; }
 void reply(const std::string &body, int status = 200, const std::string &headers = "") {
-  Host::enqueue(Fixtures::http(body, status, headers), 3, 1);
+  Host::enqueue(Fixtures::http(body, status, headers), 3, 1, true);
 }
 void oauth() { reply(R"({"access_token":"access","token_type":"Bearer"})"); }
 void folder() { reply(R"({"id":"folder","mimeType":"application/vnd.google-apps.folder","trashed":false})"); }
-std::string remote(const char *id, const std::string &bytes, const String &hash) {
-  return std::string("{\"id\":\"") + id + "\",\"name\":\"test.wav\",\"trashed\":false,\"parents\":[\"folder\"],\"size\":\"" +
+std::string remote(const char *id, const std::string &bytes, const String &hash, const char *name = "test.wav") {
+  return std::string("{\"id\":\"") + id + "\",\"name\":\"" + name + "\",\"trashed\":false,\"parents\":[\"folder\"],\"size\":\"" +
          std::to_string(bytes.size()) + "\",\"md5Checksum\":\"" + hash.c_str() + "\"}";
 }
 SettingsStore driveSettings() {
@@ -55,7 +56,11 @@ SettingsStore driveSettings() {
 }
 void newUploadReplies(const std::string &bytes, bool badHash = false) {
   oauth(); folder(); reply(R"({"files":[]})"); reply(R"({"ids":["new_wav"]})");
-  reply("{}", 404); reply("{}", 200, "Location: https://www.googleapis.com/upload/session\r\n");
+  if (bytes.size() > 5 * 1024 * 1024) {
+    reply("{}", 200, "Location: https://www.googleapis.com/upload/session\r\n");
+    for (size_t offset = 1024 * 1024; offset < bytes.size(); offset += 1024 * 1024)
+      reply("", 308, "Range: bytes=0-" + std::to_string(offset - 1) + "\r\n");
+  }
   reply("{}", 200);
   reply(remote("new_wav", bytes, badHash ? Host::mockFileHash("different") : Host::mockFileHash(bytes)));
 }
@@ -252,6 +257,29 @@ TEST(note_atomic_replace_requires_closed_destination_littlefs_contract) {
   CHECK(NoteFiles::writeAtomic("/notes/test.ai", "new metadata", 12));
   CHECK(LittleFS.bytes("/notes/test.ai") == "new metadata");
 }
+TEST(bounded_metadata_read_uses_known_size_and_preserves_bytes) {
+  const std::string json = "{\"modelo\":\"ação\",\"estado\":\"concluido\"}";
+  File file(json, 3); String read = "old";
+  CHECK(NoteFiles::readBounded(file, read, json.size()));
+  CHECK(std::string(read.c_str()) == json && file.position() == json.size());
+}
+TEST(bounded_metadata_read_rejects_partial_and_oversized_files) {
+  File oversized("12345"); String read = "old";
+  CHECK(!NoteFiles::readBounded(oversized, read, 4) && read.isEmpty());
+  LittleFS.put("/test.json", "12345"); LittleFS.faults->readBudget = 3;
+  File partial = LittleFS.open("/test.json", FILE_READ);
+  CHECK(!NoteFiles::readBounded(partial, read, 5) && read.isEmpty());
+}
+TEST(sync_state_save_and_load_use_bounded_io_instead_of_byte_reads) {
+  auto s = settings(); NoteSyncState state;
+  state.authGeneration = s.get().driveAuthGeneration;
+  uint64_t reads = Host::fileReadCalls;
+  CHECK(state.save(wav)); NoteSyncState recovered; CHECK(recovered.load(wav));
+  CHECK(Host::fileReadCalls - reads < 32);
+  reads = Host::fileReadCalls;
+  File legacy(std::string(100, 'x')); legacy.readString();
+  CHECK(Host::fileReadCalls - reads >= 100);
+}
 TEST(note_recovery_prefers_valid_old_then_valid_tmp) {
   LittleFS.put("/notes/test.txt", "old"); LittleFS.put("/notes/test.txt.tmp", "new");
   NoteFiles::recoverText("/notes/test.txt"); CHECK(LittleFS.bytes("/notes/test.txt") == "old" && !LittleFS.exists("/notes/test.txt.tmp"));
@@ -282,7 +310,7 @@ TEST(note_read_long_utf8_short_reads_and_strict_limits) {
   std::vector<char> exact(boundary.size() + 1);
   CHECK(NoteFiles::readText("/notes/test.txt", exact.data(), exact.size()) && std::string(exact.data()) == boundary);
   CHECK(NoteFiles::writeAtomic("/notes/out.txt", boundary.c_str(), boundary.size()));
-  for (const std::string &bad : {std::string("\xe2\x82"), std::string("a\0b", 3), std::string(" \n\t"), std::string(32768, 'x')}) {
+  for (const std::string &bad : {std::string("\xe2\x82"), std::string("a\0b", 3), std::string(" \n\t"), std::string(NoteFiles::kMaxTextBytes + 1, 'x')}) {
     LittleFS.put("/notes/test.txt", bad); std::vector<char> buffer(bad.size() + 1, 'Z');
     CHECK(!NoteFiles::readText("/notes/test.txt", buffer.data(), buffer.size()) && buffer[0] == '\0');
     CHECK(!NoteFiles::writeAtomic("/notes/out.txt", bad.c_str(), bad.size()));
@@ -302,14 +330,14 @@ TEST(drive_generate_id_persist_before_requests_and_final_get_verify) {
   auto s = driveSettings(); const auto bytes = Fixtures::wav(); LittleFS.put(wav, bytes); newUploadReplies(bytes);
   Host::onConnect = [](size_t index) {
     if (index == 4) { auto saved = load(); CHECK(saved.wavIdReserved && !saved.wavUploaded && std::string(saved.wavDriveId) == "new_wav"); }
-    if (index == 6) { auto saved = load(); CHECK(saved.wavSessionUrl == "https://www.googleapis.com/upload/session" && !saved.wavUploaded); }
-    if (index == 7) { auto saved = load(); CHECK(saved.wavBytesUploaded == saved.wavSize && !saved.wavUploaded && !saved.fullySynced); }
+    if (index == 5) { auto saved = load(); CHECK(saved.wavBytesUploaded == saved.wavSize && !saved.wavUploaded && !saved.fullySynced); }
   };
-  GDriveClient client; CHECK(client.uploadNote(s, wav)); CHECK(Host::requests.size() == 8 && Host::responses.empty());
+  GDriveClient client; CHECK(client.uploadNote(s, wav)); CHECK(Host::requests.size() == 6 && Host::responses.empty());
   CHECK(Host::requests[3].find("GET /drive/v3/files/generateIds?") == 0);
-  CHECK(Host::requests[5].find("POST /upload/drive/v3/files?") == 0 && Host::requests[5].find("\"id\":\"new_wav\"") != std::string::npos);
-  CHECK(Host::requests[6].find("PUT /upload/session ") == 0 && Host::requests[6].find(bytes) != std::string::npos);
-  CHECK(Host::requests[7].find("GET /drive/v3/files/new_wav?") == 0);
+  CHECK(Host::requests[4].find("POST /upload/drive/v3/files?uploadType=multipart") == 0 && Host::requests[4].find("\"id\":\"new_wav\"") != std::string::npos);
+  CHECK(Host::requests[4].find(bytes) != std::string::npos);
+  CHECK(Host::requests[5].find("GET /drive/v3/files/new_wav?") == 0);
+  CHECK(Host::connectionHosts.size() == 2); // OAuth isolado + unico TLS Drive
   auto saved = load(); CHECK(saved.fullySynced && saved.wavUploaded && !saved.wavIdReserved && saved.wavSessionUrl.isEmpty());
   CHECK(std::string(saved.wavMd5) == Host::mockFileHash(bytes).c_str() && !GDriveClient::needsUpload(wav, false));
 }
@@ -332,15 +360,14 @@ TEST(drive_auth_generation_change_regenerates_id_and_discards_old_session) {
 TEST(drive_source_change_updates_snapshot_retains_id_and_uses_patch) {
   uploaded(); Host::rebootNvs(); seedString("driveRefTok", "refresh"); seedString("driveFolder", "folder");
   auto s = settings(); const auto old = Fixtures::wav(); auto changed = old; changed.back() = 1; LittleFS.put(wav, changed);
-  oauth(); folder(); reply(remote("old_wav", old, Host::mockFileHash(old))); reply(remote("old_wav", old, Host::mockFileHash(old)));
-  reply("{}", 200, "Location: https://www.googleapis.com/upload/patch\r\n"); reply("{}", 200);
+  oauth(); folder(); reply(remote("old_wav", old, Host::mockFileHash(old))); reply("{}", 200);
   reply(remote("old_wav", changed, Host::mockFileHash(changed)));
   GDriveClient client;
   if (!client.uploadNote(s, wav)) throw std::runtime_error(std::string(client.lastError().c_str()) +
       "; requests=" + std::to_string(Host::requests.size()) +
       (Host::requests.empty() ? "" : "; last=" + Host::requests.back()));
-  CHECK(Host::requests.size() == 7);
-  CHECK(Host::requests[4].find("PATCH /upload/drive/v3/files/old_wav?") == 0);
+  CHECK(Host::requests.size() == 5);
+  CHECK(Host::requests[3].find("PATCH /upload/drive/v3/files/old_wav?uploadType=multipart") == 0);
   CHECK(std::string(load().wavMd5) == Host::mockFileHash(changed).c_str() && load().fullySynced);
 }
 TEST(drive_persistence_failure_blocks_network_and_preserves_old_state) {
@@ -350,9 +377,10 @@ TEST(drive_persistence_failure_blocks_network_and_preserves_old_state) {
   CHECK(LittleFS.bytes(sync) == old && LittleFS.exists(tmp));
 }
 TEST(drive_reservation_and_session_commit_failure_block_next_mutation) {
-  for (size_t index : {size_t(3), size_t(5)}) {
+  for (size_t index : {size_t(3), size_t(4)}) {
     Host::resetClock(); Host::resetNetwork(); Host::resetNvs(); LittleFS.reset();
-    auto s = driveSettings(); LittleFS.put(wav, Fixtures::wav()); newUploadReplies(Fixtures::wav());
+    auto s = driveSettings(); auto bytes = Fixtures::sizedWav(5 * 1024 * 1024 + 60);
+    LittleFS.put(wav, bytes); newUploadReplies(bytes);
     std::string committed;
     Host::onConnect = [index, &committed](size_t current) {
       if (current == index) { committed = LittleFS.bytes(sync); LittleFS.faults->failRename = tmp; }
@@ -379,14 +407,238 @@ TEST(drive_pairing_strict_token_capacity_and_nvs_failure) {
   reply(R"({"refresh_token":"token","access_token":"access","token_type":"Bearer"})");
   GDriveClient client; CHECK(!client.pairDevice(s, nullptr) && !s.hasDriveAuth() && client.lastError().length());
 }
+
+TEST(drive_bulk_three_ids_atomic_before_multipart_and_nine_requests) {
+  auto s = driveSettings(); CHECK(s.saveStt("https://stt.test", "model", "fake-key"));
+  const std::string audio = Fixtures::wav(), txt = "texto útil", md = "# nota\n- fato";
+  LittleFS.put(wav, audio); LittleFS.put("/notes/test.txt", txt); LittleFS.put("/notes/test.md", md);
+  oauth(); folder(); for (int i = 0; i < 3; ++i) reply(R"({"files":[]})");
+  reply(R"({"ids":["new_wav","new_txt","new_md"]})");
+  reply(remote("new_wav", audio, Host::mockFileHash(audio)));
+  reply(remote("new_txt", txt, Host::mockFileHash(txt), "test.txt"));
+  reply(remote("new_md", md, Host::mockFileHash(md), "test.md"));
+  Host::onConnect = [](size_t index) {
+    if (index == 6) {
+      auto state = load(); CHECK(state.wavIdReserved && state.txtIdReserved && state.mdIdReserved);
+      CHECK(std::string(state.wavDriveId) == "new_wav" && std::string(state.txtDriveId) == "new_txt" && std::string(state.mdDriveId) == "new_md");
+      CHECK(!state.wavUploaded && !state.txtUploaded && !state.mdUploaded && !state.fullySynced);
+    }
+    if (index == 8) { auto state = load(); CHECK(state.wavUploaded && state.txtUploaded && !state.mdUploaded && !state.fullySynced); }
+  };
+  GDriveClient client; CHECK(client.uploadNote(s, wav)); CHECK(Host::requests.size() == 9 && Host::responses.empty());
+  CHECK(Host::requests[5].find("generateIds?count=3") != std::string::npos);
+  const std::string bytes[] = {audio, txt, md};
+  for (size_t i = 0; i < 3; ++i) {
+    const auto &request = Host::requests[6 + i]; CHECK(request.find("POST /upload/drive/v3/files?uploadType=multipart") == 0);
+    CHECK(request.find("Content-Type: multipart/related; boundary=esp32_drive_") != std::string::npos);
+    CHECK(request.find(bytes[i]) != std::string::npos);
+    size_t end = request.find("\r\n\r\n"), length = request.find("\r\nContent-Length: ");
+    CHECK(end != std::string::npos && length < end);
+    CHECK(request.size() == end + 4 + std::strtoull(request.c_str() + length + 18, nullptr, 10));
+  }
+  auto state = load(); CHECK(state.fullySynced && state.wavUploaded && state.txtUploaded && state.mdUploaded);
+  CHECK(!state.wavIdReserved && !state.txtIdReserved && !state.mdIdReserved);
+  CHECK(Host::connectionHosts.size() == 2 && !GDriveClient::needsUpload(wav, true));
+}
+TEST(drive_bulk_reservation_commit_failure_blocks_every_post) {
+  auto s = driveSettings(); LittleFS.put(wav, Fixtures::wav()); LittleFS.put("/notes/test.txt", "texto"); LittleFS.put("/notes/test.md", "# nota");
+  oauth(); folder(); for (int i = 0; i < 3; ++i) reply(R"({"files":[]})"); reply(R"({"ids":["new_wav","new_txt","new_md"]})");
+  Host::onConnect = [](size_t index) { if (index == 5) LittleFS.faults->failRename = tmp; };
+  GDriveClient client; CHECK(!client.uploadNote(s, wav) && Host::requests.size() == 6);
+  for (const auto &request : Host::requests) CHECK(request.find("POST /upload/") != 0);
+  LittleFS.faults->failRename.clear(); auto recovered = load();
+  CHECK(recovered.wavIdReserved && recovered.txtIdReserved && recovered.mdIdReserved && !recovered.fullySynced);
+}
+TEST(drive_bulk_duplicate_ids_fail_closed_without_mutations) {
+  auto s = driveSettings(); LittleFS.put(wav, Fixtures::wav()); LittleFS.put("/notes/test.txt", "texto");
+  oauth(); folder(); reply(R"({"files":[]})"); reply(R"({"files":[]})"); reply(R"({"ids":["duplicate","duplicate"]})");
+  GDriveClient client; CHECK(!client.uploadNote(s, wav) && Host::requests.size() == 5);
+  auto state = load(); CHECK(!state.wavUploaded && !state.txtUploaded && !state.fullySynced);
+  CHECK(!state.wavDriveId[0] && !state.txtDriveId[0]);
+}
+TEST(drive_bulk_last_multipart_hash_failure_keeps_note_pending) {
+  auto s = driveSettings(); auto bytes = Fixtures::wav(); LittleFS.put(wav, bytes);
+  LittleFS.put("/notes/test.txt", "texto"); LittleFS.put("/notes/test.md", "# nota");
+  oauth(); folder(); for (int i = 0; i < 3; ++i) reply(R"({"files":[]})"); reply(R"({"ids":["new_wav","new_txt","new_md"]})");
+  reply(remote("new_wav", bytes, Host::mockFileHash(bytes)));
+  reply(remote("new_txt", "texto", Host::mockFileHash("texto"), "test.txt"));
+  reply(remote("new_md", "# nota", Host::mockFileHash("wrong"), "test.md"));
+  GDriveClient client; CHECK(!client.uploadNote(s, wav) && Host::requests.size() == 9);
+  auto state = load(); CHECK(state.wavUploaded && state.txtUploaded && !state.mdUploaded && !state.fullySynced);
+  CHECK(std::string(state.mdDriveId) == "new_md" && std::string(state.mdMd5) == Host::mockFileHash("# nota").c_str());
+}
+TEST(drive_multipart_final_matching_hash_eliminates_get) {
+  auto s = driveSettings(); auto bytes = Fixtures::wav(); LittleFS.put(wav, bytes);
+  oauth(); folder(); reply(R"({"files":[]})"); reply(R"({"ids":["new_wav"]})"); reply(remote("new_wav", bytes, Host::mockFileHash(bytes)), 201);
+  GDriveClient client; CHECK(client.uploadNote(s, wav)); CHECK(Host::requests.size() == 5 && load().fullySynced);
+  CHECK(Host::requests.back().find(bytes) != std::string::npos && Host::requests.back().find("Content-Type: audio/wav\r\n\r\n") != std::string::npos);
+}
+TEST(drive_multipart_final_wrong_hash_never_false_complete) {
+  auto s = driveSettings(); auto bytes = Fixtures::wav(); LittleFS.put(wav, bytes);
+  oauth(); folder(); reply(R"({"files":[]})"); reply(R"({"ids":["new_wav"]})"); reply(remote("new_wav", bytes, Host::mockFileHash("wrong")));
+  GDriveClient client; CHECK(!client.uploadNote(s, wav) && Host::requests.size() == 5);
+  auto state = load(); CHECK(!state.fullySynced && !state.wavUploaded && !state.wavIdReserved);
+  CHECK(std::string(state.wavDriveId) == "new_wav" && state.wavBytesUploaded == 0 && state.wavSessionUrl.isEmpty());
+  CHECK(std::string(state.wavMd5) == Host::mockFileHash(bytes).c_str());
+}
+TEST(drive_multipart_incomplete_metadata_falls_back_to_strict_get) {
+  auto s = driveSettings(); auto bytes = Fixtures::wav(); LittleFS.put(wav, bytes);
+  oauth(); folder(); reply(R"({"files":[]})"); reply(R"({"ids":["new_wav"]})"); reply(R"({"id":"new_wav","size":"60"})");
+  reply(R"({"id":"new_wav","name":"test.wav","size":"60","trashed":false,"parents":["folder"]})");
+  GDriveClient client; CHECK(!client.uploadNote(s, wav)); CHECK(Host::requests.size() == 6 && !load().fullySynced && !load().wavUploaded);
+}
+TEST(drive_lost_multipart_reply_get_same_id_no_duplicate_bytes) {
+  auto s = driveSettings(); auto bytes = Fixtures::wav(); LittleFS.put(wav, bytes);
+  oauth(); folder(); reply(R"({"files":[]})"); reply(R"({"ids":["new_wav"]})");
+  Host::enqueue("HTTP/1.1 201 Created\r\nContent-Length: 40\r\n\r\n{", 1, 1, false);
+  reply(remote("new_wav", bytes, Host::mockFileHash(bytes)));
+  GDriveClient client; CHECK(client.uploadNote(s, wav) && load().fullySynced && Host::requests.size() == 6);
+  CHECK(Host::requests[4].find(bytes) != std::string::npos && Host::requests[5].find("GET /drive/v3/files/new_wav?") == 0);
+  size_t mutations = 0; for (const auto &request : Host::requests) if (request.find("POST /upload/") == 0) ++mutations;
+  CHECK(mutations == 1 && Host::connectionHosts.size() == 3);
+}
+TEST(drive_multipart_503_get_before_retry_same_reserved_id) {
+  auto s = driveSettings(); auto bytes = Fixtures::wav(); LittleFS.put(wav, bytes);
+  oauth(); folder(); reply(R"({"files":[]})"); reply(R"({"ids":["new_wav"]})");
+  reply(R"({"error":{"code":503}})", 503); Host::responses.back().waitForBody = true;
+  reply("{}", 404); reply(remote("new_wav", bytes, Host::mockFileHash(bytes)));
+  GDriveClient client; CHECK(client.uploadNote(s, wav) && Host::requests.size() == 7);
+  CHECK(Host::requests[5].find("GET /drive/v3/files/new_wav?") == 0);
+  for (size_t index : {size_t(4), size_t(6)}) CHECK(Host::requests[index].find("\"id\":\"new_wav\"") != std::string::npos);
+  CHECK(load().fullySynced && SyncTelemetry::counters().retryWaitMs > 0);
+}
+TEST(drive_early_media_403_keeps_status_closes_and_no_false_complete) {
+  auto s = driveSettings(); LittleFS.put(wav, Fixtures::wav());
+  oauth(); folder(); reply(R"({"files":[]})"); reply(R"({"ids":["new_wav"]})"); reply(R"({"error":{"code":403,"message":"denied"}})", 403);
+  GDriveClient client; CHECK(!client.uploadNote(s, wav));
+  CHECK(client.lastStatusCode() == 403 && Host::requests.size() == 5);
+  CHECK(Host::requests[4].find(Fixtures::wav()) == std::string::npos);
+  CHECK(load().lastStatusCode == 403 && !load().fullySynced && !load().wavUploaded && load().wavIdReserved);
+}
+TEST(drive_source_changes_during_multipart_cannot_inherit_remote_match) {
+  auto s = driveSettings(); auto bytes = Fixtures::wav(); LittleFS.put(wav, bytes);
+  oauth(); folder(); reply(R"({"files":[]})"); reply(R"({"ids":["new_wav"]})"); reply(remote("new_wav", bytes, Host::mockFileHash(bytes)));
+  Host::onConnect = [bytes](size_t index) { if (index == 4) { auto changed = bytes; changed.back() ^= 1; LittleFS.put(wav, changed); } };
+  GDriveClient client; CHECK(!client.uploadNote(s, wav) && !load().fullySynced && !load().wavUploaded);
+  CHECK(std::string(load().wavMd5) == Host::mockFileHash(bytes).c_str());
+}
+TEST(drive_source_changed_after_first_asset_detected_at_final_local_guard) {
+  auto s = driveSettings(); auto bytes = Fixtures::wav(); LittleFS.put(wav, bytes); LittleFS.put("/notes/test.txt", "texto");
+  oauth(); folder(); reply(R"({"files":[]})"); reply(R"({"files":[]})"); reply(R"({"ids":["new_wav","new_txt"]})");
+  reply(remote("new_wav", bytes, Host::mockFileHash(bytes)));
+  reply(remote("new_txt", "texto", Host::mockFileHash("texto"), "test.txt"));
+  Host::onConnect = [bytes](size_t index) { if (index == 6) { auto changed = bytes; changed.back() ^= 1; LittleFS.put(wav, changed); } };
+  GDriveClient client; CHECK(!client.uploadNote(s, wav) && Host::requests.size() == 7 && !load().fullySynced && !load().wavUploaded);
+  CHECK(load().txtUploaded && std::string(load().wavMd5) == Host::mockFileHash(bytes).c_str());
+}
+TEST(drive_required_text_missing_blocks_oauth_and_all_requests) {
+  auto s = driveSettings(); CHECK(s.saveStt("https://stt.test", "model", "fake-key")); LittleFS.put(wav, Fixtures::wav());
+  GDriveClient client; CHECK(!client.uploadNote(s, wav) && Host::requests.empty() && !load().fullySynced);
+}
+TEST(drive_large_resumable_uses_one_mib_chunks_ack_commit_and_final_hash) {
+  auto s = driveSettings(); auto bytes = Fixtures::sizedWav(5 * 1024 * 1024 + 60); LittleFS.put(wav, bytes);
+  newUploadReplies(bytes);
+  Host::onConnect = [](size_t index) {
+    if (index == 5) { auto state = load(); CHECK(state.wavSessionUrl == "https://www.googleapis.com/upload/session" && !state.wavUploaded); }
+    if (index >= 6 && index <= 10) CHECK(load().wavBytesUploaded == (index - 5) * 1024 * 1024);
+    if (index == 11) { auto state = load(); CHECK(state.wavBytesUploaded == state.wavSize && !state.wavUploaded); }
+  };
+  GDriveClient client; CHECK(client.uploadNote(s, wav)); CHECK(Host::requests.size() == 12 && Host::responses.empty());
+  CHECK(Host::requests[4].find("POST /upload/drive/v3/files?uploadType=resumable") == 0);
+  for (size_t i = 0; i < 6; ++i) {
+    const auto &request = Host::requests[5 + i]; CHECK(request.find("PUT /upload/session HTTP/1.1") == 0);
+    size_t length = i < 5 ? 1024 * 1024 : 60;
+    CHECK(request.find("Content-Length: " + std::to_string(length) + "\r\n") != std::string::npos);
+    CHECK(request.find("Content-Range: bytes " + std::to_string(i * 1024 * 1024) + "-") != std::string::npos);
+    CHECK(request.substr(request.find("\r\n\r\n") + 4) == bytes.substr(i * 1024 * 1024, length));
+  }
+  CHECK(load().fullySynced && load().wavSessionUrl.isEmpty() && Host::connectionHosts.size() == 2);
+}
+TEST(drive_saved_small_session_remains_resumable_308_without_range_restarts_zero) {
+  auto s = driveSettings(); auto bytes = Fixtures::wav(); LittleFS.put(wav, bytes);
+  NoteSyncState state; state.authGeneration = s.get().driveAuthGeneration; std::strcpy(state.folderId, "folder");
+  std::strcpy(state.wavDriveId, "reserved"); state.wavIdReserved = true; state.wavSize = bytes.size();
+  std::strcpy(state.wavMd5, Host::mockFileHash(bytes).c_str()); state.wavSessionUrl = "https://www.googleapis.com/upload/saved";
+  CHECK(state.save(wav)); oauth(); folder(); reply("{}", 404); reply("", 308);
+  reply(remote("reserved", bytes, Host::mockFileHash(bytes)));
+  GDriveClient client; CHECK(client.uploadNote(s, wav) && Host::requests.size() == 5);
+  CHECK(Host::requests[3].find("Content-Range: bytes */60") != std::string::npos);
+  CHECK(Host::requests[4].find("Content-Range: bytes 0-59/60") != std::string::npos);
+  CHECK(Host::requests[4].find(bytes) != std::string::npos && load().fullySynced);
+}
+TEST(drive_saved_session_regressive_range_refused_preserves_offset) {
+  auto s = driveSettings(); auto bytes = Fixtures::wav(); LittleFS.put(wav, bytes);
+  NoteSyncState state; state.authGeneration = s.get().driveAuthGeneration; std::strcpy(state.folderId, "folder");
+  std::strcpy(state.wavDriveId, "reserved"); state.wavIdReserved = true; state.wavSize = bytes.size(); state.wavBytesUploaded = 20;
+  std::strcpy(state.wavMd5, Host::mockFileHash(bytes).c_str()); state.wavSessionUrl = "https://www.googleapis.com/upload/saved";
+  CHECK(state.save(wav)); oauth(); folder(); reply("{}", 404); reply("", 308, "Range: bytes=0-9\r\n");
+  GDriveClient client; CHECK(!client.uploadNote(s, wav) && Host::requests.size() == 4);
+  CHECK(load().wavBytesUploaded == 20 && !load().wavUploaded && !load().fullySynced);
+}
+TEST(drive_access_token_and_folder_cache_ttl_and_session_boundary) {
+  auto s = driveSettings(); auto bytes = Fixtures::wav(); LittleFS.put(wav, bytes);
+  reply(R"({"access_token":"access","token_type":"Bearer","expires_in":3600})"); folder();
+  reply(R"({"files":[]})"); reply(R"({"ids":["new_wav"]})"); reply(remote("new_wav", bytes, Host::mockFileHash(bytes)));
+  GDriveClient client; CHECK(client.uploadNote(s, wav) && Host::requests.size() == 5);
+  reply(remote("new_wav", bytes, Host::mockFileHash(bytes)));
+  CHECK(client.uploadNote(s, wav) && Host::requests.size() == 6 && Host::connectionHosts.size() == 2);
+  delay(30001); folder(); reply(remote("new_wav", bytes, Host::mockFileHash(bytes)));
+  CHECK(client.uploadNote(s, wav) && Host::requests.size() == 8 && Host::connectionHosts.size() == 2);
+  delay(3600000); reply(R"({"access_token":"new_access","token_type":"Bearer","expires_in":3600})"); folder(); reply(remote("new_wav", bytes, Host::mockFileHash(bytes)));
+  CHECK(client.uploadNote(s, wav) && Host::requests.size() == 11 && Host::connectionHosts.size() == 3);
+  CHECK(Host::requests[10].find("Authorization: Bearer new_access") != std::string::npos);
+  client.endSession(); folder(); reply(remote("new_wav", bytes, Host::mockFileHash(bytes)));
+  CHECK(client.uploadNote(s, wav) && Host::requests.size() == 13 && Host::connectionHosts.size() == 4);
+}
+TEST(drive_reserved_404_and_matching_final_2xx_reuse_connection) {
+  auto s = driveSettings(); auto bytes = Fixtures::wav(); LittleFS.put(wav, bytes);
+  NoteSyncState state; state.authGeneration = s.get().driveAuthGeneration; std::strcpy(state.folderId, "folder");
+  std::strcpy(state.wavDriveId, "reserved"); state.wavIdReserved = true; CHECK(state.save(wav));
+  oauth(); folder(); reply("{}", 404); reply(remote("reserved", bytes, Host::mockFileHash(bytes)), 201);
+  GDriveClient client; CHECK(client.uploadNote(s, wav) && Host::requests.size() == 4 && Host::connectionHosts.size() == 2);
+  CHECK(load().fullySynced && Host::requests[3].find("\"id\":\"reserved\"") != std::string::npos);
+}
+TEST(drive_401_refresh_once_safe_get_then_mutation) {
+  auto s = driveSettings(); auto bytes = Fixtures::wav(); LittleFS.put(wav, bytes);
+  oauth(); reply("{}", 401); oauth(); folder(); reply(R"({"files":[]})"); reply(R"({"ids":["new_wav"]})"); reply(remote("new_wav", bytes, Host::mockFileHash(bytes)));
+  GDriveClient client; CHECK(client.uploadNote(s, wav) && Host::requests.size() == 7 && load().fullySynced);
+  CHECK(Host::requests[1].find("GET /drive/v3/files/folder?") == 0 && Host::requests[3].find("GET /drive/v3/files/folder?") == 0);
+  CHECK(Host::requests[2].find("POST /token ") == 0);
+}
+TEST(drive_invalid_grant_nvs_failure_retains_auth_no_enumeration) {
+  auto s = driveSettings(); LittleFS.put(wav, Fixtures::wav()); Host::failPuts.insert("cfg/driveRefTok");
+  reply(R"({"error":"invalid_grant"})", 400); GDriveClient client;
+  CHECK(!client.uploadNote(s, wav) && Host::requests.size() == 1 && s.hasDriveAuth());
+  CHECK(nvsString("driveRefTok") == "refresh" && load().lastStatusCode == 400 && !load().fullySynced);
+}
+TEST(drive_invalid_grant_clears_auth_persistently_without_token_enumeration) {
+  auto s = driveSettings(); LittleFS.put(wav, Fixtures::wav()); reply(R"({"error":"invalid_grant"})", 400);
+  GDriveClient client; CHECK(!client.uploadNote(s, wav) && Host::requests.size() == 1 && !s.hasDriveAuth());
+  Host::rebootNvs(); CHECK(!settings().hasDriveAuth() && nvsString("driveRefTok").empty());
+  CHECK(!load().fullySynced);
+}
+TEST(drive_observer_byte_events_identify_asset_filename) {
+  auto s = driveSettings(); auto bytes = Fixtures::wav(); LittleFS.put(wav, bytes);
+  oauth(); folder(); reply(R"({"files":[]})"); reply(R"({"ids":["new_wav"]})"); reply(remote("new_wav", bytes, Host::mockFileHash(bytes)));
+  static bool sawMeasured = false, identified = true; sawMeasured = false; identified = true;
+  SyncTelemetry::setObserver([](const SyncTelemetry::Update &u) {
+    if (u.phase == SyncTelemetry::Phase::DriveUpload && u.total && u.current) {
+      sawMeasured = true; std::string detail(u.detail ? u.detail : "");
+      if (detail != "test.wav") identified = false;
+    }
+  });
+  GDriveClient client; CHECK(client.uploadNote(s, wav)); SyncTelemetry::setObserver(nullptr);
+  CHECK(sawMeasured && identified);
+}
 } // namespace
 
 int main() {
   size_t failed = 0;
   for (const auto &test : tests()) {
-    Host::resetClock(); Host::resetNetwork(); Host::resetNvs(); LittleFS.reset();
+    Host::resetClock(); Host::resetNetwork(); Host::resetNvs(); LittleFS.reset(); SyncTelemetry::reset();
     try { test.run(); }
     catch (const std::exception &e) { ++failed; std::cout << "FAIL " << test.name << ": " << e.what() << '\n'; }
+    SyncTelemetry::setObserver(nullptr);
   }
   std::cout << "Storage/Drive host tests: " << tests().size() - failed << '/' << tests().size()
             << " OK" << (failed ? " (FALHOU)" : "") << '\n';

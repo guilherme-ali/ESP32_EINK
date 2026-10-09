@@ -1,6 +1,22 @@
 #include "wifi_mgr.h"
 #include "../storage/note_files.h"
 #include <LittleFS.h>
+#include <Preferences.h>
+
+namespace {
+void rememberLink(const char *ssid) {
+  const uint8_t *bssid = WiFi.BSSID();
+  if (!bssid) return;
+  char hex[13];
+  snprintf(hex, sizeof(hex), "%02x%02x%02x%02x%02x%02x", bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
+  Preferences prefs;
+  if (!prefs.begin("wifiPerf", false)) return;
+  if (prefs.getString("ssid", "") != ssid) prefs.putString("ssid", ssid);
+  if (prefs.getString("bssid", "") != hex) prefs.putString("bssid", hex);
+  if (prefs.getUInt("channel", 0) != static_cast<unsigned>(WiFi.channel())) prefs.putUInt("channel", WiFi.channel());
+  prefs.end();
+}
+}
 
 bool WifiManager::connect(SettingsStore &settings, uint32_t timeoutMs) {
   settings_ = &settings;
@@ -8,6 +24,37 @@ bool WifiManager::connect(SettingsStore &settings, uint32_t timeoutMs) {
   if (cfg.wifiNetworkCount == 0) return false;
 
   WiFi.mode(WIFI_STA);
+  // Tenta favorita/ultima rede diretamente. O scan completo e o fallback,
+  // nao um custo obrigatorio cada vez que o usuario sincroniza uma nota.
+  String lastSsid, lastBssid;
+  unsigned lastChannel = 0;
+  Preferences prefs;
+  if (prefs.begin("wifiPerf", true)) {
+    lastSsid = prefs.getString("ssid", ""); lastBssid = prefs.getString("bssid", "");
+    lastChannel = prefs.getUInt("channel", 0); prefs.end();
+  }
+  const char *preferred = cfg.favoriteWifiSsid[0] ? cfg.favoriteWifiSsid : lastSsid.c_str();
+  for (int i = 0; preferred[0] && i < cfg.wifiNetworkCount; ++i) {
+    if (strcmp(cfg.wifiSsid[i], preferred)) continue;
+    uint8_t bssid[6]; bool pinned = lastSsid == preferred && lastBssid.length() == 12 && lastChannel >= 1 && lastChannel <= 14;
+    if (pinned) {
+      for (unsigned byte = 0; byte < 6; ++byte) {
+        char pair[3] = {lastBssid[byte * 2], lastBssid[byte * 2 + 1], 0};
+        if (!isxdigit(static_cast<unsigned char>(pair[0])) || !isxdigit(static_cast<unsigned char>(pair[1]))) { pinned = false; break; }
+        bssid[byte] = static_cast<uint8_t>(strtoul(pair, nullptr, 16));
+      }
+    }
+    Serial.printf("[Wi-Fi] Tentativa direta: '%s'%s\n", preferred, pinned ? " (canal/BSSID em cache)" : "");
+    WiFi.begin(cfg.wifiSsid[i], cfg.wifiPass[i], pinned ? lastChannel : 0, pinned ? bssid : nullptr);
+    uint32_t started = millis(), directTimeout = min(timeoutMs, static_cast<uint32_t>(6000));
+    while (WiFi.status() != WL_CONNECTED && millis() - started < directTimeout) delay(100);
+    if (WiFi.status() == WL_CONNECTED) {
+      mode_ = Mode::Station; rememberLink(cfg.wifiSsid[i]); startServerOnce();
+      Serial.printf("[Wi-Fi] Conexao direta pronta: %s\n", WiFi.localIP().toString().c_str());
+      return true;
+    }
+    WiFi.disconnect(false); break;
+  }
   int found = WiFi.scanNetworks();
 
   // Encontra todas as redes salvas visiveis e seus melhores sinais.
@@ -78,6 +125,7 @@ bool WifiManager::connect(SettingsStore &settings, uint32_t timeoutMs) {
 
     if (WiFi.status() == WL_CONNECTED) {
       mode_ = Mode::Station;
+      rememberLink(cfg.wifiSsid[idx]);
       Serial.printf("[Wi-Fi] Conectado a '%s': %s\n", cfg.wifiSsid[idx],
                     WiFi.localIP().toString().c_str());
       startServerOnce();
@@ -93,6 +141,7 @@ bool WifiManager::connect(SettingsStore &settings, uint32_t timeoutMs) {
 }
 
 void WifiManager::disconnect() {
+  if (serverStarted_) { server_.stop(); serverStarted_ = false; }
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
   mode_ = Mode::Off;
@@ -118,10 +167,13 @@ void WifiManager::startApPortal(SettingsStore &settings) {
 
 void WifiManager::startServerOnce() {
   if (serverStarted_) return;
+  if (!routesRegistered_) {
   server_.on("/", HTTP_GET, [this]() { handleRoot(); });
   server_.on("/save", HTTP_POST, [this]() { handleSave(); });
   server_.on("/notes", HTTP_GET, [this]() { handleListNotes(); });
   server_.on("/note", HTTP_GET, [this]() { handleGetNote(); });
+  routesRegistered_ = true;
+  }
   server_.begin();
   serverStarted_ = true;
 }

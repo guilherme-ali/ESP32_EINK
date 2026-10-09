@@ -8,6 +8,7 @@
 #define FILE_WRITE "w"
 #define FILE_APPEND "a"
 
+namespace Host { inline uint64_t fileReadCalls = 0; }
 namespace fs {
 struct Faults {
   size_t readLimit = SIZE_MAX, writeLimit = SIZE_MAX, readBudget = SIZE_MAX;
@@ -39,6 +40,7 @@ public:
   }
   int available() const { return static_cast<int>(size() - position_); }
   size_t read(uint8_t *out, size_t count) {
+    ++Host::fileReadCalls;
     if (!data_) return 0;
     size_t n = std::min({count, size() - position_, readLimit_});
     if (faults_) {
@@ -57,6 +59,7 @@ public:
   String readString() {
     std::string result;
     for (int c; available() && (c = read()) >= 0;) result += static_cast<char>(c);
+    // File do core 2.0.17 usa timeout zero; readString ainda le byte a byte.
     return String(result);
   }
   size_t write(const uint8_t *data, size_t count) {

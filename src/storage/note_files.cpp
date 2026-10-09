@@ -14,6 +14,24 @@ uint64_t recordingBytes() {
   return available > kReserveBytes ? available - kReserveBytes : 0;
 }
 
+bool readBounded(File &file, String &out, size_t maximum) {
+  out = "";
+  if (!file || file.isDirectory() || file.size() > maximum || !file.seek(0)) return false;
+  size_t expected = file.size(), remaining = expected;
+  if (expected && !out.reserve(expected)) return false;
+  uint8_t buffer[512];
+  while (remaining) {
+    size_t wanted = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
+    size_t got = file.read(buffer, wanted);
+    if (!got || got > wanted || !out.concat(reinterpret_cast<const char *>(buffer), got)) {
+      out = ""; return false;
+    }
+    remaining -= got;
+  }
+  if (file.size() != expected || out.length() != expected) { out = ""; return false; }
+  return true;
+}
+
 bool readText(const String &path, char *out, size_t capacity) {
   if (!out || capacity < 2) return false;
   out[0] = '\0';

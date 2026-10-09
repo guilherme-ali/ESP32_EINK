@@ -154,6 +154,45 @@ as gravações — sem cartão SD isso dá poucos minutos de áudio no total.
   OAuth invalida a autorização anterior; PWR cancela a espera de pareamento.
 - A tela final informa a etapa/erro e reinicia o contador de inatividade.
 
+### Performance e duas barras
+
+- Operacoes de IA/Drive executam em um worker FreeRTOS. A UI continua atendendo
+  botoes e atualiza o e-paper fora do caminho critico da transferencia.
+- A barra superior mostra o progresso ponderado da nota atual. Os pesos usam
+  bytes/duracao do audio e um historico local por modelo/velocidade. `~` indica
+  percentual estimado; 100% exige a confirmacao final dos arquivos.
+- A barra inferior mostra **notas concluidas / notas pendentes no lote**.
+  As antigas ja sincronizadas nao entram no lote. PWR longo pede pausa apos
+  a etapa atual; uma chamada HTTPS em andamento termina ou atinge seu prazo.
+- As regioes de texto/barras sao fixas no painel 200x200. A UI atualiza a cada
+  2 segundos ou mudanca de fase/nota, sem refresh por cada bloco de rede.
+- O Drive reserva os IDs de arquivos em lote, usa multipart ate 5 MiB,
+  reutiliza HTTPS/token/pasta e verifica MD5 na resposta final (GET em caso
+  incompleto/ambiguo). Arquivos maiores usam blocos retomaveis de 1 MiB.
+- Audios ate 2 MiB tentam Transcribe inline em base64 por streaming. Se a API
+  recusar especificamente esse formato, o firmware usa Files URI no mesmo
+  modelo e guarda a incompatibilidade por 24 horas. Chave/cota invalida nao
+  e tratada como incompatibilidade de formato.
+- Capacidades/modelos sao armazenados no NVS por fingerprint da chave e
+  configuracao, com validade de 24 horas; nenhuma chave original vai ao cache.
+- Gemini 3.8 Flash usa `thinkingLevel: LOW`; Lite/legados nao recebem esse campo.
+- Wi-Fi tenta a favorita/ultima rede diretamente antes do scan completo.
+  O NTP deixa de bloquear a conexao por ate 8 segundos e e aplicado pelo loop.
+- Temporarios Files sao limpos separadamente, com orcamento total de 15 segundos
+  por lote. A fila cheia tenta liberar capacidade; falha de limpeza nao apaga
+  transcricao/Markdown nem altera a confirmacao dos arquivos ja entregues.
+- Estados/metadados locais sao lidos por blocos com tamanho conhecido, evitando
+  o custo de `readString()` byte a byte. Falha de envio inline tenta Files URI
+  no mesmo modelo; bloqueio temporario desse transporte nao vira incompatibilidade
+  permanente nem dispara a mesma tentativa inline em todos os modelos.
+
+Cada nota recebe um irmao **`.perf`** com tempos por etapa, bytes, requests HTTP,
+handshakes TLS e modelos efetivos, sem chaves/tokens/corpos de audio. A serial
+tambem publica `[Perf]`. Esse diagnostico e o historico sao auxiliares: uma
+falha em salva-los nao provoca nova inferencia de uma nota ja entregue.
+Validacao em hardware: `test/VALIDACAO_PERFORMANCE.md` (tempos medidos e limites
+da comparacao, incluindo variacao de latencia do Markdown no servico).
+
 ### Memória interna e futuro microSD
 
 `src/storage/note_files.*` centraliza o backend das notas (LittleFS nesta
@@ -165,6 +204,10 @@ e overhead. PSRAM guarda buffers temporários, não substitui armazenamento.
 
 O backend permite integração futura de SD, que ainda não está implementada.
 Não há transcrição Live; o arquivo é processado depois da gravação.
+Textos agora tem capacidade de 128 KiB em PSRAM, com resposta HTTP limitada a
+256 KiB. O buffer do visualizador e alocado sob demanda em PSRAM. Isso prepara
+o processamento de texto longo; a gravacao de uma hora ainda depende da etapa
+microSD e validacao de captura/compressao, que nao faz parte do teste em flash.
 
 ### Verificações e diagnóstico USB
 
@@ -186,10 +229,12 @@ antes de cada sessão**; o console não tenta reconectar indefinidamente:
 & "$env:USERPROFILE\.platformio\penv\Scripts\python.exe" "tools/device_console.py" "stayawake 0" --timeout 3
 ```
 
-`status` mostra espaço, modelos, flags e erros sem chaves/tokens. `sync-one`
+`status` mostra espaço, modelos, flags e erros sem chaves/tokens. Durante um
+lote, consulta o snapshot do worker e nao acessa arquivos sendo escritos. `sync-one`
 processa a nota mais recente; `sync` processa somente as pendentes. As chamadas são
-síncronas e têm tentativas e prazos limitados; o botão não cancela inferência
-TLS em andamento. O ambiente `battery` é o destinado a uso fora do cabo.
+assíncronas e têm tentativas e prazos limitados; `[DiagDone] sync`/`sync-one`
+somente aparece ao terminar o worker. O botão não cancela inferência TLS em
+andamento. O ambiente `battery` é o destinado a uso fora do cabo.
 
 ## Limitações conhecidas
 

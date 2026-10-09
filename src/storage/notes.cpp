@@ -167,7 +167,7 @@ bool NotesStore::deleteAt(int index) {
   bool ok = NoteFiles::fs().remove(wavPath);
   if (!ok) return false;
   String base = wavPath.substring(0, wavPath.length() - 4);
-  const char *extensions[] = {".txt", ".md", ".snc", ".sync", ".sync.tmp", ".txt.tmp", ".md.tmp", ".ai", ".ai.tmp"};
+  const char *extensions[] = {".txt", ".md", ".snc", ".sync", ".sync.tmp", ".txt.tmp", ".md.tmp", ".ai", ".ai.tmp", ".perf", ".perf.tmp"};
   for (const char *extension : extensions) NoteFiles::fs().remove(base + extension);
   g_dirty = true;
   return ok;
@@ -181,7 +181,7 @@ int NotesStore::deleteAll() {
     if (!NoteFiles::fs().remove(wavPath)) continue;
     removed++;
     String base = wavPath.substring(0, wavPath.length() - 4);
-    const char *extensions[] = {".txt", ".md", ".snc", ".sync", ".sync.tmp", ".txt.tmp", ".md.tmp", ".ai", ".ai.tmp"};
+    const char *extensions[] = {".txt", ".md", ".snc", ".sync", ".sync.tmp", ".txt.tmp", ".md.tmp", ".ai", ".ai.tmp", ".perf", ".perf.tmp"};
     for (const char *extension : extensions) NoteFiles::fs().remove(base + extension);
   }
   g_cacheCount = 0;

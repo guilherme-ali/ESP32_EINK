@@ -14,6 +14,7 @@
 #include "../net/wifi_mgr.h"
 #include "../net/stt.h"
 #include "../net/gdrive.h"
+#include "../sync/sync_job.h"
 
 // Maquina de estados de toda a UI interativa: tela inicial, gravacao,
 // menus, notas (com detalhe/apagar) e configuracoes. Tudo que roda so
@@ -48,6 +49,7 @@ public:
   // gravacao a cada segundo e verifica o timeout de inatividade.
   void loop();
   void diagnosticCommand(const String &command);
+  bool isSyncActive() const { return syncJob_.isActive(); }
 
 private:
   enum class Screen {
@@ -67,6 +69,7 @@ private:
     KeyboardSsid,
     KeyboardPassword,
     SyncResult,
+    SyncBusy,
   };
 
   EPaperDisplay &epd_;
@@ -81,6 +84,7 @@ private:
   GDriveClient &gdrive_;
   Rtc &rtc_;
   Shtc3 &shtc3_;
+  SyncJob syncJob_;
   Menu menu_;
   Keyboard keyboard_;
 
@@ -90,6 +94,7 @@ private:
   PortalRequestFn onPortalRequested_ = nullptr;
 
   int noteCount_ = 0;
+  uint32_t notesDriveGeneration_ = 0;
   int rootSel_ = 0;
   int notesSel_ = 0;
   int noteDetailSel_ = 0;
@@ -105,7 +110,7 @@ private:
     char ssid[33];
     int rssi;
   };
-  ScanResult scanResults_[kMaxScanResults];
+  ScanResult scanResults_[kMaxScanResults] = {};
   int scanCount_ = 0;
   char kbSsidBuf_[33] = "";
   char kbPassBuf_[65] = "";
@@ -113,16 +118,24 @@ private:
   bool recording_ = false;
   char currentRecordingPath_[48] = "";
   uint32_t recordingStartMs_ = 0;
-  char lastTxtPath_[48] = "";
-  char lastMdPath_[48] = "";
-  String pipelineError_;
   bool syncResultForNote_ = false;
   void showSyncResult(const String &message, bool forNote = false);
 
   int textViewerPage_ = 0;
   int textViewerTotalPages_ = 1;
   char textViewerTitle_[32] = "";
-  char textViewerBuf_[SttClient::kMaxTextLen] = "";
+  static constexpr size_t kTextViewerMaxLen = 128 * 1024;
+  char *textViewerBuf_ = nullptr;
+  bool ensureTextViewerBuffer();
+
+  bool syncDisconnectAfter_ = false;
+  bool syncForNote_ = false;
+  uint32_t syncLastDrawMs_ = 0;
+  SyncTelemetry::Phase syncLastPhase_ = SyncTelemetry::Phase::Preparing;
+  uint16_t syncLastNote_ = 0;
+  unsigned syncLastPercent_ = 0;
+  bool syncLastPause_ = false, syncLastDelivered_ = false;
+  char syncDiagnosticTag_[12] = "";
 
   uint32_t lastActivityMs_ = 0;
   bool diagnosticAwake_ = false;
@@ -154,9 +167,8 @@ private:
   void stopRecording();
   void playSelected(int index);
 
-  void transcribeIfPossible(const char *wavPath);
-  void syncIfPossible(const char *wavPath);
-  bool transcribeNote(const char *wavPath, int progress = 0, int totalPending = 0);
+  bool startSync(int index = -1, bool forNote = false, const char *wavPath = nullptr);
+  void serviceSync();
   void runManualSync();
   void syncOneNote(int index);
   void deleteSelectedNote();

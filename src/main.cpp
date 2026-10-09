@@ -2,6 +2,7 @@
 #include <LittleFS.h>
 #include <Wire.h>
 #include <esp_sleep.h>
+#include <esp_heap_caps.h>
 
 #include "config/pins.h"
 #include "board/power.h"
@@ -78,6 +79,8 @@ static void drawWifiSetupScreen(const String &line1, const String &line2) {
 
 static bool g_skipWifiSetup = false;
 static bool g_cancelDrivePairing = false;
+static bool g_ntpPending = false;
+static uint32_t g_ntpPollAt = 0;
 static void onWifiSetupButtonEvent(BtnId id, BtnAction action) {
   if (id == BtnId::Boot && action == BtnAction::LongPress) {
     g_skipWifiSetup = true;
@@ -97,18 +100,18 @@ static bool serviceDrivePairing() {
 }
 
 // O PCF85063 nao tem como saber a hora certa sozinho - so acerta com
-// ajuda de fora. Sem isso, o relogio fica preso em qualquer data que
-// tenha sido gravada nele uma vez (foi o que aconteceu: meses de testes
-// com uma data de fabrica/teste nunca corrigida). Roda uma vez, toda
-// vez que conecta no Wi-Fi - barato e mantem o relogio sempre certo.
+// ajuda de fora. O NTP e iniciado ao conectar, sem bloquear a sincronizacao;
+// serviceNtpRtc grava o RTC quando a hora de sistema estiver disponivel.
 static void syncRtcFromNtp() {
   configTime(-3 * 3600, 0, "pool.ntp.org", "time.google.com");
-
+  g_ntpPending = true;
+  g_ntpPollAt = 0;
+}
+static void serviceNtpRtc() {
+  if (!g_ntpPending || millis() - g_ntpPollAt < 1000) return;
+  g_ntpPollAt = millis();
   struct tm timeinfo;
-  if (!getLocalTime(&timeinfo, 8000)) {
-    Serial.println("!! AVISO: NTP nao respondeu, RTC continua com a hora antiga.");
-    return;
-  }
+  if (!getLocalTime(&timeinfo, 1)) return;
 
   RtcDateTime dt;
   dt.year = timeinfo.tm_year + 1900;
@@ -117,7 +120,8 @@ static void syncRtcFromNtp() {
   dt.hour = timeinfo.tm_hour;
   dt.minute = timeinfo.tm_min;
   dt.second = timeinfo.tm_sec;
-  rtc.setDateTime(dt);
+  if (!rtc.setDateTime(dt)) return;
+  g_ntpPending = false;
   Serial.printf("RTC sincronizado via NTP: %04u-%02u-%02u %02u:%02u:%02u\n", dt.year, dt.month,
                 dt.day, dt.hour, dt.minute, dt.second);
 }
@@ -282,9 +286,11 @@ void setup() {
   gpio_deep_sleep_hold_dis();
 
   Serial.begin(115200);
+  // Alocacoes grandes de Strings/cJSON usam PSRAM, liberando heap para TLS.
+  if (psramFound()) heap_caps_malloc_extmem_enable(8192);
   delay(2000);
   Serial.println("=================================");
-  Serial.println("Gravador de Ideias - sincronizacao resiliente v2");
+  Serial.println("Gravador de Ideias - sincronizacao otimizada v3");
   Serial.println("=================================");
 
   if (!LittleFS.begin(false)) {
@@ -323,7 +329,8 @@ void setup() {
 
 void loop() {
   buttons.poll();
-  wifiMgr.loop();
+  if (!app.isSyncActive()) wifiMgr.loop();
+  serviceNtpRtc();
   app.loop();
 #if ARDUINO_USB_CDC_ON_BOOT
   static String command;

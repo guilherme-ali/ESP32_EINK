@@ -6,12 +6,13 @@
 #include <cJSON.h>
 #include <initializer_list>
 #include "settings.h"
+#include "../sync/telemetry.h"
 
 // Transporte privado à integração STT. Não altera HttpClient nem os hooks
 // globais do cJSON. Chamadas síncronas, serializadas pelo fluxo do aplicativo.
 namespace SttNet {
-constexpr size_t kMaxBody = 128 * 1024;
-constexpr size_t kMaxText = 32768;
+constexpr size_t kMaxBody = 256 * 1024;
+constexpr size_t kMaxText = 128 * 1024;
 constexpr unsigned kMaxRetries = 2; // uma chamada inicial + até duas repetições
 constexpr uint32_t kReadTimeoutMs = 60000;
 
@@ -32,6 +33,7 @@ struct Response {
   size_t length = 0;
   size_t capacity = 0;
   bool complete = false;
+  bool connectionClose = true; // somente reutilizar após consumir todo o framing
   Response() = default;
   ~Response();
   Response(const Response &) = delete;
@@ -59,6 +61,10 @@ bool hasText(const char *value);
 bool safeModel(const String &model);
 String normalizedModel(const char *value);
 bool safeHeader(const char *value);
+String bodyLimitError(const char *subject);
+WiFiClientSecure &sharedClient(); // um socket, chamadas serializadas por host/porta
+void endSession();
+void setPhase(SyncTelemetry::Phase phase, const char *detail = "");
 bool beginRequest(WiFiClientSecure &client, const String &host, uint16_t port,
                   const char *method, const String &path, const char *key,
                   bool google, const char *contentType, size_t length,
@@ -74,11 +80,12 @@ bool finishRequest(WiFiClientSecure &client, Response &response, bool bodySent,
 bool requestJson(const String &host, uint16_t port, const char *method,
                  const String &path, const char *key, bool google,
                  const String &body, Response &response,
-                 const String &extraHeaders = "", uint32_t timeoutMs = kReadTimeoutMs);
+                  const String &extraHeaders = "", uint32_t timeoutMs = kReadTimeoutMs,
+                  SyncTelemetry::Phase afterBody = SyncTelemetry::Phase::Preparing);
 void recordFailure(const Response &response, Diagnostics &diagnostics);
 bool retryable(const Response &response);
 uint32_t retryHint(const Response &response);
-void backoff(unsigned retry, uint32_t seconds);
+void backoff(unsigned retry, uint32_t seconds, bool quota = false);
 bool extractGemini(const Response &response, bool interaction, char *out,
                    size_t outLen, Diagnostics &diagnostics, uint32_t outputLimit = 0);
 bool extractCompatible(const Response &response, bool summary, char *out,
@@ -89,6 +96,14 @@ extern const char kTranscribePrompt[];
 
 class GeminiClient {
 public:
+  // Uma vez por lote; transcribe/summary inicializam lazily se omitido.
+  static void beginBatch();
+  // Fim do lote, ainda com Wi-Fi ligado. Não altera diagnóstico da inferência.
+  // Fila NVS aiPerf/cleanup (3 nomes + fingerprints); limpeza intermediária
+  // e final compartilham 15 s e um retry por lote. Reconecta somente para
+  // liberar capacidade antes de outro upload quando a fila estiver cheia.
+  static void cleanupPending(const Settings &cfg);
+  static void endSession();
   bool transcribe(const Settings &cfg, File &wav, char *out, size_t outLen,
                   SttNet::Diagnostics &diagnostics);
   bool generateSummary(const Settings &cfg, const char *transcript, char *out,

@@ -1,6 +1,7 @@
 #include "gdrive.h"
 #include "http_client.h"
 #include "../storage/note_files.h"
+#include "../sync/telemetry.h"
 #include <MD5Builder.h>
 #include <cJSON.h>
 #include <math.h>
@@ -11,7 +12,9 @@
 namespace {
 
 constexpr size_t kMaxStateBytes = 32768;
-constexpr size_t kChunkBytes = 256 * 1024;
+constexpr size_t kChunkBytes = 1024 * 1024;
+constexpr size_t kMultipartBytes = 5 * 1024 * 1024;
+constexpr uint32_t kFolderCacheMs = 30000;
 constexpr int kMaxAttempts = 4;
 const char *kFolderName = "Gravador de Ideias";
 const char *kFolderMime = "application/vnd.google-apps.folder";
@@ -118,6 +121,13 @@ bool getUnsigned(const cJSON *root, const char *key, uint64_t maxValue, uint64_t
   return true;
 }
 
+uint32_t tokenLifetimeMs(const cJSON *root) {
+  uint64_t expires = 0;
+  if (!getUnsigned(root, "expires_in", INT32_MAX / 1000, expires) || !expires) return 0;
+  uint32_t ttl = static_cast<uint32_t>(expires * 1000);
+  return ttl - (ttl > 120000 ? 60000 : ttl / 2);
+}
+
 bool decimal(const String &s, size_t &out) {
   if (s.isEmpty()) return false;
   size_t n = 0;
@@ -179,7 +189,25 @@ bool sessionParts(const String &url, String &host, uint16_t &port, String &path)
          path.startsWith("/") && plainString(path.c_str());
 }
 
-bool fileSnapshot(const char *path, bool text, size_t &size, String &hash) {
+// Guarda de mudanca local, independente do MD5 remoto. Nunca reutiliza hashes
+// do .sync como prova local. O job controla a fotografia; arquivos devem ficar
+// imoveis durante o job, mas as guardas ainda detectam alteracoes de conteudo.
+struct ContentGuard {
+  uint64_t first = 14695981039346656037ULL;
+  uint64_t second = 0x9e3779b97f4a7c15ULL;
+  void add(const uint8_t *bytes, size_t length) {
+    for (size_t i = 0; i < length; ++i) {
+      first = (first ^ bytes[i]) * 1099511628211ULL;
+      second ^= bytes[i] + 0x9e3779b97f4a7c15ULL + (second << 6) + (second >> 2);
+    }
+  }
+  bool equals(const ContentGuard &other) const {
+    return first == other.first && second == other.second;
+  }
+};
+
+bool fileSnapshot(const char *path, bool text, size_t &size, String &hash,
+                  ContentGuard *guard = nullptr) {
   if (!path || !*path || (text ? !NoteFiles::validText(path) : !NoteFiles::validWav(path))) return false;
   File f = NoteFiles::fs().open(path, FILE_READ);
   if (!f || f.isDirectory() || f.size() == 0) return false;
@@ -193,6 +221,7 @@ bool fileSnapshot(const char *path, bool text, size_t &size, String &hash) {
     size_t n = f.read(buffer, wanted);
     if (n == 0 || n > wanted) return false;
     md5.add(buffer, static_cast<uint16_t>(n));
+    if (guard) guard->add(buffer, n);
     remaining -= n;
     yield();
   }
@@ -323,8 +352,8 @@ bool readState(const String &path, NoteSyncState &out, String *raw = nullptr) {
   File f = NoteFiles::fs().open(path.c_str(), FILE_READ);
   if (!f || f.isDirectory() || f.size() == 0 || f.size() > kMaxStateBytes) return false;
   size_t size = f.size();
-  String json = f.readString();
-  if (json.length() != size || !decodeState(json, out)) return false;
+  String json;
+  if (!NoteFiles::readBounded(f, json, kMaxStateBytes) || json.length() != size || !decodeState(json, out)) return false;
   if (raw) *raw = json;
   return true;
 }
@@ -369,28 +398,71 @@ String oauthProblem(const HttpResponse &resp, bool transportOk) {
 
 // Todas as requisicoes usam os timeouts existentes; corpos grandes sao
 // transmitidos por streaming. Status real e preservado mesmo em read parcial.
-bool transport(const String &host, uint16_t port, const String &path, const char *method,
-               const String &token, const String &extraHeaders, const String &body,
-               HttpResponse &response, File *file = nullptr, size_t offset = 0, size_t length = 0) {
+bool transportOn(HttpClient::Connection &connection, bool keepAlive,
+                const String &host, uint16_t port, const String &path, const char *method,
+                const String &token, const String &extraHeaders, const String &body,
+                HttpResponse &response, File *file, size_t offset, size_t length,
+                const String &suffix, HttpClient::WriteProgressFn progress, void *context) {
   response = HttpResponse();
-  WiFiClientSecure client;
-  client.setInsecure(); // Mantem a politica TLS atual do projeto.
-  client.setHandshakeTimeout((HttpClient::kConnectTimeoutMs + 999) / 1000);
-  if (!client.connect(host.c_str(), port, HttpClient::kConnectTimeoutMs)) return false;
+  WiFiClientSecure &client = connection.client;
+  if (!connection.reusable || connection.host != host || connection.port != port ||
+      !client.connected() || client.available()) {
+    connection.stop();
+    client.setInsecure(); // Mantem a politica TLS atual do projeto.
+    client.setHandshakeTimeout((HttpClient::kConnectTimeoutMs + 999) / 1000);
+    SyncTelemetry::tlsHandshake(host.c_str());
+    if (!client.connect(host.c_str(), port, HttpClient::kConnectTimeoutMs)) {
+      connection.stop(); return false;
+    }
+    connection.host = host;
+    connection.port = port;
+  }
+  connection.reusable = false;
   // WiFiClientSecure::setTimeout usa SEGUNDOS no Arduino-ESP32, enquanto
   // connect(..., timeout) e os helpers HTTP recebem milissegundos.
   client.setTimeout((HttpClient::kResponseTimeoutMs + 999) / 1000);
   String headers = String(method) + " " + path + " HTTP/1.1\r\nHost: " + host + "\r\n";
   if (!token.isEmpty()) headers += "Authorization: Bearer " + token + "\r\n";
   headers += extraHeaders;
-  headers += "Content-Length: " + String(static_cast<unsigned long>(file ? length : body.length())) +
-             "\r\nConnection: close\r\n\r\n";
+  size_t contentLength = body.length();
+  if (file) {
+    if (length > SIZE_MAX - contentLength || suffix.length() > SIZE_MAX - contentLength - length) {
+      connection.stop(); return false;
+    }
+    contentLength += length + suffix.length();
+  }
+  headers += "Content-Length: " + String(static_cast<unsigned long>(contentLength)) +
+             (keepAlive ? "\r\nConnection: keep-alive\r\n\r\n" : "\r\nConnection: close\r\n\r\n");
+  SyncTelemetry::httpRequest(host.c_str());
   bool ok = HttpClient::writeAll(client, headers);
-  if (ok && file) ok = HttpClient::writeFileChunk(client, *file, offset, length);
-  else if (ok && !body.isEmpty()) ok = HttpClient::writeAll(client, body);
-  if (ok) ok = HttpClient::readResponse(client, response, HttpClient::kMaxResponseBody);
-  client.stop();
-  return ok && response.headersComplete && response.bodyComplete && !response.bodyTruncated;
+  if (ok && !body.isEmpty()) ok = HttpClient::writeAll(client,
+      reinterpret_cast<const uint8_t *>(body.c_str()), body.length(),
+      HttpClient::kResponseTimeoutMs, nullptr, nullptr, true);
+  if (ok && file) ok = HttpClient::writeFileChunk(client, *file, offset, length,
+      HttpClient::kResponseTimeoutMs, progress, context);
+  if (ok && file && !suffix.isEmpty()) ok = HttpClient::writeAll(client,
+      reinterpret_cast<const uint8_t *>(suffix.c_str()), suffix.length(),
+      HttpClient::kResponseTimeoutMs, nullptr, nullptr, true);
+  // Mesmo apos write parcial, preservar 401/403/429 antecipados do servidor.
+  bool read = HttpClient::readResponse(client, response, HttpClient::kMaxResponseBody);
+  bool complete = read && response.headersComplete && response.bodyComplete && !response.bodyTruncated;
+  if (ok && complete && !response.connectionClose && keepAlive) connection.reusable = true;
+  else connection.stop();
+  // Uma resposta de sucesso nunca comprova um request que nao terminou.
+  return complete && (ok || response.statusCode >= 400);
+}
+
+bool transport(const String &host, uint16_t port, const String &path, const char *method,
+                const String &token, const String &extraHeaders, const String &body,
+                HttpResponse &response, File *file = nullptr, size_t offset = 0, size_t length = 0,
+                HttpClient::Connection *persistent = nullptr, const String &suffix = "",
+                HttpClient::WriteProgressFn progress = nullptr, void *context = nullptr) {
+  if (persistent) return transportOn(*persistent, true, host, port, path, method,
+      token, extraHeaders, body, response, file, offset, length, suffix, progress, context);
+  // OAuth nunca deixa sockets/contextos em cache.
+  HttpClient::Connection temporary;
+  return transportOn(temporary, false, host, port, path, method,
+      token, extraHeaders, body, response, file, offset, length, suffix, progress, context);
 }
 
 bool oauthPost(const char *path, const String &body, HttpResponse &response) {
@@ -515,13 +587,42 @@ bool NoteSyncState::save(const char *wavPath) const {
 }
 
 bool GDriveClient::fail(const String &message, int statusCode) {
+  SyncTelemetry::phase(SyncTelemetry::Phase::Error, "falha Drive");
+  driveConnection_.stop();
   lastError_ = message;
   lastStatusCode_ = statusCode;
   Serial.printf("[Drive] %s (HTTP %d)\n", message.c_str(), statusCode);
   return false;
 }
 
-bool GDriveClient::refreshAccessToken(Settings &cfg, String &outAccessToken) {
+void GDriveClient::endSession() {
+  driveConnection_.stop();
+  validatedFolder_ = "";
+  folderValidatedAt_ = 0;
+}
+
+void GDriveClient::bindCredentials(const Settings &cfg) {
+  if (credentialGeneration_ == cfg.driveAuthGeneration &&
+      credentialClientId_ == cfg.driveClientId && credentialSecret_ == cfg.driveClientSecret &&
+      credentialRefresh_ == cfg.driveRefreshToken) return;
+  endSession();
+  cachedAccessToken_ = "";
+  accessTokenDeadline_ = 0;
+  credentialGeneration_ = cfg.driveAuthGeneration;
+  credentialClientId_ = cfg.driveClientId;
+  credentialSecret_ = cfg.driveClientSecret;
+  credentialRefresh_ = cfg.driveRefreshToken;
+}
+
+bool GDriveClient::refreshAccessToken(Settings &cfg, String &outAccessToken, bool force) {
+  bindCredentials(cfg);
+  if (!force && !cachedAccessToken_.isEmpty() &&
+      static_cast<int32_t>(accessTokenDeadline_ - millis()) > 0) {
+    outAccessToken = cachedAccessToken_;
+    return true;
+  }
+  cachedAccessToken_ = "";
+  accessTokenDeadline_ = 0;
   String body = "client_id=" + urlEncode(cfg.driveClientId) +
                 "&client_secret=" + urlEncode(cfg.driveClientSecret) +
                 "&refresh_token=" + urlEncode(cfg.driveRefreshToken) + "&grant_type=refresh_token";
@@ -535,12 +636,23 @@ bool GDriveClient::refreshAccessToken(Settings &cfg, String &outAccessToken) {
       !getString(root.p, "token_type", type, 32) || !type.equalsIgnoreCase("Bearer")) {
     return fail("Resposta OAuth invalida ou access token maior que 2048 bytes", response.statusCode);
   }
+  // Fixtures/servidores legados sem expires_in sao aceitos, sem cache.
+  // TTL sempre menor que 2^31 ms, permitindo wrap seguro de millis().
+  uint32_t ttl = tokenLifetimeMs(root.p);
+  if (ttl) {
+    cachedAccessToken_ = token;
+    accessTokenDeadline_ = millis() + ttl;
+  }
   outAccessToken = std::move(token);
   lastError_ = "";
   return true;
 }
 
 bool GDriveClient::pairDevice(SettingsStore &settingsStore, ShowCodeFn showCode, ServiceFn service) {
+  endSession();
+  cachedAccessToken_ = "";
+  accessTokenDeadline_ = 0;
+  SyncTelemetry::phase(SyncTelemetry::Phase::Preparing, "pareamento Drive");
   lastError_ = "";
   lastStatusCode_ = 0;
   Settings &cfg = settingsStore.get();
@@ -574,12 +686,14 @@ bool GDriveClient::pairDevice(SettingsStore &settingsStore, ShowCodeFn showCode,
   uint32_t pollInterval = static_cast<uint32_t>(interval * 1000);
   while (static_cast<uint32_t>(millis() - started) < lifetime) {
     uint32_t waitStarted = millis();
+    SyncTelemetry::phase(SyncTelemetry::Phase::RetryWait, "aguardando autorizacao");
     while (static_cast<uint32_t>(millis() - waitStarted) < pollInterval) {
       if (service && !service()) return fail("Pareamento cancelado", lastStatusCode_);
       if (static_cast<uint32_t>(millis() - started) >= lifetime) return fail("Codigo de pareamento expirado", lastStatusCode_);
       delay(25);
     }
     if (service && !service()) return fail("Pareamento cancelado", lastStatusCode_);
+    SyncTelemetry::phase(SyncTelemetry::Phase::Preparing, "consultando autorizacao");
     HttpResponse poll;
     ok = oauthPost("/token", body, poll);
     lastStatusCode_ = poll.statusCode;
@@ -597,7 +711,11 @@ bool GDriveClient::pairDevice(SettingsStore &settingsStore, ShowCodeFn showCode,
         return fail("Resposta OAuth invalida ou token excede a capacidade de Settings", poll.statusCode);
       }
       if (!settingsStore.saveDriveRefreshToken(refresh.c_str())) return fail("Falha ao salvar autorizacao OAuth em NVS", poll.statusCode);
+      bindCredentials(cfg);
+      uint32_t ttl = tokenLifetimeMs(result.p);
+      if (ttl) { cachedAccessToken_ = access; accessTokenDeadline_ = millis() + ttl; }
       lastError_ = "";
+      SyncTelemetry::phase(SyncTelemetry::Phase::Done, "Drive pareado");
       return true;
     }
     String error;
@@ -620,6 +738,16 @@ bool GDriveClient::pairDevice(SettingsStore &settingsStore, ShowCodeFn showCode,
 }
 
 struct GDriveClient::Job {
+  enum class Remote { Unknown, Missing, Match, Different, Foreign, Error };
+  struct Snapshot {
+    String path;
+    String hash;
+    size_t size = 0;
+    ContentGuard guard;
+    bool valid = false;
+  } snapshots[3];
+  Remote inspected[3] = {Remote::Unknown, Remote::Unknown, Remote::Unknown};
+  bool freshReservation[3] = {};
   GDriveClient &owner;
   SettingsStore &store;
   Settings &cfg;
@@ -632,6 +760,8 @@ struct GDriveClient::Job {
   bool persistenceFailed = false;
   String authFailure;
   int authFailureStatus = 0;
+  size_t transferCurrent = 0, transferTotal = 0;
+  String transferName;
 
   Job(GDriveClient &client, SettingsStore &settings, NoteSyncState &sync,
       const char *path, SyncProgressFn progress)
@@ -640,6 +770,15 @@ struct GDriveClient::Job {
 
   void progress(SyncStage stage, const char *name, size_t done, size_t total,
                 int attempt, const char *message) {
+    SyncTelemetry::Phase phase = SyncTelemetry::Phase::Preparing;
+    if (stage == SyncStage::UploadingWav || stage == SyncStage::UploadingTxt || stage == SyncStage::UploadingMd)
+      phase = SyncTelemetry::Phase::DriveUpload;
+    else if (stage == SyncStage::VerifyingChecksum) phase = SyncTelemetry::Phase::Verifying;
+    else if (stage == SyncStage::Done) phase = SyncTelemetry::Phase::Done;
+    else if (stage == SyncStage::Error) phase = SyncTelemetry::Phase::Error;
+    const char *detail = phase == SyncTelemetry::Phase::DriveUpload && name && *name
+                             ? name : (message ? message : "");
+    SyncTelemetry::transfer(phase, done, total, detail);
     if (!callback) return;
     SyncProgress p;
     p.stage = stage;
@@ -650,6 +789,23 @@ struct GDriveClient::Job {
     p.maxAttempts = kMaxAttempts;
     p.message = message;
     callback(p); // Strings validas durante a callback, como na API anterior.
+  }
+
+  void beginTransfer(SyncStage stage, const char *name, size_t offset, size_t total, int attempt) {
+    transferCurrent = offset;
+    transferTotal = total;
+    transferName = name ? name : "";
+    progress(stage, name, offset, total, attempt, "enviando arquivo");
+  }
+
+  static void wrote(size_t count, void *context) {
+    Job &job = *static_cast<Job *>(context);
+    SyncTelemetry::sentBytes(SyncTelemetry::Phase::DriveUpload, count);
+    job.transferCurrent += count;
+    // So o observer barato de telemetria recebe cada write; a callback publica
+    // conserva os eventos de etapa/ACK, sem obrigar UI legada a desenhar 1 KiB.
+    SyncTelemetry::transfer(SyncTelemetry::Phase::DriveUpload, job.transferCurrent,
+                            job.transferTotal, job.transferName.c_str());
   }
 
   bool persist() {
@@ -681,7 +837,16 @@ struct GDriveClient::Job {
 
   bool request(const char *method, const String &path, const String &body,
                const String &extra, HttpResponse &r, const String &session = "",
-               File *file = nullptr, size_t offset = 0, size_t length = 0) {
+               File *file = nullptr, size_t offset = 0, size_t length = 0,
+               const String &suffix = "") {
+    if (persistenceFailed) { r = HttpResponse(); return false; }
+    if (!owner.cachedAccessToken_.isEmpty() &&
+        static_cast<int32_t>(owner.accessTokenDeadline_ - millis()) <= 0) {
+      if (!owner.refreshAccessToken(cfg, token)) {
+        authFailure = owner.lastError_; authFailureStatus = owner.lastStatusCode_;
+        r = HttpResponse(); return false;
+      }
+    }
     String host("www.googleapis.com"), target(path);
     uint16_t port = 443;
     if (!session.isEmpty() && !sessionParts(session, host, port, target)) {
@@ -689,35 +854,78 @@ struct GDriveClient::Job {
       owner.fail("URL de sessao invalida; estado preservado para recuperacao", 0);
       return false;
     }
-    bool ok = transport(host, port, target, method, token, extra, body, r, file, offset, length);
+    // Um unico contexto Drive, normalmente www.googleapis.com. Uma Location
+    // permitida em outro host muda o destino e fecha o socket anterior; jamais
+    // reutilizar TLS/Bearer num host/porta diferente sem um novo connect.
+    HttpClient::Connection *connection = &owner.driveConnection_;
+    bool ok = transport(host, port, target, method, token, extra, body, r, file, offset, length,
+                        connection, suffix, file ? wrote : nullptr, this);
+    if (r.statusCode == 404 || r.statusCode == 403) owner.validatedFolder_ = "";
+    // Somente GET e probe vazio podem ser repetidos numa conexao nova.
+    // Mutacoes seguem inspect/probe no chamador, sempre apos reconnect.
+    bool safeReplay = String(method) == "GET" ||
+                      (!file && String(method) == "PUT" && body.isEmpty());
+    if (!ok && r.statusCode != 401 && safeReplay) {
+      if (connection) connection->stop();
+      ok = transport(host, port, target, method, token, extra, body, r,
+                     nullptr, 0, 0, connection);
+    }
     owner.lastStatusCode_ = r.statusCode;
+    if (r.statusCode == 404 || r.statusCode == 403) owner.validatedFolder_ = "";
+    if (r.statusCode == 401) {
+      owner.cachedAccessToken_ = "";
+      owner.accessTokenDeadline_ = 0;
+      owner.driveConnection_.stop();
+    }
     if (r.statusCode == 401 && !refreshed401) {
       refreshed401 = true; // Uma unica renovacao reativa para todo o job.
-      if (!owner.refreshAccessToken(cfg, token)) {
+      if (!owner.refreshAccessToken(cfg, token, true)) {
         authFailure = owner.lastError_;
         authFailureStatus = owner.lastStatusCode_;
         return false;
       }
       if (!persist()) return false;
-      // Nunca retransmitir um chunk sem antes consultar sua sessao.
-      if (file) { owner.lastStatusCode_ = r.statusCode; return ok; }
-      ok = transport(host, port, target, method, token, extra, body, r);
+      // Nem bytes nem metadados de criacao sao repetidos sem inspect/probe.
+      // GET e PUT vazio (probe) podem ser repetidos diretamente apos 401.
+      if (file || String(method) == "POST" || String(method) == "PATCH") {
+        owner.lastStatusCode_ = r.statusCode; return ok;
+      }
+      ok = transport(host, port, target, method, token, extra, body, r,
+                     nullptr, 0, 0, connection);
       owner.lastStatusCode_ = r.statusCode;
+      if (r.statusCode == 401) {
+        owner.cachedAccessToken_ = "";
+        owner.accessTokenDeadline_ = 0;
+        owner.driveConnection_.stop();
+      }
+      if (r.statusCode == 404 || r.statusCode == 403) owner.validatedFolder_ = "";
     }
     return ok;
   }
 
-  bool generateId(String &id) {
+  bool generateIds(unsigned count, String *out) {
+    if (!count || count > 3) return error("Quantidade de IDs reservados invalida", 0);
     HttpResponse r;
-    bool ok = request("GET", "/drive/v3/files/generateIds?count=1&space=drive&type=files&fields=ids", "", "", r);
+    bool ok = request("GET", "/drive/v3/files/generateIds?count=" + String(count) +
+                      "&space=drive&type=files&fields=ids", "", "", r);
     if (!ok || r.statusCode != 200) return httpError("Reservar ID no Drive", r, ok);
     Json root(parseJson(r.body));
     cJSON *ids = root.p ? item(root.p, "ids") : nullptr;
-    cJSON *first = cJSON_IsArray(ids) ? cJSON_GetArrayItem(ids, 0) : nullptr;
-    if (!cJSON_IsString(first) || !first->valuestring || !isId(first->valuestring)) return error("Drive retornou ID reservado invalido", r.statusCode);
-    id = first->valuestring;
+    if (!cJSON_IsArray(ids) || cJSON_GetArraySize(ids) != static_cast<int>(count))
+      return error("Drive retornou lote de IDs reservado invalido", r.statusCode);
+    for (unsigned i = 0; i < count; ++i) {
+      cJSON *entry = cJSON_GetArrayItem(ids, i);
+      if (!cJSON_IsString(entry) || !plainString(entry->valuestring) || !isId(entry->valuestring))
+        return error("Drive retornou ID reservado invalido", r.statusCode);
+      out[i] = entry->valuestring;
+      for (unsigned j = 0; j < i; ++j) {
+        if (out[j] == out[i]) return error("Drive retornou IDs reservados repetidos", r.statusCode);
+      }
+    }
     return true;
   }
+
+  bool generateId(String &id) { return generateIds(1, &id); }
 
   // Paginacao completa; resposta parcial/limite nunca permite criar duplicata.
   bool list(const String &query, const char *fields, String &pageToken, HttpResponse &r) {
@@ -746,6 +954,10 @@ struct GDriveClient::Job {
       return error("Metadados da pasta incompletos ou invalidos", r.statusCode);
     }
     valid = !trashed && mime == kFolderMime;
+    if (valid) {
+      owner.validatedFolder_ = id;
+      owner.folderValidatedAt_ = millis();
+    } else owner.validatedFolder_ = "";
     return true;
   }
 
@@ -767,6 +979,9 @@ struct GDriveClient::Job {
     bool valid;
     String previousReservation;
     String cached = state.pendingFolderId[0] ? String(state.pendingFolderId) : String(cfg.driveFolderId);
+    if (!state.pendingFolderId[0] && !cached.isEmpty() && owner.validatedFolder_ == cached &&
+        static_cast<uint32_t>(millis() - owner.folderValidatedAt_) < kFolderCacheMs)
+      return confirmFolder(cached);
     if (!cached.isEmpty()) {
       if (!isId(cached)) return error("ID da pasta salvo e invalido", 0);
       bool missing;
@@ -815,12 +1030,26 @@ struct GDriveClient::Job {
     String body = render(meta.p);
     if (body.isEmpty()) return error("Sem memoria para criar pasta", 0);
     HttpResponse r;
+    bool authWasRefreshed = refreshed401;
     bool ok = request("POST", "/drive/v3/files?fields=" + urlEncode(kFolderFields), body,
                       "Content-Type: application/json; charset=UTF-8\r\n", r);
+    if (persistenceFailed) return false;
+    if (r.statusCode == 401 && !authWasRefreshed && refreshed401 && authFailure.isEmpty()) {
+      bool missing;
+      if (!validateFolder(id, valid, &missing)) return false;
+      if (valid) return confirmFolder(id);
+      if (!missing) return error("Reserva de pasta nao corresponde a uma pasta valida", owner.lastStatusCode_);
+      // O 404 foi inspecionado com o token novo antes do unico novo POST.
+      if (!persist()) return false;
+      ok = request("POST", "/drive/v3/files?fields=" + urlEncode(kFolderFields), body,
+                   "Content-Type: application/json; charset=UTF-8\r\n", r);
+      if (persistenceFailed) return false;
+    }
     if (!ok || (!accepted(r.statusCode) && r.statusCode != 409)) {
       // Criacao ambigua: verificar a reserva, nunca criar outra neste job.
       int code = r.statusCode;
       if (!ok || HttpClient::isRetryableStatus(code, r.body)) {
+        owner.driveConnection_.stop();
         if (!validateFolder(id, valid)) return false;
         if (valid) return confirmFolder(id);
       }
@@ -831,50 +1060,82 @@ struct GDriveClient::Job {
     return confirmFolder(id);
   }
 
-  enum class Remote { Missing, Match, Different, Foreign, Error };
+  Remote metadata(const cJSON *root, const Asset &a, const char *name) {
+    String id, remoteName, hash, sizeString;
+    bool trashed;
+    size_t size;
+    if (!root || !getString(root, "id", id, 127)) return Remote::Unknown;
+    if (id != a.id) return Remote::Foreign;
+    if (!getString(root, "name", remoteName, 1024) || !boolField(root, "trashed", trashed) ||
+        !cJSON_IsArray(item(root, "parents"))) return Remote::Unknown;
+    if (trashed || !hasParent(root, folder) || remoteName != name) return Remote::Foreign;
+    if (!getString(root, "size", sizeString, 32) || !decimal(sizeString, size) ||
+        !getString(root, "md5Checksum", hash, 32) || !isMd5(hash)) return Remote::Unknown;
+    return size == a.size && hash.equalsIgnoreCase(a.hash) ? Remote::Match : Remote::Different;
+  }
 
   Remote inspect(const Asset &a, const char *name) {
+    SyncTelemetry::phase(SyncTelemetry::Phase::Verifying, "verificando arquivo remoto");
     HttpResponse r;
     bool ok = request("GET", "/drive/v3/files/" + urlEncode(a.id) + "?fields=" + urlEncode(kFileFields), "", "", r);
     if (ok && r.statusCode == 404) return Remote::Missing;
     if (!ok || r.statusCode != 200) { httpError("Verificar arquivo remoto", r, ok); return Remote::Error; }
     Json root(parseJson(r.body));
-    String id, remoteName, hash, sizeString;
-    bool trashed;
-    size_t size;
-    if (!root.p || !getString(root.p, "id", id, 127) || id != a.id ||
-        !getString(root.p, "name", remoteName, 1024) || !boolField(root.p, "trashed", trashed)) {
-      error("GET do arquivo retornou metadados invalidos", r.statusCode);
+    Remote result = metadata(root.p, a, name);
+    if (result == Remote::Unknown) {
+      error("GET do arquivo nao retornou metadados, tamanho e MD5 verificaveis", r.statusCode);
       return Remote::Error;
     }
-    if (trashed || !hasParent(root.p, folder) || remoteName != name) return Remote::Foreign;
-    if (!getString(root.p, "size", sizeString, 32) || !decimal(sizeString, size) ||
-        !getString(root.p, "md5Checksum", hash, 32) || !isMd5(hash)) {
-      error("GET do arquivo nao retornou tamanho e MD5 verificaveis", r.statusCode);
-      return Remote::Error;
-    }
-    return size == a.size && hash.equalsIgnoreCase(a.hash) ? Remote::Match : Remote::Different;
+    return result;
   }
 
   bool localUnchanged(Asset a, const char *path, bool text) {
-    String hash;
-    size_t size;
-    if (!fileSnapshot(path, text, size, hash) || size != a.size || !hash.equalsIgnoreCase(a.hash)) {
+    SyncTelemetry::phase(SyncTelemetry::Phase::Verifying, "validando fotografia local");
+    const Snapshot *snapshot = nullptr;
+    for (const Snapshot &candidate : snapshots) {
+      if (candidate.valid && candidate.path == path) { snapshot = &candidate; break; }
+    }
+    bool valid = snapshot && snapshot->size == a.size && snapshot->hash.equalsIgnoreCase(a.hash) &&
+                 (text ? NoteFiles::validText(path) : NoteFiles::validWav(path));
+    File file = valid ? NoteFiles::fs().open(path, FILE_READ) : File();
+    ContentGuard guard;
+    size_t remaining = a.size;
+    uint8_t buffer[1024];
+    valid = valid && file && !file.isDirectory() && file.size() == a.size;
+    while (valid && remaining) {
+      size_t wanted = min(remaining, sizeof(buffer));
+      size_t n = file.read(buffer, wanted);
+      if (!n || n > wanted) { valid = false; break; }
+      guard.add(buffer, n);
+      remaining -= n;
+      yield();
+    }
+    valid = valid && file.size() == a.size && guard.equals(snapshot->guard);
+    if (!valid) {
       a.uploaded = false;
       return error("Arquivo local ausente, invalido ou alterado durante a sincronizacao", owner.lastStatusCode_);
     }
     return true;
   }
 
-  bool complete(Asset a, const char *path, const char *name, SyncStage stage, bool text) {
+  bool complete(Asset a, const char *path, const char *name, SyncStage stage, bool text,
+                Remote verified = Remote::Unknown, const HttpResponse *finalResponse = nullptr) {
+    progress(SyncStage::VerifyingChecksum, name, a.size, a.size, 1, "confirmando tamanho e MD5");
     a.uploaded = false;
     // ACK final (ou GET correspondente) confirma os bytes, mas ainda NAO o
     // checksum. Persistir inclusive o ultimo bloco antes da verificacao.
     a.offset = a.size;
     if (!persist()) return false;
-    progress(SyncStage::VerifyingChecksum, name, a.offset, a.size, 1, "confirmando tamanho e MD5 por GET");
     if (!localUnchanged(a, path, text)) return false;
-    Remote remote = inspect(a, name);
+    Remote remote = verified;
+    if (remote == Remote::Unknown && finalResponse && finalResponse->bodyComplete &&
+        !finalResponse->bodyTruncated && accepted(finalResponse->statusCode)) {
+      Json root(parseJson(finalResponse->body));
+      remote = metadata(root.p, a, name);
+    }
+    // Um ACK com todos os fields ou um inspect ja validado elimina o GET.
+    // JSON vazio/incompleto nunca comprova conclusao: GET conservador.
+    if (remote == Remote::Unknown) remote = inspect(a, name);
     if (remote == Remote::Error) return false;
     if (remote == Remote::Different) {
       // Uma sessao que terminou com bytes divergentes nao pode ficar sendo
@@ -895,6 +1156,7 @@ struct GDriveClient::Job {
   }
 
   bool reconcile(Asset a, const char *name) {
+    SyncTelemetry::phase(SyncTelemetry::Phase::Preparing, "reconciliando arquivo");
     String query = "trashed = false and " + queryLiteral(folder) + " in parents and name = " + queryLiteral(name);
     String page;
     unsigned pages = 0;
@@ -932,6 +1194,59 @@ struct GDriveClient::Job {
     return true;
   }
 
+  int indexOf(const Asset &a) const {
+    return a.id == state.wavDriveId ? 0 : a.id == state.txtDriveId ? 1 : 2;
+  }
+
+  bool prepareAssets(const bool *present) {
+    unsigned missing = 0;
+    int slots[3] = {};
+    for (int i = 0; i < 3; ++i) {
+      if (!present[i]) continue;
+      Asset a = asset(state, i);
+      String name = baseName(snapshots[i].path.c_str());
+      if (name.isEmpty() || !plainString(name.c_str())) return error("Nome de arquivo local invalido", 0);
+      if (a.id[0]) {
+        inspected[i] = inspect(a, name.c_str());
+        if (inspected[i] == Remote::Error) return false;
+        if (inspected[i] == Remote::Foreign || (inspected[i] == Remote::Missing && !a.reserved)) {
+          a.id[0] = '\0'; a.reserved = false; a.uploaded = false; a.session = ""; a.offset = 0;
+          inspected[i] = Remote::Unknown;
+          if (!persist()) return false;
+        }
+      }
+      if (!a.id[0]) {
+        // Sem UUID/prova de criacao exclusiva nao e seguro omitir esta busca,
+        // mesmo para um .sync novo: pode haver um upload legado/estado perdido.
+        if (!reconcile(a, name.c_str())) return false;
+        if (a.id[0]) {
+          inspected[i] = inspect(a, name.c_str());
+          if (inspected[i] != Remote::Match)
+            return inspected[i] == Remote::Error ? false : error("Arquivo reconciliado mudou antes da confirmacao", owner.lastStatusCode_);
+        } else slots[missing++] = i;
+      }
+    }
+    if (!missing) return true;
+    SyncTelemetry::phase(SyncTelemetry::Phase::Preparing, "reservando IDs do lote");
+    String ids[3];
+    if (!generateIds(missing, ids)) return false;
+    for (unsigned n = 0; n < missing; ++n) {
+      int i = slots[n];
+      // Tambem rejeitar um lote que colide com qualquer ID local conhecido.
+      for (int j = 0; j < 3; ++j) {
+        if (ids[n] == asset(state, j).id || ids[n] == folder || ids[n] == state.pendingFolderId)
+          return error("ID reservado colide com recurso conhecido", owner.lastStatusCode_);
+      }
+      Asset a = asset(state, i);
+      if (!copyString(a.id, 128, ids[n])) return error("ID reservado excede a capacidade", owner.lastStatusCode_);
+      a.uploaded = false; a.reserved = true; a.session = ""; a.offset = 0;
+      freshReservation[i] = true;
+      inspected[i] = Remote::Unknown;
+    }
+    // Todos os IDs juntos no .sync antes de qualquer POST de arquivo.
+    return persist();
+  }
+
   enum class Probe { Continue, Complete, Restart, Error };
 
   Probe probe(Asset a, const char *path, const char *name, SyncStage stage, bool text) {
@@ -941,7 +1256,7 @@ struct GDriveClient::Job {
     bool ok = request("PUT", "", "", extra, r, a.session);
     if (persistenceFailed) return Probe::Error;
     if (!ok) { httpError("Consultar sessao (preservada para retomada)", r, ok); return Probe::Error; }
-    if (accepted(r.statusCode)) return complete(a, path, name, stage, text) ? Probe::Complete : Probe::Error;
+    if (accepted(r.statusCode)) return complete(a, path, name, stage, text, Remote::Unknown, &r) ? Probe::Complete : Probe::Error;
     if (r.statusCode == 308) {
       size_t next;
       if (!rangeOffset(r.range, a.size, a.offset, a.size, next)) {
@@ -958,7 +1273,12 @@ struct GDriveClient::Job {
       // Sessao pode ter expirado DEPOIS de concluir. Verificar o mesmo ID.
       Remote remote = inspect(a, name);
       if (remote == Remote::Error) return Probe::Error;
-      if (remote == Remote::Match) return complete(a, path, name, stage, text) ? Probe::Complete : Probe::Error;
+      if (remote == Remote::Match) return complete(a, path, name, stage, text, remote) ? Probe::Complete : Probe::Error;
+      if (remote == Remote::Foreign || (remote == Remote::Missing && !a.reserved)) {
+        error("Arquivo remoto movido ou removido; retomada recusada", owner.lastStatusCode_);
+        return Probe::Error;
+      }
+      inspected[indexOf(a)] = remote;
       a.session = "";
       a.offset = 0;
       a.uploaded = false;
@@ -970,12 +1290,17 @@ struct GDriveClient::Job {
   }
 
   bool initiate(Asset a, const char *path, const char *name, const char *mime,
-                SyncStage stage, bool text) {
-    Remote remote = inspect(a, name); // ID reservado nunca e sucesso.
+                 SyncStage stage, bool text) {
+    int index = indexOf(a);
+    Remote remote = freshReservation[index] ? Remote::Missing : inspected[index];
+    // Missing e uma reserva fresca ou um GET 404 deste job. A primeira
+    // mutacao consome essa prova; falhas posteriores sempre fazem inspect.
+    if (remote == Remote::Unknown) remote = inspect(a, name);
     if (remote == Remote::Error) return false;
-    if (remote == Remote::Match) return complete(a, path, name, stage, text);
+    if (remote == Remote::Match) return complete(a, path, name, stage, text, remote);
     if (remote == Remote::Foreign) return error("ID remoto fora da pasta, renomeado ou na lixeira; reconciliacao necessaria", owner.lastStatusCode_);
     bool update = remote == Remote::Different;
+    SyncTelemetry::phase(SyncTelemetry::Phase::Preparing, "preparando sessao resumable");
     Json meta(cJSON_CreateObject());
     if (!meta.p || !cJSON_AddStringToObject(meta.p, "name", name) ||
         !cJSON_AddStringToObject(meta.p, "mimeType", mime)) return error("Sem memoria para metadados do upload", 0);
@@ -1002,16 +1327,27 @@ struct GDriveClient::Job {
     String extra = "Content-Type: application/json; charset=UTF-8\r\nX-Upload-Content-Type: " + String(mime) +
                    "\r\nX-Upload-Content-Length: " + String(static_cast<unsigned long>(a.size)) + "\r\n";
     HttpResponse r;
+    freshReservation[index] = false;
+    inspected[index] = Remote::Unknown;
+    progress(stage, name, 0, a.size, 1, "iniciando sessao de upload");
+    bool authWasRefreshed = refreshed401;
     bool ok = request(update ? "PATCH" : "POST", target, body, extra, r);
     if (persistenceFailed) return false;
     if (!ok || r.statusCode == 409 || !accepted(r.statusCode)) {
       // Sem Location em uma resposta ambigua: GET da reserva antes de qualquer
       // proximo POST. Novo job reutiliza o ID, inclusive apos 409.
       int originalStatus = r.statusCode;
-      if (!ok || originalStatus == 409 || HttpClient::isRetryableStatus(originalStatus, r.body)) {
+      bool renewed = originalStatus == 401 && !authWasRefreshed && refreshed401 && authFailure.isEmpty();
+      if (!ok || renewed || originalStatus == 409 || HttpClient::isRetryableStatus(originalStatus, r.body)) {
+        owner.driveConnection_.stop();
         Remote check = inspect(a, name);
         if (check == Remote::Error) return false;
-        if (check == Remote::Match) return complete(a, path, name, stage, text);
+        if (check == Remote::Match) return complete(a, path, name, stage, text, check);
+        if (renewed && (check == Remote::Different || (check == Remote::Missing && a.reserved))) {
+          inspected[index] = check;
+          // Profundidade maxima dois: refreshed401 ja impede outra renovacao.
+          return initiate(a, path, name, mime, stage, text);
+        }
       }
       return httpError("Iniciar upload; ID reservado preservado", r, ok);
     }
@@ -1024,6 +1360,80 @@ struct GDriveClient::Job {
     return persist(); // Nunca enviar dados antes de persistir a sessao.
   }
 
+  bool multipart(int index, const char *path, const char *name, const char *mime,
+                 SyncStage stage, bool text) {
+    Asset a = asset(state, index);
+    Remote remote = freshReservation[index] ? Remote::Missing : inspected[index];
+    for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
+      if (remote == Remote::Unknown) remote = inspect(a, name);
+      if (remote == Remote::Error) return false;
+      if (remote == Remote::Match) return complete(a, path, name, stage, text, remote);
+      if (remote == Remote::Foreign || (remote == Remote::Missing && !a.reserved))
+        return error("ID remoto movido, renomeado ou removido; upload recusado", owner.lastStatusCode_);
+      bool update = remote == Remote::Different;
+      SyncTelemetry::phase(SyncTelemetry::Phase::Preparing, "preparando multipart");
+      Json meta(cJSON_CreateObject());
+      if (!meta.p || !cJSON_AddStringToObject(meta.p, "name", name) ||
+          !cJSON_AddStringToObject(meta.p, "mimeType", mime))
+        return error("Sem memoria para metadados multipart", 0);
+      if (!update) {
+        cJSON *parents = cJSON_AddArrayToObject(meta.p, "parents");
+        cJSON *parent = cJSON_CreateString(folder.c_str());
+        if (!cJSON_AddStringToObject(meta.p, "id", a.id) || !parents || !parent) {
+          cJSON_Delete(parent);
+          return error("Sem memoria para ID/pasta multipart", 0);
+        }
+        cJSON_AddItemToArray(parents, parent);
+        if (cJSON_GetArrayItem(parents, 0) != parent) {
+          cJSON_Delete(parent);
+          return error("Falha ao montar pasta multipart", 0);
+        }
+      }
+      String metadataBody = render(meta.p);
+      if (metadataBody.isEmpty()) return error("Sem memoria para upload multipart", 0);
+      // O boundary depende do ID reservado, sem nomes/conteudo/credenciais.
+      String boundary = "esp32_drive_" + String(a.id).substring(0, 48);
+      String prefix = "--" + boundary + "\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n" +
+                      metadataBody + "\r\n--" + boundary + "\r\nContent-Type: " + String(mime) + "\r\n\r\n";
+      String suffix = "\r\n--" + boundary + "--\r\n";
+      String target = "/upload/drive/v3/files";
+      if (update) target += "/" + urlEncode(a.id);
+      target += "?uploadType=multipart&fields=" + urlEncode(kFileFields);
+      String extra = "Content-Type: multipart/related; boundary=" + boundary + "\r\n";
+      if (!localUnchanged(a, path, text) || !persist()) return false;
+      File file = NoteFiles::fs().open(path, FILE_READ);
+      if (!file || file.size() != a.size) return error("Arquivo local indisponivel para multipart", 0);
+      freshReservation[index] = false;
+      inspected[index] = Remote::Unknown;
+      beginTransfer(stage, name, 0, a.size, attempt);
+      HttpResponse r;
+      bool ok = request(update ? "PATCH" : "POST", target, prefix, extra, r,
+                        "", &file, 0, a.size, suffix);
+      file.close();
+      if (persistenceFailed) return false;
+      if (ok && accepted(r.statusCode)) return complete(a, path, name, stage, text, Remote::Unknown, &r);
+      int originalStatus = r.statusCode;
+      bool retryable = !ok || originalStatus == 401 || originalStatus == 409 ||
+                       HttpClient::isRetryableStatus(originalStatus, r.body);
+      if (!retryable) return httpError("Enviar arquivo multipart", r, ok);
+      // Resposta perdida, escrita parcial ou conflito: nunca repetir bytes
+      // antes de consultar o MESMO ID num transporte limpo.
+      owner.driveConnection_.stop();
+      remote = inspect(a, name);
+      if (remote == Remote::Error) return false;
+      if (remote == Remote::Match) return complete(a, path, name, stage, text, remote);
+      if (remote == Remote::Foreign || (remote == Remote::Missing && !a.reserved))
+        return error("Arquivo remoto mudou durante recuperacao multipart", owner.lastStatusCode_);
+      if (attempt == kMaxAttempts) return httpError("Multipart sem confirmacao; ID preservado", r, ok);
+      uint32_t wait = HttpClient::retryDelayMs(attempt - 1, r.retryAfterSec);
+      if (wait == UINT32_MAX || wait > 60000)
+        return error("Upload adiado pelo Retry-After; ID preservado", originalStatus);
+      bool quota = originalStatus == 429 || originalStatus == 403;
+      SyncTelemetry::wait(wait, quota, quota ? "limite do Drive" : "retentativa multipart");
+    }
+    return false;
+  }
+
   bool upload(int index, const char *path, const char *mime, SyncStage stage) {
     Asset a = asset(state, index);
     bool text = index != 0;
@@ -1031,34 +1441,17 @@ struct GDriveClient::Job {
     if (name.isEmpty() || !plainString(name.c_str())) return error("Nome de arquivo local invalido", 0);
     a.uploaded = false;
     if (!persist()) return false;
-    if (a.id[0]) {
-      Remote remote = inspect(a, name.c_str());
-      if (remote == Remote::Error) return false;
-      if (remote == Remote::Match) return complete(a, path, name.c_str(), stage, text);
-      if (remote == Remote::Foreign || (remote == Remote::Missing && !a.reserved)) {
-        // Nao editar arquivos movidos/renomeados/enviados ao lixo, nem tentar
-        // recriar um ID anteriormente confirmado e agora apagado. Reservas
-        // ainda nao concluidas, em contraste, conservam o ID para idempotencia.
-        a.id[0] = '\0';
-        a.reserved = false;
-        a.session = "";
-        a.offset = 0;
-        if (!persist()) return false;
-      }
-    }
-    if (!a.id[0]) {
-      if (!reconcile(a, name.c_str())) return false;
-      if (a.id[0]) return complete(a, path, name.c_str(), stage, text);
-      String id;
-      if (!generateId(id) || !copyString(a.id, 128, id)) return false;
-      a.reserved = true;
-      if (!persist()) return false;
-    }
+    if (!isId(a.id)) return error("Upload sem ID previamente reservado e persistido", 0);
+    if (inspected[index] == Remote::Match)
+      return complete(a, path, name.c_str(), stage, text, Remote::Match);
     if (!a.session.isEmpty()) {
       Probe p = probe(a, path, name.c_str(), stage, text);
       if (p == Probe::Complete) return true;
       if (p == Probe::Error) return false;
     }
+    // Sessoes persistidas continuam resumable, mesmo para um arquivo pequeno.
+    if (a.size <= kMultipartBytes && a.session.isEmpty())
+      return multipart(index, path, name.c_str(), mime, stage, text);
     int stalled = 0, restarts = 0;
     while (!a.uploaded) {
       if (a.session.isEmpty()) {
@@ -1071,7 +1464,7 @@ struct GDriveClient::Job {
       if (!file || file.size() != a.size) return error("Arquivo local indisponivel para enviar bloco", 0);
       size_t start = a.offset;
       size_t length = a.size - start < kChunkBytes ? a.size - start : kChunkBytes;
-      progress(stage, name.c_str(), start, a.size, stalled + 1, "enviando bloco");
+      beginTransfer(stage, name.c_str(), start, a.size, stalled + 1);
       String extra = "Content-Type: " + String(mime) + "\r\nContent-Range: bytes " +
                      String(static_cast<unsigned long>(start)) + "-" +
                      String(static_cast<unsigned long>(start + length - 1)) + "/" +
@@ -1080,11 +1473,12 @@ struct GDriveClient::Job {
       bool ok = request("PUT", "", "", extra, r, a.session, &file, start, length);
       file.close();
       if (persistenceFailed) return false;
-      if (ok && accepted(r.statusCode)) return complete(a, path, name.c_str(), stage, text);
+      if (ok && accepted(r.statusCode)) return complete(a, path, name.c_str(), stage, text, Remote::Unknown, &r);
       if (ok && r.statusCode == 308) {
         size_t next;
         if (!rangeOffset(r.range, a.size, a.offset, start + length, next)) {
           // Resposta estranha tambem e ambigua: consultar antes de repetir.
+          owner.driveConnection_.stop();
           Probe p = probe(a, path, name.c_str(), stage, text);
           if (p == Probe::Complete) return true;
           if (p == Probe::Error) return false;
@@ -1099,12 +1493,14 @@ struct GDriveClient::Job {
         bool retryable = !ok || originalStatus == 401 || originalStatus == 404 ||
                          HttpClient::isRetryableStatus(originalStatus, r.body);
         uint32_t wait = r.retryAfterSec > 60 ? UINT32_MAX : HttpClient::retryDelayMs(stalled, r.retryAfterSec);
+        owner.driveConnection_.stop();
         Probe p = probe(a, path, name.c_str(), stage, text);
         if (p == Probe::Complete) return true;
         if (p == Probe::Error) return false;
         if (!retryable) return httpError("Enviar bloco", r, ok);
         if (wait == UINT32_MAX || wait > 60000) return error("Upload adiado pelo Retry-After; sessao preservada", originalStatus);
-        delay(wait);
+        bool quota = originalStatus == 429 || originalStatus == 403;
+        SyncTelemetry::wait(wait, quota, quota ? "limite do Drive" : "retentativa resumable");
       }
       if (a.session.isEmpty()) { stalled = 0; continue; }
       if (a.offset > start) stalled = 0;
@@ -1164,7 +1560,9 @@ bool GDriveClient::needsUpload(const char *wavPath, bool requireText) {
 }
 
 bool GDriveClient::uploadNote(SettingsStore &settingsStore, const char *wavPath,
-                              const char *txtPath, const char *mdPath, SyncProgressFn onProgress) {
+                               const char *txtPath, const char *mdPath, SyncProgressFn onProgress) {
+  SyncTelemetry::phase(SyncTelemetry::Phase::Preparing, "preparando nota Drive");
+  bindCredentials(settingsStore.get());
   lastError_ = "";
   lastStatusCode_ = 0;
   NoteSyncState state;
@@ -1192,6 +1590,7 @@ bool GDriveClient::uploadNote(SettingsStore &settingsStore, const char *wavPath,
   // Validar os assets e gravar o estado ANTES de OAuth/POST/PATCH/upload.
   for (int i = 0; i < 3; ++i) {
     Asset a = asset(state, i);
+    job.snapshots[i].path = paths[i];
     present[i] = !paths[i].isEmpty() && NoteFiles::fs().exists(paths[i].c_str());
     if (!present[i]) {
       a.uploaded = false;
@@ -1203,10 +1602,13 @@ bool GDriveClient::uploadNote(SettingsStore &settingsStore, const char *wavPath,
     }
     size_t size;
     String hash;
-    if (!fileSnapshot(paths[i].c_str(), i != 0, size, hash)) {
+    if (!fileSnapshot(paths[i].c_str(), i != 0, size, hash, &job.snapshots[i].guard)) {
       a.uploaded = false;
       return job.error(i == 0 ? "WAV local invalido ou ilegivel" : "Texto local vazio, invalido ou ilegivel", 0);
     }
+    job.snapshots[i].size = size;
+    job.snapshots[i].hash = hash;
+    job.snapshots[i].valid = true;
     if (size != a.size || !hash.equalsIgnoreCase(a.hash)) {
       a.uploaded = false;
       a.session = "";
@@ -1220,7 +1622,7 @@ bool GDriveClient::uploadNote(SettingsStore &settingsStore, const char *wavPath,
   if (!present[0]) return job.error("Arquivo WAV local ausente", 0);
   if (requireText && (!present[1] || !present[2])) return job.error("STT configurado: TXT e MD validos sao obrigatorios antes do upload", 0);
   if (!settingsStore.hasDriveAuth()) return job.error("Google Drive ainda nao pareado", 0);
-  job.progress(SyncStage::Authenticating, "", 0, 0, 1, "renovando autorizacao");
+  job.progress(SyncStage::Authenticating, "", 0, 0, 1, "obtendo autorizacao");
   if (!refreshAccessToken(settingsStore.get(), job.token)) {
     // invalid_grant e definitivo: a proxima conexao deve pedir autorizacao,
     // em vez de insistir indefinidamente com o mesmo refresh token invalido.
@@ -1242,11 +1644,13 @@ bool GDriveClient::uploadNote(SettingsStore &settingsStore, const char *wavPath,
   }
   const char *mime[] = {"audio/wav", "text/plain", "text/markdown"};
   const SyncStage stages[] = {SyncStage::UploadingWav, SyncStage::UploadingTxt, SyncStage::UploadingMd};
+  if (!job.prepareAssets(present)) return false;
   for (int i = 0; i < 3; ++i) {
     if (present[i] && !job.upload(i, paths[i].c_str(), mime[i], stages[i])) return false;
   }
   // Revalidar todos os locais no final: um asset novo/removido/modificado no
   // meio do job nao pode herdar fullySynced de uma fotografia antiga.
+  SyncTelemetry::phase(SyncTelemetry::Phase::Verifying, "validando fotografia local final");
   for (int i = 0; i < 3; ++i) {
     bool exists = NoteFiles::fs().exists(paths[i].c_str());
     if (exists != present[i]) {

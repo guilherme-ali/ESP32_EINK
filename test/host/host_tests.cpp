@@ -3,6 +3,8 @@
 #include "json_utils.h"
 #include "gemini_client.h"
 #include "stt.h"
+#include <Preferences.h>
+#include <mbedtls/sha256.h>
 #include <functional>
 #include <iostream>
 #include <stdexcept>
@@ -328,7 +330,7 @@ TEST(sttnet_http_fragmented_chunked) {
                        "3;test=yes\r\nabc\r\n2\r\nde\r\n0\r\nX-Trailer: 1\r\n\r\n", 1, 1, true);
   SttNet::Response r;
   CHECK(SttNet::readResponse(client, r, 1000));
-  CHECK(r.complete && r.length == 5 && std::string(r.body) == "abcde" && client.stopped());
+  CHECK(r.complete && r.length == 5 && std::string(r.body) == "abcde" && !r.connectionClose && !client.stopped());
 }
 TEST(sttnet_http_rejects_bad_framing) {
   for (const std::string wire : {
@@ -346,10 +348,10 @@ TEST(sttnet_http_rejects_bad_framing) {
   }
 }
 TEST(sttnet_http_maxbody_rejected) {
-  auto client = stream("HTTP/1.1 200 OK\r\nContent-Length: 131073\r\n\r\n", 1, 1, true);
+  auto client = stream("HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(SttNet::kMaxBody + 1) + "\r\n\r\n", 1, 1, true);
   SttNet::Response r;
   CHECK(!SttNet::readResponse(client, r, 1000));
-  CHECK(!r.complete && r.length == 0 && r.error.indexOf("128 KiB") >= 0);
+  CHECK(!r.complete && r.length == 0 && r.error.length());
   CHECK(!SttNet::retryable(r));
 }
 TEST(sttnet_204_retry_after_defers) {
@@ -456,16 +458,87 @@ TEST(stt_rejects_path_and_invalid_wav_without_network) {
   CHECK(!client.transcribe(cfg, "/notes/test.wav", out, sizeof(out)));
   CHECK(Host::requests.empty());
 }
+TEST(shared_wire_mixed_2xx_errors_keepalive_one_handshake) {
+  for (int status : {200, 404, 429, 503, 200}) Host::enqueue(Fixtures::http("{}", status), 1, 1, true);
+  for (int status : {200, 404, 429, 503, 200}) {
+    SttNet::Response r;
+    CHECK(SttNet::requestJson("example.test", 443, "GET", "/models", "fake-key", true, "", r));
+    CHECK(r.complete && r.status == status && !r.connectionClose);
+  }
+  CHECK(Host::requests.size() == 5 && Host::connectionHosts.size() == 1 && Host::responses.empty());
+  for (const auto &request : Host::requests) {
+    CHECK(request.find("GET /models HTTP/1.1\r\n") == 0);
+    CHECK(request.find("GET /models", 1) == std::string::npos);
+  }
+  auto c = SyncTelemetry::counters(); CHECK(c.httpRequests == 5 && c.tlsHandshakes == 1);
+}
+TEST(shared_wire_early_media_4xx_closes_and_preserves_status) {
+  Host::enqueue(Fixtures::http("{}"), 1, 0, true);
+  Host::enqueue(Fixtures::http(R"({"error":{"status":"PERMISSION_DENIED"}})", 403), 1, 0, true);
+  Host::enqueue(Fixtures::http("{}"), 1, 0, true);
+  SttNet::Response first;
+  CHECK(SttNet::requestJson("example.test", 443, "GET", "/models", "fake-key", true, "", first));
+  auto &client = SttNet::sharedClient(); SttNet::Response error;
+  CHECK(SttNet::beginRequest(client, "example.test", 443, "POST", "/audio", "fake-key", true,
+                             "audio/wav", Fixtures::wav().size(), "", error));
+  File audio(Fixtures::wav()); CHECK(!SttNet::writeFile(client, audio));
+  CHECK(SttNet::finishRequest(client, error, false)); CHECK(error.status == 403 && error.complete && client.stopped());
+  CHECK(Host::requests[1].find(Fixtures::wav()) == std::string::npos);
+  SttNet::Response final;
+  CHECK(SttNet::requestJson("example.test", 443, "GET", "/models", "fake-key", true, "", final));
+  CHECK(Host::requests.size() == 3 && Host::connectionHosts.size() == 2);
+}
+TEST(shared_wire_invalid_frame_and_forced_partial_read_disconnect) {
+  for (bool forced : {false, true}) {
+    SttNet::endSession(); Host::resetNetwork();
+    if (forced) {
+      Host::enqueue(Fixtures::http("abcdef"), 2, 0, true);
+      Host::responses.back().disconnectAfterRead = Fixtures::http("abcdef").size() - 3;
+    } else Host::enqueue("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\n\r\n", 1, 0, true);
+    SttNet::Response bad;
+    CHECK(!SttNet::requestJson("example.test", 443, "GET", "/bad", "fake-key", true, "", bad));
+    CHECK(!bad.complete && SttNet::sharedClient().stopped());
+    Host::enqueue(Fixtures::http("{}"), 1, 0, true); SttNet::Response good;
+    CHECK(SttNet::requestJson("example.test", 443, "GET", "/good", "fake-key", true, "", good));
+    CHECK(Host::connectionHosts.size() == 2 && Host::requests.size() == 2);
+  }
+}
+TEST(shared_wire_destination_change_and_end_session_reconnect) {
+  for (const char *host : {"a.test", "a.test", "b.test", "b.test"}) {
+    Host::enqueue(Fixtures::http("{}"), 1, 0, true); SttNet::Response r;
+    CHECK(SttNet::requestJson(host, 443, "GET", "/models", "fake-key", true, "", r));
+  }
+  CHECK(Host::connectionHosts.size() == 2 && Host::connectionHosts[0] == "a.test" && Host::connectionHosts[1] == "b.test");
+  SttNet::endSession(); Host::enqueue(Fixtures::http("{}"), 1, 0, true); SttNet::Response r;
+  CHECK(SttNet::requestJson("b.test", 443, "GET", "/models", "fake-key", true, "", r));
+  CHECK(Host::connectionHosts.size() == 3);
+}
+TEST(telemetry_accrues_wait_times_wrap_and_byte_destinations) {
+  Host::resetClock(UINT32_MAX - 9); SyncTelemetry::reset();
+  delay(20); SyncTelemetry::phase(SyncTelemetry::Phase::GeminiUpload);
+  delay(7); SyncTelemetry::wait(13, true); delay(3);
+  SyncTelemetry::phase(SyncTelemetry::Phase::DriveUpload); delay(11);
+  SyncTelemetry::wait(17, false); delay(5);
+  SyncTelemetry::sentBytes(SyncTelemetry::Phase::GeminiUpload, 80);
+  SyncTelemetry::sentBytes(SyncTelemetry::Phase::DriveUpload, 60);
+  SyncTelemetry::sentBytes(SyncTelemetry::Phase::Preparing, 999);
+  auto c = SyncTelemetry::counters();
+  CHECK(c.preparingMs == 20 && c.geminiUploadMs == 10 && c.driveUploadMs == 16);
+  CHECK(c.quotaWaitMs == 13 && c.retryWaitMs == 17 && c.geminiBytes == 80 && c.driveBytes == 60);
+  CHECK(SyncTelemetry::counters().driveUploadMs == 16);
+}
 } // namespace
 
 int main() {
   size_t failed = 0;
   for (const Test &test : tests()) {
-    Host::resetClock(); Host::resetNetwork(); NoteFiles::fs().clear();
+    SttClient::endSession(); Host::fakeShaEnabled = false;
+    Host::resetClock(); Host::resetNetwork(); Host::resetNvs(); NoteFiles::fs().clear(); SyncTelemetry::reset();
     try { test.run(); }
     catch (const std::exception &error) {
       ++failed; std::cout << "FAIL " << test.name << ": " << error.what() << '\n';
     }
+    SttClient::endSession(); SyncTelemetry::setObserver(nullptr);
   }
   std::cout << "Host tests: " << tests().size() - failed << '/' << tests().size()
             << " OK" << (failed ? " (FALHOU)" : "") << '\n';

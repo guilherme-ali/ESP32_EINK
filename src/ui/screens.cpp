@@ -256,4 +256,33 @@ void drawSaved(Canvas &canvas, EPaperDisplay &epd, int noteNumber) {
   epd.displayPart();
 }
 
+void drawSyncProgress(Canvas &canvas, EPaperDisplay &epd, const char *noteLabel,
+                      const char *phaseLabel, unsigned percent, bool estimated,
+                      int currentNote, int completedNotes, int totalNotes,
+                      uint32_t elapsedMs, uint32_t remainingMs, bool overdue) {
+  canvas.clear(EPD_WHITE);
+  drawHeader(canvas, "sincronizando");
+  char line[48];
+  snprintf(line, sizeof(line), "Nota %d de %d", currentNote, totalNotes);
+  canvas.drawText(kMarginX, 39, line, EPD_BLACK, FONT_BODY);
+  canvas.drawWrappedText(kMarginX, 57, noteLabel ? noteLabel : "", EPD_BLACK,
+                         FONT_BODY, kContentW, 18, 0, 1);
+  canvas.drawWrappedText(kMarginX, 75, phaseLabel ? phaseLabel : "preparando", EPD_BLACK,
+                         FONT_EMPHASIS, kContentW, 20, 0, 1);
+  snprintf(line, sizeof(line), "Nota atual: %s%u%%", estimated ? "~" : "", percent > 100 ? 100 : percent);
+  canvas.drawText(kMarginX, 99, line, EPD_BLACK, FONT_BODY);
+  canvas.drawProgressBar(kMarginX, 118, kContentW, 12, percent > 100 ? 100 : percent, 100, EPD_BLACK);
+  snprintf(line, sizeof(line), "Lote: %d / %d concluidas", completedNotes, totalNotes);
+  canvas.drawText(kMarginX, 136, line, EPD_BLACK, FONT_BODY);
+  canvas.drawProgressBar(kMarginX, 153, kContentW, 12, completedNotes, totalNotes, EPD_BLACK);
+  uint32_t seconds = elapsedMs / 1000, remaining = (remainingMs + 999) / 1000;
+  if (overdue) snprintf(line, sizeof(line), "%lu:%02lu | tempo excedido",
+                        (unsigned long)(seconds / 60), (unsigned long)(seconds % 60));
+  else snprintf(line, sizeof(line), "%lu:%02lu | falta ~%lu:%02lu",
+                 (unsigned long)(seconds / 60), (unsigned long)(seconds % 60),
+                 (unsigned long)(remaining / 60), (unsigned long)(remaining % 60));
+  drawFooter(canvas, line);
+  epd.displayPart();
+}
+
 } // namespace Screens

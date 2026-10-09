@@ -115,20 +115,21 @@ bool compatibleTranscribe(const Settings &cfg, const String &host, uint16_t port
   for (unsigned attempt = 0; attempt <= kMaxRetries; ++attempt) {
     Response r;
     d.model = model;
-    WiFiClientSecure client;
+    setPhase(SyncTelemetry::Phase::GeminiUpload, "áudio");
+    WiFiClientSecure &client = sharedClient();
     bool ok = beginRequest(client, host, port, "POST", transcriptionPath(path),
                             cfg.sttApiKey, false, contentType.c_str(), length, "", r);
     if (ok) {
       bool sent = write(client, prefix) && writeFile(client, wav) && write(client, suffix);
+      if (sent) setPhase(SyncTelemetry::Phase::Transcribing);
       ok = finishRequest(client, r, sent);
     }
-    client.stop();
     if (ok && r.status == 200 && extractCompatible(r, false, out, outLen, d)) {
       return true;
     }
     if (r.status != 200 || !ok) recordFailure(r, d);
     if (!retryable(r) || attempt == kMaxRetries) return false;
-    backoff(attempt, retryHint(r));
+    backoff(attempt, retryHint(r), r.status == 429);
   }
   return false;
 }
@@ -146,22 +147,25 @@ bool compatibleSummary(const Settings &cfg, const String &host, uint16_t port,
   if (!join(body, {"{\"model\":", qm.c_str(), ",\"messages\":[{\"role\":\"system\",\"content\":",
                   qp.c_str(), "},{\"role\":\"user\",\"content\":", qt.c_str(),
                   "}],\"max_tokens\":4096,\"stream\":false}"})) {
-    d.error = "memória insuficiente ou pedido JSON excede 128 KiB"; return false;
+    d.error = "memória insuficiente ou " + bodyLimitError("pedido JSON"); return false;
   }
   for (unsigned attempt = 0; attempt <= kMaxRetries; ++attempt) {
     Response r;
     d.model = model;
-    bool ok = requestJson(host, port, "POST", chatPath(path), cfg.sttApiKey, false, body, r);
+    setPhase(SyncTelemetry::Phase::Markdown);
+    bool ok = requestJson(host, port, "POST", chatPath(path), cfg.sttApiKey, false, body, r,
+                          "", kReadTimeoutMs, SyncTelemetry::Phase::Markdown);
     if (ok && r.status == 200 && extractCompatible(r, true, out, outLen, d)) return true;
     if (r.status != 200 || !ok) recordFailure(r, d);
     if (!retryable(r) || attempt == kMaxRetries) return false;
-    backoff(attempt, retryHint(r));
+    backoff(attempt, retryHint(r), r.status == 429);
   }
   return false;
 }
 } // namespace
 
 bool SttClient::transcribe(const Settings &cfg, const char *wavPath, char *outText, size_t outLen) {
+  setPhase(SyncTelemetry::Phase::Preparing);
   String host, path;
   uint16_t port = 443;
   if (!prepare(cfg, outText, outLen, host, port, path, diagnostics_)) return false;
@@ -182,13 +186,14 @@ bool SttClient::transcribe(const Settings &cfg, const char *wavPath, char *outTe
 
 bool SttClient::generateSummary(const Settings &cfg, const char *transcriptText,
                                 char *outMarkdown, size_t outLen) {
+  setPhase(SyncTelemetry::Phase::Preparing);
   String host, path;
   uint16_t port = 443;
   if (!prepare(cfg, outMarkdown, outLen, host, port, path, diagnostics_)) return false;
   size_t length = transcriptText ? strnlen(transcriptText, kMaxTextLen) : 0;
   if (!length || length >= kMaxTextLen || !validUtf8(transcriptText, length) ||
       !hasText(transcriptText)) {
-    diagnostics_.error = "transcrição vazia, UTF-8 inválido ou acima de 32767 bytes";
+    diagnostics_.error = "transcrição vazia, UTF-8 inválido ou acima de " + String(kMaxTextLen - 1) + " bytes";
     return false;
   }
   bool ok;
@@ -201,3 +206,16 @@ bool SttClient::generateSummary(const Settings &cfg, const char *transcriptText,
   if (!ok) outMarkdown[0] = '\0';
   return ok;
 }
+
+void SttClient::cleanupPending(const Settings &cfg) {
+  String host, path;
+  uint16_t port = 443;
+  if (HttpClient::parseHttpsUrl(cfg.sttEndpoint, host, port, path)) {
+    host.toLowerCase();
+    while (host.endsWith(".")) host.remove(host.length() - 1);
+    if (host == "generativelanguage.googleapis.com" && port == 443) GeminiClient::cleanupPending(cfg);
+  }
+}
+
+void SttClient::beginBatch() { GeminiClient::beginBatch(); }
+void SttClient::endSession() { GeminiClient::endSession(); }

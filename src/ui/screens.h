@@ -34,7 +34,13 @@ void drawAbout(Canvas &canvas, EPaperDisplay &epd, int noteCount, uint64_t usedB
                uint64_t totalBytes);
 
 void drawSyncSummary(Canvas &canvas, EPaperDisplay &epd, int transcribed, int uploaded,
-                      int failed, int totalPending);
+                       int failed, int totalPending);
+
+// Regioes fixas: nao quebra textos sobre as duas barras do painel 200x200.
+void drawSyncProgress(Canvas &canvas, EPaperDisplay &epd, const char *noteLabel,
+                      const char *phaseLabel, unsigned percent, bool estimated,
+                      int currentNote, int completedNotes, int totalNotes,
+                      uint32_t elapsedMs, uint32_t remainingMs, bool overdue);
 
 enum class StateIcon { Activity, Wifi };
 

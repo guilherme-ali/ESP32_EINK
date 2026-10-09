@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <cstdint>
 
 namespace Fixtures {
 inline const char flash[] = R"({"modelVersion":"gemini-test-version","candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"secreto","thought":true},{"text":"Olá "},{"inlineData":{"data":"ignored"}},{"text":"mundo"}]}}]})";
@@ -19,6 +20,14 @@ inline std::string wav() {
   data.replace(12, 4, "fmt "); data[16] = 16; data[20] = 1; data[22] = 1;
   data[24] = '\x80'; data[25] = '\x3e'; data[28] = '\x00'; data[29] = '\x7d';
   data[32] = 2; data[34] = 16; data.replace(36, 4, "data"); data[40] = 16;
+  return data;
+}
+inline std::string sizedWav(size_t size) {
+  std::string data = wav(); data.resize(size, '\x25');
+  auto word = [&data](size_t offset, uint32_t value) {
+    for (unsigned i = 0; i < 4; ++i) data[offset + i] = static_cast<char>(value >> (8 * i));
+  };
+  word(4, static_cast<uint32_t>(size - 8)); word(40, static_cast<uint32_t>(size - 44));
   return data;
 }
 }

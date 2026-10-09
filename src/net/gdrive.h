@@ -1,6 +1,7 @@
 #pragma once
 #include <Arduino.h>
 #include "settings.h"
+#include "http_client.h"
 
 enum class SyncStage {
   Idle,
@@ -89,11 +90,16 @@ public:
 
   // Envia wavPath (e txtPath / mdPath, se existirem) para a pasta do app no
   // Drive, criando a pasta na primeira vez. Renova o access token
-  // sozinho a partir do refresh_token salvo. Suporta upload retomavel e
-  // salva progresso em NoteSyncState.
+  // sozinho a partir do refresh_token salvo. Usa multipart ate 5 MiB,
+  // retomavel acima disso e preserva sessoes antigas. Salva os IDs/progresso
+  // em NoteSyncState antes das mutacoes. Os arquivos devem ficar imoveis
+  // durante o job; guardas locais recusam mudancas antes de confirmar sucesso.
   bool uploadNote(SettingsStore &settings, const char *wavPath,
                   const char *txtPath = nullptr, const char *mdPath = nullptr,
                   SyncProgressFn onProgress = nullptr);
+
+  // Encerrar o lote antes de desligar Wi-Fi. O token valido permanece em RAM.
+  void endSession();
 
   // Consulta estado de sincronizacao de uma nota.
   static bool getNoteSyncState(const char *wavPath, NoteSyncState &outState);
@@ -108,6 +114,14 @@ private:
   struct Job;
   String lastError_;
   int lastStatusCode_ = 0;
+  HttpClient::Connection driveConnection_;
+  String cachedAccessToken_;
+  String credentialClientId_, credentialSecret_, credentialRefresh_;
+  uint32_t credentialGeneration_ = 0;
+  uint32_t accessTokenDeadline_ = 0;
+  String validatedFolder_;
+  uint32_t folderValidatedAt_ = 0;
+  void bindCredentials(const Settings &cfg);
   bool fail(const String &message, int statusCode);
-  bool refreshAccessToken(Settings &cfg, String &outAccessToken);
+  bool refreshAccessToken(Settings &cfg, String &outAccessToken, bool force = false);
 };

@@ -18,6 +18,7 @@ SOURCES = [ROOT / "src" / "net" / name for name in
            ("http_client.cpp", "json_utils.cpp", "gemini_client.cpp", "stt.cpp",
             "settings.cpp", "gdrive.cpp")]
 SOURCES.append(ROOT / "src" / "storage" / "note_files.cpp")
+SOURCES.extend(ROOT / "src" / "sync" / name for name in ("telemetry.cpp", "progress_model.cpp"))
 CJSON_TAG = "v1.7.17"  # Same version as the installed Arduino ESP32 SDK header.
 CJSON_ORIGIN = f"https://raw.githubusercontent.com/DaveGamble/cJSON/{CJSON_TAG}/"
 
@@ -89,7 +90,8 @@ def main() -> int:
     if not cxx:
         raise RuntimeError(f"compilador host não encontrado: {args.cxx}")
     cjson = find_cjson(args.cjson_dir)
-    snapshot = {path: hashlib.sha256(path.read_bytes()).digest() for path in SOURCES}
+    production = list((ROOT / "src").rglob("*.cpp")) + list((ROOT / "src").rglob("*.h"))
+    snapshot = {path: hashlib.sha256(path.read_bytes()).digest() for path in production}
     flags = ["-std=c++17", "-O1", "-g", "-Wall", "-Wextra",
              "-ffunction-sections", "-fdata-sections", "-DCJSON_HIDE_SYMBOLS",
              "-I" + str(HOST / "stubs"), "-I" + str(cjson), "-I" + str(ROOT / "src" / "net")]
@@ -98,7 +100,7 @@ def main() -> int:
     compiled = run([cxx, "-x", "c", "-std=c89", "-O1", "-DCJSON_HIDE_SYMBOLS",
                     "-ffunction-sections", "-fdata-sections", "-c", str(cjson / "cJSON.c"),
                     "-o", str(obj)])
-    for suite in ("host_tests", "storage_tests"):
+    for suite in ("host_tests", "storage_tests", "gemini_tests"):
         exe = BUILD / (suite + (".exe" if os.name == "nt" else ""))
         suite_compiled = compiled and run([
             cxx, *flags, *(str(path) for path in SOURCES), str(HOST / "fakes.cpp"),
@@ -106,9 +108,23 @@ def main() -> int:
             diagnostics=True)
         print(f"Host build ({suite}): {'OK' if suite_compiled else 'FALHOU'}")
         if suite_compiled:
-            ok = run([str(exe)], timeout=30) and ok
+            if suite == "gemini_tests":
+                listed = subprocess.run([str(exe), "--list"], capture_output=True, timeout=10, check=True)
+                names = listed.stdout.decode("utf-8").splitlines()
+                passed = sum(run([str(exe), str(index)], timeout=30) for index in range(len(names)))
+                print(f"Gemini integration (processos isolados): {passed}/{len(names)} OK")
+                ok = bool(names) and passed == len(names) and ok
+            else:
+                ok = run([str(exe)], timeout=30) and ok
         else:
             ok = False
+    # Prova de portabilidade: nenhum include do Arduino/SDK nem mocks no modelo.
+    portable = BUILD / ("progress_tests" + (".exe" if os.name == "nt" else ""))
+    portable_ok = run([cxx, "-std=c++17", "-O1", "-Wall", "-Wextra", "-Werror",
+                       str(ROOT / "src" / "sync" / "progress_model.cpp"),
+                       str(HOST / "progress_tests.cpp"), "-o", str(portable)], diagnostics=True)
+    print(f"Host build (progress_tests, sem SDK): {'OK' if portable_ok else 'FALHOU'}")
+    ok = (run([str(portable)], timeout=30) if portable_ok else False) and ok
     # There was no existing project linter/test runner; this lint is opt-in.
     if args.cppcheck:
         lint = shutil.which("cppcheck")
@@ -128,8 +144,10 @@ def main() -> int:
             ok = lint_ok and ok
         else:
             print("cppcheck: indisponível (opcional)")
-    if any(hashlib.sha256(path.read_bytes()).digest() != digest
-           for path, digest in snapshot.items()):
+    current_production = set((ROOT / "src").rglob("*.cpp")) | set((ROOT / "src").rglob("*.h"))
+    if current_production != set(snapshot) or any(
+            not path.is_file() or hashlib.sha256(path.read_bytes()).digest() != digest
+            for path, digest in snapshot.items()):
         print("Host: produção mudou durante a execução; rode o checker novamente")
         ok = False
     return 0 if ok else 1

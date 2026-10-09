@@ -1,4 +1,5 @@
 #include "wifi_mgr.h"
+#include "../storage/note_files.h"
 #include <LittleFS.h>
 
 bool WifiManager::connect(SettingsStore &settings, uint32_t timeoutMs) {
@@ -170,7 +171,7 @@ void WifiManager::handleGetNote() {
     return;
   }
   String path = "/notes/" + name;
-  File f = LittleFS.open(path, FILE_READ);
+  File f = NoteFiles::fs().open(path, FILE_READ);
   if (!f) {
     server_.send(404, "text/plain", "nao encontrado");
     return;
@@ -213,14 +214,25 @@ void WifiManager::handleRoot() {
   html += cfg.sttEndpoint;
   html += F("'><label>Modelo</label><input name='stt_model' value='");
   html += cfg.sttModel;
-  html += F("'><label>API key (deixe em branco p/ manter)</label>"
-             "<input name='stt_key' type='password'>");
+  html += F("'><label>Modelo do Markdown</label><input name='summary_model' value='");
+  html += cfg.summaryModel;
+  html += F("'><label><input style='width:auto' type='checkbox' name='ai_auto' value='1'");
+  if (cfg.sttAutoModel) html += F(" checked");
+  html += F("> Escolha automatica: Transcribe / Flash / Flash-Lite</label>"
+            "<p>Transcricao: 3.5 Transcribe, 3.8 Flash, 3.5 Flash-Lite. Markdown: 3.8 Flash, 3.5 Flash-Lite.</p>"
+            "<label><input style='width:auto' type='checkbox' name='free_confirmed' value='1'");
+  if (cfg.geminiFreeConfirmed) html += F(" checked");
+  html += F("> Confirmo que esta chave pertence a projeto gratuito, sem faturamento pago</label>"
+            "<p>A API nao informa o plano de faturamento pela lista de modelos. Quando a cota acabar, a nota fica pendente.</p>"
+            "<label>API key (deixe em branco p/ manter)</label>"
+              "<input name='stt_key' type='password'>");
 
   html += F("<h3>Google Drive</h3>"
              "<label>Client ID</label><input name='drive_id' value='");
   html += cfg.driveClientId;
   html += F("'><label>Client secret (deixe em branco p/ manter)</label>"
-             "<input name='drive_secret' type='password'>");
+              "<input name='drive_secret' type='password'>"
+              "<label><input style='width:auto' type='checkbox' name='drive_repair' value='1'> Refazer autorizacao do Drive ao conectar</label>");
 
   html += F("<button type='submit'>Salvar</button></form></body></html>");
 
@@ -249,10 +261,16 @@ void WifiManager::handleSave() {
     }
     settings_->saveWifiNetwork(ssid.c_str(), finalPass.c_str());
   }
-  settings_->saveStt(sttEndpoint.c_str(), sttModel.c_str(),
-                      sttKey.length() > 0 ? sttKey.c_str() : cfg.sttApiKey);
-  settings_->saveDriveApp(driveId.c_str(),
-                           driveSecret.length() > 0 ? driveSecret.c_str() : cfg.driveClientSecret);
+  String summaryModel = server_.arg("summary_model");
+  if (!summaryModel.length()) summaryModel = cfg.summaryModel;
+  bool ok = settings_->saveStt(sttEndpoint.c_str(), sttModel.c_str(),
+                       sttKey.length() > 0 ? sttKey.c_str() : cfg.sttApiKey);
+  ok = settings_->saveAiPolicy(server_.hasArg("ai_auto"), summaryModel.c_str(),
+                               server_.hasArg("free_confirmed")) && ok;
+  ok = settings_->saveDriveApp(driveId.c_str(),
+                            driveSecret.length() > 0 ? driveSecret.c_str() : cfg.driveClientSecret) && ok;
+  if (server_.hasArg("drive_repair")) ok = settings_->saveDriveRefreshToken("") && ok;
+  if (!ok) { server_.send(400, "text/plain", "Configuracao invalida ou nao foi possivel salvar."); return; }
 
   server_.send(200, "text/html",
                "<html><body><h3>Salvo. Reiniciando...</h3></body></html>");

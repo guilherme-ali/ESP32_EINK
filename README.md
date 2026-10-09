@@ -70,9 +70,15 @@ volta para a lista de notas.
    - **Endpoint**: `https://generativelanguage.googleapis.com` (Gemini)
      ou a URL de `.../audio/transcriptions` de um provedor
      OpenAI-compatível (ex.: Groq)
-   - **Modelo**: `gemini-2.5-flash` (ou o modelo atual do Gemini — eles
-     são descontinuados de tempos em tempos, veja o erro na serial se
-     parar de funcionar) ou `whisper-large-v3` para Groq
+    - **Seleção automática**: transcrição com `gemini-3.5-transcribe`,
+      seguida de `gemini-3.8-flash` e `gemini-3.5-flash-lite` quando
+      necessário; Markdown com 3.8 Flash e alternativa Flash-Lite.
+      No modo manual, os campos **Modelo STT** e **Modelo do Markdown**
+      são independentes. Para Groq, use um modelo Whisper para STT.
+    - **Projeto gratuito confirmado**: confirme que a chave pertence
+      ao tier gratuito, sem faturamento pago. Os nomes dos modelos não
+      comprovam o plano da conta; o firmware utiliza uma lista restrita
+      de modelos e deixa a nota pendente ao esgotar as opções permitidas.
    - **API key**: gerada em [aistudio.google.com/apikey](https://aistudio.google.com/apikey)
      (Gemini, gratuito) ou no console do provedor escolhido
 4. **Google Drive** (opcional, para sincronizar): crie um projeto no
@@ -125,6 +131,61 @@ remova essa linha se não for o seu caso.
 O particionamento (`partitions.csv`) reserva ~3 MB para o firmware e
 o resto (~4,75 MB na versão V2 da placa) para o LittleFS, onde ficam
 as gravações — sem cartão SD isso dá poucos minutos de áudio no total.
+
+## Sincronização resiliente
+
+- O WAV é finalizado e validado antes de transcrever. TXT/Markdown são
+  escritos em arquivos temporários, verificados e promovidos ao destino.
+- A transcrição pronta é reutilizada quando falta apenas Markdown. O
+  modelo efetivamente utilizado e o último erro ficam no irmão `.ai`.
+- O Drive usa IDs pré-gerados persistidos, sessões completas e progresso
+  salvo para WAV/TXT/MD no irmão `.sync` (schema v3). Após queda de conexão,
+  consulta o servidor antes de reenviar bytes. Conclusão exige GET remoto
+  com tamanho e MD5 iguais ao local, além de persistência local bem-sucedida.
+- Marcadores antigos `.snc`/`.sync` são reconciliados por nome, pasta,
+  tamanho e hash. Nova autorização exige nova verificação do destino.
+- A sincronização manual também verifica os arquivos remotos já enviados,
+  permitindo recuperar arquivo/pasta apagados. Não apaga áudio local.
+- O portal oferece **Refazer autorização do Drive**. Alterar as credenciais
+  OAuth invalida a autorização anterior; PWR cancela a espera de pareamento.
+- A tela final informa a etapa/erro e reinicia o contador de inatividade.
+
+### Memória interna e futuro microSD
+
+`src/storage/note_files.*` centraliza o backend das notas (LittleFS nesta
+versão). São reservados 256 KiB para textos/metadados; o tempo de gravação
+considera o espaço disponível e a gravação para antes de consumir essa
+reserva. WAV mono 16-bit a 16 kHz consome 32.000 bytes/s. A partição inteira
+equivale a aproximadamente 2,6 minutos antes da reserva, arquivos existentes
+e overhead. PSRAM guarda buffers temporários, não substitui armazenamento.
+
+O backend permite integração futura de SD, que ainda não está implementada.
+Não há transcrição Live; o arquivo é processado depois da gravação.
+
+### Verificações e diagnóstico USB
+
+```powershell
+& "$env:USERPROFILE\.platformio\penv\Scripts\python.exe" "tools/check_project.py" --cppcheck
+& "$env:USERPROFILE\.platformio\penv\Scripts\pio.exe" run -e esp32-s3-devkitc-1 -e battery
+```
+
+Os testes host exercitam os parsers reais, arquivos/estado, persistência NVS
+e protocolo Drive com rede simulada; detalhes em `test/host/README.md`.
+
+Para testes com o firmware de depuração e cabo conectado, **acorde o ESP32
+antes de cada sessão**; o console não tenta reconectar indefinidamente:
+
+```powershell
+& "$env:USERPROFILE\.platformio\penv\Scripts\python.exe" "tools/device_console.py" "stayawake 1" --timeout 3
+& "$env:USERPROFILE\.platformio\penv\Scripts\python.exe" "tools/device_console.py" status --timeout 3
+& "$env:USERPROFILE\.platformio\penv\Scripts\python.exe" "tools/device_console.py" sync-one --timeout 420
+& "$env:USERPROFILE\.platformio\penv\Scripts\python.exe" "tools/device_console.py" "stayawake 0" --timeout 3
+```
+
+`status` mostra espaço, modelos, flags e erros sem chaves/tokens. `sync-one`
+processa a nota mais recente; `sync` processa todas. As chamadas são
+síncronas e têm tentativas e prazos limitados; o botão não cancela inferência
+TLS em andamento. O ambiente `battery` é o destinado a uso fora do cabo.
 
 ## Limitações conhecidas
 

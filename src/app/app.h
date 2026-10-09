@@ -47,6 +47,7 @@ public:
   // Chamar toda iteracao do loop() principal: atualiza a tela de
   // gravacao a cada segundo e verifica o timeout de inatividade.
   void loop();
+  void diagnosticCommand(const String &command);
 
 private:
   enum class Screen {
@@ -65,6 +66,7 @@ private:
     WifiScanList,
     KeyboardSsid,
     KeyboardPassword,
+    SyncResult,
   };
 
   EPaperDisplay &epd_;
@@ -113,6 +115,9 @@ private:
   uint32_t recordingStartMs_ = 0;
   char lastTxtPath_[48] = "";
   char lastMdPath_[48] = "";
+  String pipelineError_;
+  bool syncResultForNote_ = false;
+  void showSyncResult(const String &message, bool forNote = false);
 
   int textViewerPage_ = 0;
   int textViewerTotalPages_ = 1;
@@ -120,6 +125,7 @@ private:
   char textViewerBuf_[SttClient::kMaxTextLen] = "";
 
   uint32_t lastActivityMs_ = 0;
+  bool diagnosticAwake_ = false;
 
   void markActivity();
   uint32_t bytesPerSec() const;

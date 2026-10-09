@@ -45,8 +45,9 @@ bool jsonGetString(const String &body, const char *path, char *out, size_t outLe
   bool ok = item && cJSON_IsString(item) && item->valuestring &&
             item->valuestring[0] != '\0';
   if (ok) {
-    strncpy(out, item->valuestring, outLen - 1);
-    out[outLen - 1] = '\0';
+    size_t length = strlen(item->valuestring);
+    if (length >= outLen) ok = false;
+    else memcpy(out, item->valuestring, length + 1);
   }
   cJSON_Delete(root);
   return ok;

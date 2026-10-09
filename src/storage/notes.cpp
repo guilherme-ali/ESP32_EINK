@@ -2,6 +2,8 @@
 #include "../audio/wav.h"
 #include <LittleFS.h>
 #include <string.h>
+#include "note_files.h"
+#include "../net/gdrive.h"
 
 namespace {
 constexpr const char *kNotesDir = "/notes";
@@ -18,7 +20,7 @@ bool g_dirty = true; // forca a primeira varredura
 // nao mexe em /notes, entao nao precisa reler o diretorio a cada tecla.
 void rescan() {
   g_cacheCount = 0;
-  File dir = LittleFS.open(kNotesDir);
+  File dir = NoteFiles::fs().open(kNotesDir);
   if (!dir || !dir.isDirectory()) return;
 
   File f = dir.openNextFile();
@@ -54,7 +56,7 @@ void rescan() {
   // abrir/ler conteudo), pra marcar quais .wav ja tem .txt/.snc do
   // lado. Substitui um LittleFS.exists() por nota (medido em ~13ms
   // cada nesta flash) por comparacoes de string em memoria.
-  File dir2 = LittleFS.open(kNotesDir);
+  File dir2 = NoteFiles::fs().open(kNotesDir);
   if (dir2 && dir2.isDirectory()) {
     File f2 = dir2.openNextFile();
     while (f2) {
@@ -70,8 +72,8 @@ void rescan() {
           String label = dot >= 0 ? base.substring(0, dot) : base;
           for (int i = 0; i < g_cacheCount; i++) {
             if (label == g_cache[i].label) {
-              if (isTxt) g_cache[i].hasTxt = true;
-              else if (isMd) g_cache[i].hasMd = true;
+               if (isTxt) g_cache[i].hasTxt = f2.size() > 0;
+               else if (isMd) g_cache[i].hasMd = f2.size() > 0;
               else g_cache[i].hasSnc = true;
               break;
             }
@@ -80,6 +82,15 @@ void rescan() {
       }
       f2 = dir2.openNextFile();
     }
+  }
+
+  for (int i = 0; i < g_cacheCount; ++i) {
+    String txt(g_cache[i].path); txt.replace(".wav", ".txt");
+    String md(g_cache[i].path); md.replace(".wav", ".md");
+    NoteFiles::recoverText(txt); NoteFiles::recoverText(md);
+    g_cache[i].hasTxt = NoteFiles::validText(txt);
+    g_cache[i].hasMd = NoteFiles::validText(md);
+    g_cache[i].hasSnc = !GDriveClient::needsUpload(g_cache[i].path, false);
   }
 
   // insertion sort descendente por label (timestamp) - poucas dezenas
@@ -103,8 +114,8 @@ void rescanIfDirty() {
 } // namespace
 
 bool NotesStore::begin() {
-  if (!LittleFS.exists(kNotesDir)) {
-    return LittleFS.mkdir(kNotesDir);
+  if (!NoteFiles::fs().exists(kNotesDir)) {
+    return NoteFiles::fs().mkdir(kNotesDir);
   }
   return true;
 }
@@ -113,6 +124,9 @@ void NotesStore::buildPath(const RtcDateTime &now, char *outPath, size_t outLen)
   char stamp[16];
   Rtc::formatForFilename(now, stamp, sizeof(stamp));
   snprintf(outPath, outLen, "%s/%s.wav", kNotesDir, stamp);
+  for (unsigned suffix = 1; NoteFiles::fs().exists(outPath) && suffix < 10000; ++suffix) {
+    snprintf(outPath, outLen, "%s/%s-%u.wav", kNotesDir, stamp, suffix);
+  }
 }
 
 int NotesStore::count() {
@@ -133,7 +147,8 @@ int NotesStore::countPendingSync(bool sttConfigured, bool driveConfigured) {
   int pending = 0;
   for (int i = 0; i < g_cacheCount; i++) {
     bool needsAi = sttConfigured && (!g_cache[i].hasTxt || !g_cache[i].hasMd);
-    bool needsDrive = driveConfigured && !g_cache[i].hasSnc;
+    bool needsDrive = driveConfigured && (!g_cache[i].hasSnc ||
+                       (sttConfigured && (!g_cache[i].hasTxt || !g_cache[i].hasMd)));
     if (needsAi || needsDrive) pending++;
   }
   return pending;
@@ -148,20 +163,12 @@ bool NotesStore::deleteAt(int index) {
   if (index < 0 || index >= g_cacheCount) return false;
 
   String wavPath = String(g_cache[index].path);
-  String txtPath = wavPath; txtPath.replace(".wav", ".txt");
-  String mdPath = wavPath; mdPath.replace(".wav", ".md");
-  String sncPath = wavPath; sncPath.replace(".wav", ".snc");
-  String syncPath = wavPath; syncPath.replace(".wav", ".sync");
-  String syncTmp = wavPath; syncTmp.replace(".wav", ".sync.tmp");
 
-  bool ok = LittleFS.remove(wavPath);
-  if (g_cache[index].hasTxt) LittleFS.remove(txtPath);
-  if (g_cache[index].hasMd) LittleFS.remove(mdPath);
-  if (g_cache[index].hasSnc) {
-    LittleFS.remove(sncPath);
-    LittleFS.remove(syncPath);
-    LittleFS.remove(syncTmp);
-  }
+  bool ok = NoteFiles::fs().remove(wavPath);
+  if (!ok) return false;
+  String base = wavPath.substring(0, wavPath.length() - 4);
+  const char *extensions[] = {".txt", ".md", ".snc", ".sync", ".sync.tmp", ".txt.tmp", ".md.tmp", ".ai", ".ai.tmp"};
+  for (const char *extension : extensions) NoteFiles::fs().remove(base + extension);
   g_dirty = true;
   return ok;
 }
@@ -171,19 +178,11 @@ int NotesStore::deleteAll() {
   int removed = 0;
   for (int i = 0; i < g_cacheCount; i++) {
     String wavPath = String(g_cache[i].path);
-    String txtPath = wavPath; txtPath.replace(".wav", ".txt");
-    String mdPath = wavPath; mdPath.replace(".wav", ".md");
-    String sncPath = wavPath; sncPath.replace(".wav", ".snc");
-    String syncPath = wavPath; syncPath.replace(".wav", ".sync");
-    String syncTmp = wavPath; syncTmp.replace(".wav", ".sync.tmp");
-    if (LittleFS.remove(wavPath)) removed++;
-    if (g_cache[i].hasTxt) LittleFS.remove(txtPath);
-    if (g_cache[i].hasMd) LittleFS.remove(mdPath);
-    if (g_cache[i].hasSnc) {
-      LittleFS.remove(sncPath);
-      LittleFS.remove(syncPath);
-      LittleFS.remove(syncTmp);
-    }
+    if (!NoteFiles::fs().remove(wavPath)) continue;
+    removed++;
+    String base = wavPath.substring(0, wavPath.length() - 4);
+    const char *extensions[] = {".txt", ".md", ".snc", ".sync", ".sync.tmp", ".txt.tmp", ".md.tmp", ".ai", ".ai.tmp"};
+    for (const char *extension : extensions) NoteFiles::fs().remove(base + extension);
   }
   g_cacheCount = 0;
   g_dirty = true;
@@ -192,6 +191,6 @@ int NotesStore::deleteAll() {
 
 void NotesStore::markDirty() { g_dirty = true; }
 
-uint64_t NotesStore::totalBytes() { return LittleFS.totalBytes(); }
-uint64_t NotesStore::usedBytes() { return LittleFS.usedBytes(); }
-uint64_t NotesStore::freeBytes() { return LittleFS.totalBytes() - LittleFS.usedBytes(); }
+uint64_t NotesStore::totalBytes() { return NoteFiles::totalBytes(); }
+uint64_t NotesStore::usedBytes() { return NoteFiles::usedBytes(); }
+uint64_t NotesStore::freeBytes() { return NoteFiles::freeBytes(); }

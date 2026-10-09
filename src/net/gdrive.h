@@ -2,10 +2,6 @@
 #include <Arduino.h>
 #include "settings.h"
 
-#pragma once
-#include <Arduino.h>
-#include "settings.h"
-
 enum class SyncStage {
   Idle,
   Authenticating,
@@ -31,23 +27,40 @@ struct SyncProgress {
 using SyncProgressFn = void (*)(const SyncProgress &progress);
 
 struct NoteSyncState {
-  static constexpr uint8_t kCurrentVersion = 1;
+  static constexpr uint8_t kCurrentVersion = 3;
   uint8_t version = kCurrentVersion;
+  uint32_t authGeneration = 0;
 
   bool wavUploaded = false;
   bool txtUploaded = false;
   bool mdUploaded = false;
   bool fullySynced = false;
 
-  char wavDriveId[48] = "";
-  char txtDriveId[48] = "";
-  char mdDriveId[48] = "";
-
-  char wavSessionUrl[256] = "";
+  // Um ID pode estar apenas reservado: somente Uploaded + hash verificado
+  // representa sucesso. Strings de sessao nunca sao truncadas.
+  char wavDriveId[128] = "";
+  char txtDriveId[128] = "";
+  char mdDriveId[128] = "";
+  bool wavIdReserved = false;
+  bool txtIdReserved = false;
+  bool mdIdReserved = false;
+  char folderId[128] = "";
+  char pendingFolderId[128] = ""; // reserva antes do POST da pasta
+  String wavSessionUrl;
+  String txtSessionUrl;
+  String mdSessionUrl;
   size_t wavBytesUploaded = 0;
+  size_t txtBytesUploaded = 0;
+  size_t mdBytesUploaded = 0;
+  char wavMd5[33] = "";
+  char txtMd5[33] = "";
+  char mdMd5[33] = "";
+  size_t wavSize = 0;
+  size_t txtSize = 0;
+  size_t mdSize = 0;
 
   int lastStatusCode = 0;
-  char lastError[64] = "";
+  char lastError[384] = "";
   uint32_t lastAttemptTime = 0;
 
   static String statePathFor(const char *wavPath);
@@ -68,7 +81,11 @@ public:
   // esperando (poll) ate o usuario aprovar em outro aparelho ou o
   // codigo expirar. Salva o refresh_token em SettingsStore ao terminar.
   using ShowCodeFn = void (*)(const char *userCode, const char *verificationUrl);
-  bool pairDevice(SettingsStore &settings, ShowCodeFn showCode);
+  // service() atende a UI durante a espera; false cancela. Nao e chamada
+  // dentro das operacoes TLS bloqueantes (limitadas pelos timeouts HTTP).
+  using ServiceFn = bool (*)();
+  bool pairDevice(SettingsStore &settings, ShowCodeFn showCode,
+                  ServiceFn service = nullptr);
 
   // Envia wavPath (e txtPath / mdPath, se existirem) para a pasta do app no
   // Drive, criando a pasta na primeira vez. Renova o access token
@@ -80,14 +97,17 @@ public:
 
   // Consulta estado de sincronizacao de uma nota.
   static bool getNoteSyncState(const char *wavPath, NoteSyncState &outState);
+  // Consulta local conservadora: arquivos atuais, IDs, tamanhos e hashes.
+  // requireText exige os dois irmaos .txt/.md validos (STT configurado).
+  static bool needsUpload(const char *wavPath, bool requireText);
+
+  const String &lastError() const { return lastError_; }
+  int lastStatusCode() const { return lastStatusCode_; }
 
 private:
+  struct Job;
+  String lastError_;
+  int lastStatusCode_ = 0;
+  bool fail(const String &message, int statusCode);
   bool refreshAccessToken(Settings &cfg, String &outAccessToken);
-  bool ensureFolder(Settings &cfg, const String &accessToken, String &outFolderId);
-  bool uploadFileResumable(const String &accessToken, const String &folderId,
-                          const char *localPath, const char *driveName,
-                          const char *mimeType, char *outDriveId, size_t outDriveIdLen,
-                          char *sessionUrlBuf, size_t sessionUrlBufLen,
-                          size_t &confirmedBytes, SyncProgressFn onProgress,
-                          SyncStage stage);
 };

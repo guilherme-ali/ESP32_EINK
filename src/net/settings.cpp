@@ -4,6 +4,15 @@
 namespace {
 Preferences prefs;
 constexpr const char *kNamespace = "cfg";
+uint32_t driveGeneration = 1;
+
+bool persistString(const char *key, const String &value) {
+  prefs.putString(key, value);
+  return prefs.isKey(key) && prefs.getString(key, "") == value;
+}
+bool persistBool(const char *key, bool value) {
+  return prefs.putBool(key, value) == 1 && prefs.getBool(key, !value) == value;
+}
 } // namespace
 
 bool SettingsStore::begin() {
@@ -44,10 +53,25 @@ void SettingsStore::load() {
   String model = prefs.getString("sttModel", settings_.sttModel);
   strncpy(settings_.sttModel, model.c_str(), sizeof(settings_.sttModel) - 1);
   prefs.getString("sttApiKey", settings_.sttApiKey, sizeof(settings_.sttApiKey));
+  String summary = prefs.getString("summaryModel", settings_.summaryModel);
+  strlcpy(settings_.summaryModel, summary.c_str(), sizeof(settings_.summaryModel));
+  settings_.sttAutoModel = prefs.getBool("aiAuto", true);
+  settings_.geminiFreeOnly = true;
+  settings_.geminiFreeConfirmed = prefs.getBool("freeConfirmed", false);
+  // Migracao deste aparelho: o proprietario confirmou o projeto gratuito
+  // antes da gravacao desta versao. Novas chaves exigem nova confirmacao.
+  if (!prefs.isKey("aiPolicyV")) {
+    if (!prefs.isKey("freeConfirmed") && strstr(settings_.sttEndpoint, "generativelanguage.googleapis.com") &&
+        settings_.sttApiKey[0] && persistBool("freeConfirmed", true)) {
+      settings_.geminiFreeConfirmed = true;
+    }
+    prefs.putUChar("aiPolicyV", 1);
+  }
   prefs.getString("driveCliId", settings_.driveClientId, sizeof(settings_.driveClientId));
   prefs.getString("driveCliSec", settings_.driveClientSecret, sizeof(settings_.driveClientSecret));
   prefs.getString("driveRefTok", settings_.driveRefreshToken, sizeof(settings_.driveRefreshToken));
   prefs.getString("driveFolder", settings_.driveFolderId, sizeof(settings_.driveFolderId));
+  driveGeneration = settings_.driveAuthGeneration = prefs.getUInt("driveAuthGen", 1);
   settings_.autoSyncEnabled = prefs.getBool("autoSync", false);
   settings_.screensaverTimeoutSec = prefs.getUShort("ssTimeout", 120);
   settings_.audioSampleRateHz = prefs.getUInt("sampleRate", 16000);
@@ -115,34 +139,108 @@ bool SettingsStore::saveFavoriteWifi(const char *ssid) {
 }
 
 bool SettingsStore::saveStt(const char *endpoint, const char *model, const char *apiKey) {
-  strncpy(settings_.sttEndpoint, endpoint, sizeof(settings_.sttEndpoint) - 1);
-  strncpy(settings_.sttModel, model, sizeof(settings_.sttModel) - 1);
-  strncpy(settings_.sttApiKey, apiKey, sizeof(settings_.sttApiKey) - 1);
-  prefs.putString("sttEndpoint", settings_.sttEndpoint);
-  prefs.putString("sttModel", settings_.sttModel);
-  prefs.putString("sttApiKey", settings_.sttApiKey);
+  if (strlen(endpoint) >= sizeof(settings_.sttEndpoint) ||
+      strlen(model) >= sizeof(settings_.sttModel) ||
+      strlen(apiKey) >= sizeof(settings_.sttApiKey)) return false;
+  String oldEndpoint(settings_.sttEndpoint), oldModel(settings_.sttModel), oldKey(settings_.sttApiKey);
+  bool oldConfirmed = settings_.geminiFreeConfirmed;
+  bool changed = strcmp(apiKey, settings_.sttApiKey) != 0 || strcmp(endpoint, settings_.sttEndpoint) != 0;
+  if (changed) {
+    if (!persistBool("freeConfirmed", false)) return false;
+  }
+  String savedEndpoint(endpoint), savedModel(model), savedKey(apiKey);
+  if (!persistString("sttEndpoint", savedEndpoint) || !persistString("sttModel", savedModel) ||
+      !persistString("sttApiKey", savedKey)) {
+    persistString("sttEndpoint", oldEndpoint); persistString("sttModel", oldModel);
+    persistString("sttApiKey", oldKey);
+    if (changed) persistBool("freeConfirmed", oldConfirmed);
+    return false;
+  }
+  if (changed) settings_.geminiFreeConfirmed = false;
+  strlcpy(settings_.sttEndpoint, savedEndpoint.c_str(), sizeof(settings_.sttEndpoint));
+  strlcpy(settings_.sttModel, savedModel.c_str(), sizeof(settings_.sttModel));
+  strlcpy(settings_.sttApiKey, savedKey.c_str(), sizeof(settings_.sttApiKey));
+  return true;
+}
+
+bool SettingsStore::saveAiPolicy(bool automatic, const char *summaryModel, bool freeConfirmed) {
+  if (strlen(summaryModel) >= sizeof(settings_.summaryModel)) return false;
+  String savedModel(summaryModel);
+  bool oldAuto = settings_.sttAutoModel, oldConfirmed = settings_.geminiFreeConfirmed;
+  String oldSummary(settings_.summaryModel);
+  if (!persistBool("aiAuto", automatic) || !persistBool("freeConfirmed", freeConfirmed) ||
+      !persistString("summaryModel", savedModel)) {
+    persistBool("aiAuto", oldAuto); persistBool("freeConfirmed", oldConfirmed);
+    persistString("summaryModel", oldSummary);
+    return false;
+  }
+  settings_.sttAutoModel = automatic;
+  settings_.geminiFreeOnly = true;
+  settings_.geminiFreeConfirmed = freeConfirmed;
+  strlcpy(settings_.summaryModel, savedModel.c_str(), sizeof(settings_.summaryModel));
   return true;
 }
 
 bool SettingsStore::saveDriveApp(const char *clientId, const char *clientSecret) {
-  strncpy(settings_.driveClientId, clientId, sizeof(settings_.driveClientId) - 1);
-  strncpy(settings_.driveClientSecret, clientSecret, sizeof(settings_.driveClientSecret) - 1);
-  prefs.putString("driveCliId", settings_.driveClientId);
-  prefs.putString("driveCliSec", settings_.driveClientSecret);
+  if (strlen(clientId) >= sizeof(settings_.driveClientId) ||
+      strlen(clientSecret) >= sizeof(settings_.driveClientSecret)) return false;
+  bool changed = strcmp(clientId, settings_.driveClientId) != 0 ||
+                 strcmp(clientSecret, settings_.driveClientSecret) != 0;
+  String savedId(clientId), savedSecret(clientSecret);
+  String oldId(settings_.driveClientId), oldSecret(settings_.driveClientSecret);
+  String oldToken(settings_.driveRefreshToken), oldFolder(settings_.driveFolderId);
+  uint32_t oldGeneration = driveGeneration;
+  if (!persistString("driveCliId", savedId) || !persistString("driveCliSec", savedSecret)) {
+    persistString("driveCliId", oldId); persistString("driveCliSec", oldSecret);
+    return false;
+  }
+  if (changed) {
+    if (!saveDriveRefreshToken("") || !saveDriveFolderId("")) {
+      persistString("driveCliId", oldId); persistString("driveCliSec", oldSecret);
+      if (persistString("driveRefTok", oldToken) && persistString("driveFolder", oldFolder) &&
+          prefs.putUInt("driveAuthGen", oldGeneration) == sizeof(uint32_t)) {
+        strlcpy(settings_.driveRefreshToken, oldToken.c_str(), sizeof(settings_.driveRefreshToken));
+        strlcpy(settings_.driveFolderId, oldFolder.c_str(), sizeof(settings_.driveFolderId));
+        driveGeneration = settings_.driveAuthGeneration = oldGeneration;
+      }
+      return false;
+    }
+  }
+  strlcpy(settings_.driveClientId, savedId.c_str(), sizeof(settings_.driveClientId));
+  strlcpy(settings_.driveClientSecret, savedSecret.c_str(), sizeof(settings_.driveClientSecret));
   return true;
 }
 
 bool SettingsStore::saveDriveRefreshToken(const char *refreshToken) {
-  strncpy(settings_.driveRefreshToken, refreshToken, sizeof(settings_.driveRefreshToken) - 1);
-  prefs.putString("driveRefTok", settings_.driveRefreshToken);
+  if (strlen(refreshToken) >= sizeof(settings_.driveRefreshToken)) return false;
+  String saved(refreshToken);
+  String previous(settings_.driveRefreshToken);
+  bool previouslyStored = prefs.isKey("driveRefTok");
+  if (!persistString("driveRefTok", saved)) return false;
+  if (saved != settings_.driveRefreshToken) {
+    uint32_t generation = driveGeneration + 1;
+    if (!generation) generation = 1;
+    if (prefs.putUInt("driveAuthGen", generation) != sizeof(uint32_t) ||
+        prefs.getUInt("driveAuthGen", 0) != generation) {
+      if (previouslyStored) persistString("driveRefTok", previous);
+      else prefs.remove("driveRefTok");
+      return false;
+    }
+    driveGeneration = settings_.driveAuthGeneration = generation;
+  }
+  strlcpy(settings_.driveRefreshToken, saved.c_str(), sizeof(settings_.driveRefreshToken));
   return true;
 }
 
 bool SettingsStore::saveDriveFolderId(const char *folderId) {
-  strncpy(settings_.driveFolderId, folderId, sizeof(settings_.driveFolderId) - 1);
-  prefs.putString("driveFolder", settings_.driveFolderId);
+  if (strlen(folderId) >= sizeof(settings_.driveFolderId)) return false;
+  String saved(folderId);
+  if (!persistString("driveFolder", saved)) return false;
+  strlcpy(settings_.driveFolderId, saved.c_str(), sizeof(settings_.driveFolderId));
   return true;
 }
+
+uint32_t SettingsStore::currentDriveGeneration() { return driveGeneration; }
 
 bool SettingsStore::saveAudio(uint32_t sampleRateHz, float micGainDb) {
   settings_.audioSampleRateHz = sampleRateHz;

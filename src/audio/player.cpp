@@ -1,6 +1,7 @@
 #include "player.h"
 #include "wav.h"
 #include <LittleFS.h>
+#include "../storage/note_files.h"
 #include <string.h>
 
 namespace {
@@ -10,7 +11,7 @@ int16_t stereoBuf[kChunkFrames * 2];
 } // namespace
 
 bool Player::play(AudioCodec &codec, const char *path) {
-  File file = LittleFS.open(path, FILE_READ);
+  File file = NoteFiles::fs().open(path, FILE_READ);
   if (!file) return false;
 
   WavHeader hdr;

@@ -31,6 +31,8 @@ public:
   // Quantas vezes o ring buffer encheu e a task leitora teve que
   // descartar audio - deve ficar em 0 sempre; exposto para diagnostico.
   uint32_t overflowCount() const { return overflowCount_; }
+  bool storageFull() const { return storageFull_; }
+  bool writeFailed() const { return writeFailed_; }
 
 private:
   File file_;
@@ -38,6 +40,9 @@ private:
   uint32_t sampleRate_ = 16000;
   volatile uint32_t dataBytes_ = 0;
   volatile uint32_t overflowCount_ = 0;
+  uint32_t maximumBytes_ = 0;
+  volatile bool storageFull_ = false;
+  volatile bool writeFailed_ = false;
   bool active_ = false;
 
   volatile bool stopRequested_ = false;

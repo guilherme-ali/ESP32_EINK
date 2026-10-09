@@ -77,10 +77,23 @@ static void drawWifiSetupScreen(const String &line1, const String &line2) {
 }
 
 static bool g_skipWifiSetup = false;
+static bool g_cancelDrivePairing = false;
 static void onWifiSetupButtonEvent(BtnId id, BtnAction action) {
   if (id == BtnId::Boot && action == BtnAction::LongPress) {
     g_skipWifiSetup = true;
   }
+}
+
+static void onDrivePairingButton(BtnId id, BtnAction action) {
+  if (action == BtnAction::LongPress || (id == BtnId::Pwr && action == BtnAction::ShortClick)) {
+    g_cancelDrivePairing = true;
+  }
+}
+
+static bool serviceDrivePairing() {
+  buttons.poll();
+  wifiMgr.loop();
+  return !g_cancelDrivePairing;
 }
 
 // O PCF85063 nao tem como saber a hora certa sozinho - so acerta com
@@ -110,6 +123,7 @@ static void syncRtcFromNtp() {
 }
 
 static void drawDrivePairingScreen(const char *userCode, const char *verificationUrl) {
+  Serial.printf("[Drive] Autorize em %s com o codigo %s\n", verificationUrl, userCode);
   canvas.clear(EPD_WHITE);
   canvas.drawText(8, 8, "autorizar google drive", EPD_BLACK, FONT_EMPHASIS);
   canvas.drawFastHLine(8, 30, 184, EPD_BLACK);
@@ -127,12 +141,19 @@ static void runDrivePairingIfNeeded() {
   if (!wifiMgr.isConnected()) return;
   if (!settingsStore.hasDriveApp() || settingsStore.hasDriveAuth()) return;
 
-  if (gdrive.pairDevice(settingsStore, drawDrivePairingScreen)) {
+  g_cancelDrivePairing = false;
+  buttons.setCallback(onDrivePairingButton);
+  bool paired = gdrive.pairDevice(settingsStore, drawDrivePairingScreen, serviceDrivePairing);
+  buttons.setCallback(onButtonEvent);
+  if (paired) {
+    Serial.println("[Drive] Novo pareamento concluido e salvo.");
     canvas.clear(EPD_WHITE);
     canvas.drawText(8, 90, "Google Drive", EPD_BLACK, FONT_EMPHASIS);
     canvas.drawText(8, 110, "autorizado!", EPD_BLACK, FONT_BODY);
     epd.displayPart();
     delay(2000);
+  } else {
+    Serial.printf("[Drive] Pareamento: %s\n", gdrive.lastError().c_str());
   }
 }
 
@@ -263,10 +284,10 @@ void setup() {
   Serial.begin(115200);
   delay(2000);
   Serial.println("=================================");
-  Serial.println("Fase 4 - Menus e arquivos");
+  Serial.println("Gravador de Ideias - sincronizacao resiliente v2");
   Serial.println("=================================");
 
-  if (!LittleFS.begin(true)) {
+  if (!LittleFS.begin(false)) {
     Serial.println("!! ERRO: LittleFS.begin() falhou.");
   }
   notes.begin();
@@ -304,4 +325,17 @@ void loop() {
   buttons.poll();
   wifiMgr.loop();
   app.loop();
+#if ARDUINO_USB_CDC_ON_BOOT
+  static String command;
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n') {
+      command.trim();
+      if (command.length()) app.diagnosticCommand(command);
+      command = "";
+    } else if (c != '\r' && command.length() < 64) {
+      command += c;
+    }
+  }
+#endif
 }

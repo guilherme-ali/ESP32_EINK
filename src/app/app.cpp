@@ -3,8 +3,73 @@
 #include "../ui/wallpapers.h"
 #include "../board/battery.h"
 #include <LittleFS.h>
+#include "../storage/note_files.h"
+#include <esp_heap_caps.h>
+#include <cJSON.h>
 
 namespace {
+struct DiagnosticDone {
+  const String &command;
+  ~DiagnosticDone() { Serial.printf("[DiagDone] %s\n", command.c_str()); }
+};
+
+// Reutilizados entre notas, na PSRAM: nunca na pilha de loop (16 KiB).
+char *aiBuffer(bool summary) {
+  static char *buffers[2] = {nullptr, nullptr};
+  char *&buffer = buffers[summary ? 1 : 0];
+  if (!buffer) buffer = static_cast<char *>(heap_caps_malloc(SttClient::kMaxTextLen,
+                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  return buffer;
+}
+
+bool recordAiResult(const char *wavPath, const char *stage, const String &model,
+                    const String &error, int status) {
+  String path(wavPath); path.replace(".wav", ".ai");
+  cJSON *root = nullptr;
+  File file = NoteFiles::fs().open(path, FILE_READ);
+  if (file && file.size() < 8192) {
+    String saved = file.readString();
+    root = cJSON_Parse(saved.c_str());
+  }
+  file.close(); // LittleFS recusa rename sobre destino que ainda esta aberto.
+  if (root && !cJSON_IsObject(root)) { cJSON_Delete(root); root = nullptr; }
+  if (!root) root = cJSON_CreateObject();
+  if (!root) return false;
+  const char *key = strcmp(stage, "transcricao") == 0 ? "transcriptModel" : "summaryModel";
+  if (model.length()) {
+    cJSON_DeleteItemFromObjectCaseSensitive(root, key);
+    cJSON_AddStringToObject(root, key, model.c_str());
+  }
+  cJSON_DeleteItemFromObjectCaseSensitive(root, "lastError");
+  cJSON_DeleteItemFromObjectCaseSensitive(root, "lastStatusCode");
+  cJSON_DeleteItemFromObjectCaseSensitive(root, "pendingStage");
+  cJSON_AddStringToObject(root, "lastError", error.c_str());
+  cJSON_AddNumberToObject(root, "lastStatusCode", status);
+  cJSON_AddStringToObject(root, "pendingStage", error.length() ? stage : "");
+  char *json = cJSON_PrintUnformatted(root);
+  cJSON_Delete(root);
+  if (!json) return false;
+  bool ok = NoteFiles::writeAtomic(path, json, strlen(json));
+  free(json);
+  return ok;
+}
+
+bool aiMetadataReady(const char *wavPath) {
+  String path(wavPath); path.replace(".wav", ".ai");
+  NoteFiles::recoverText(path);
+  File file = NoteFiles::fs().open(path, FILE_READ);
+  if (!file || file.size() > 8192) return false;
+  String json = file.readString();
+  file.close();
+  cJSON *root = cJSON_Parse(json.c_str());
+  if (!root) return false;
+  cJSON *stage = cJSON_GetObjectItemCaseSensitive(root, "pendingStage");
+  cJSON *error = cJSON_GetObjectItemCaseSensitive(root, "lastError");
+  bool ok = cJSON_IsString(stage) && stage->valuestring[0] == '\0' &&
+            cJSON_IsString(error) && error->valuestring[0] == '\0';
+  cJSON_Delete(root);
+  return ok;
+}
 
 void setVal(char *dst, size_t n, const char *src) {
   strncpy(dst, src, n - 1);
@@ -349,6 +414,10 @@ void App::drawWifiScanList() {
 // ---------------------------------------------------------------------
 
 void App::startRecording() {
+  if (NoteFiles::recordingBytes() < bytesPerSec() * 2) {
+    showSyncResult("Memoria insuficiente para gravar. Libere espaco nas notas ja copiadas.");
+    return;
+  }
   RtcDateTime now;
   if (!rtc_.getDateTime(now)) now = {2026, 1, 1, 0, 0, 0};
   notes_.buildPath(now, currentRecordingPath_, sizeof(currentRecordingPath_));
@@ -368,7 +437,7 @@ void App::startRecording() {
   recording_ = true;
   screen_ = Screen::Recording;
   recordingStartMs_ = millis();
-  Screens::drawRecording(canvas_, epd_, 0, (uint32_t)(notes_.freeBytes() / bytesPerSec()));
+  Screens::drawRecording(canvas_, epd_, 0, (uint32_t)(NoteFiles::recordingBytes() / bytesPerSec()));
   Serial.printf("Gravando em %s (%lu Hz)\n", currentRecordingPath_, (unsigned long)sampleRate);
 }
 
@@ -379,6 +448,11 @@ void App::stopRecording() {
   Serial.printf("Gravacao parada: %u bytes, %u overflow(s) no ring buffer\n", bytes,
                 (unsigned)recorder_.overflowCount());
 
+  if (recorder_.writeFailed() || (bytes && !NoteFiles::validWav(currentRecordingPath_))) {
+    notes_.markDirty();
+    showSyncResult("Falha ao finalizar WAV. Arquivo preservado para recuperacao; envio retido.");
+    return;
+  }
   if (bytes == 0) {
     LittleFS.remove(currentRecordingPath_);
   } else {
@@ -387,8 +461,11 @@ void App::stopRecording() {
       // Com o toggle desligado (padrao), a nota fica so local ate o
       // usuario apertar "Sincronizar" - nem a transcricao roda aqui,
       // exatamente para nao depender de Wi-Fi logo apos gravar.
-      transcribeIfPossible(currentRecordingPath_);
-      syncIfPossible(currentRecordingPath_);
+      if (ensureOnline()) {
+        transcribeIfPossible(currentRecordingPath_);
+        syncIfPossible(currentRecordingPath_);
+        if (screen_ == Screen::SyncResult) return;
+      }
     }
     Screens::drawSaved(canvas_, epd_, notes_.count());
     delay(1200);
@@ -410,6 +487,7 @@ void App::playSelected(int index) {
 // ---------------------------------------------------------------------
 
 bool App::transcribeNote(const char *wavPath) {
+  pipelineError_ = "";
   const Settings &cfg = settingsStore_.get();
   if (cfg.sttEndpoint[0] == '\0') {
     Serial.println("[App] STT endpoint nao configurado.");
@@ -421,51 +499,65 @@ bool App::transcribeNote(const char *wavPath) {
   String mdPath = String(wavPath);
   mdPath.replace(".wav", ".md");
 
-  static char textBuf[SttClient::kMaxTextLen];
-  bool hasText = false;
-
-  if (LittleFS.exists(txtPath)) {
-    File f = LittleFS.open(txtPath, FILE_READ);
-    if (f) {
-      size_t n = f.readBytes(textBuf, sizeof(textBuf) - 1);
-      textBuf[n] = '\0';
-      f.close();
-      hasText = (n > 0);
-    }
-  }
+  NoteFiles::recoverText(txtPath);
+  NoteFiles::recoverText(mdPath);
+  char *textBuf = aiBuffer(false);
+  char *summaryBuf = aiBuffer(true);
+  if (!textBuf || !summaryBuf) { pipelineError_ = "PSRAM insuficiente para texto"; return false; }
+  bool hasText = NoteFiles::readText(txtPath, textBuf, SttClient::kMaxTextLen);
 
   if (!hasText) {
     Serial.printf("[App] Transcrevendo %s...\n", wavPath);
-    if (!sttClient_.transcribe(cfg, wavPath, textBuf, sizeof(textBuf))) {
+    if (!sttClient_.transcribe(cfg, wavPath, textBuf, SttClient::kMaxTextLen)) {
+      pipelineError_ = "Transcricao: " + sttClient_.lastError();
+      recordAiResult(wavPath, "transcricao", sttClient_.lastModel(), sttClient_.lastError(), sttClient_.lastStatusCode());
       Serial.println("[App] Transcricao falhou.");
       return false;
     }
-    File f = LittleFS.open(txtPath, FILE_WRITE);
-    if (f) {
-      f.print(textBuf);
-      f.close();
-      hasText = true;
-      Serial.printf("[App] Transcricao gravada em %s\n", txtPath.c_str());
+    if (!recordAiResult(wavPath, "transcricao", sttClient_.lastModel(), "gravacao do TXT pendente", sttClient_.lastStatusCode())) {
+      pipelineError_ = "Falha ao salvar modelo/estado antes do TXT"; return false;
     }
+    if (!NoteFiles::writeAtomic(txtPath, textBuf, strlen(textBuf))) {
+      pipelineError_ = "Nao foi possivel salvar a transcricao completa";
+      return false;
+    }
+    hasText = true;
+    if (!recordAiResult(wavPath, "transcricao", sttClient_.lastModel(), "", sttClient_.lastStatusCode())) {
+      pipelineError_ = "Transcricao salva; falha ao salvar diagnostico";
+      return false;
+    }
+    Serial.printf("[AI] Transcricao salva; modelo %s, %u bytes\n", sttClient_.lastModel().c_str(), (unsigned)strlen(textBuf));
   }
 
-  if (hasText && !LittleFS.exists(mdPath)) {
+  if (hasText && !NoteFiles::validText(mdPath)) {
     Serial.printf("[App] Gerando resumo .md para %s...\n", wavPath);
-    static char summaryBuf[SttClient::kMaxTextLen];
-    if (sttClient_.generateSummary(cfg, textBuf, summaryBuf, sizeof(summaryBuf))) {
-      File mf = LittleFS.open(mdPath, FILE_WRITE);
-      if (mf) {
-        mf.print(summaryBuf);
-        mf.close();
-        Serial.printf("[App] Resumo .md salvo em %s (%u bytes)\n", mdPath.c_str(), (unsigned)strlen(summaryBuf));
+    Screens::drawState(canvas_, epd_, Screens::StateIcon::Activity, "resumindo", "criando Markdown fiel a transcricao");
+    if (sttClient_.generateSummary(cfg, textBuf, summaryBuf, SttClient::kMaxTextLen)) {
+      if (!recordAiResult(wavPath, "resumo", sttClient_.lastModel(), "gravacao do Markdown pendente", sttClient_.lastStatusCode())) {
+        pipelineError_ = "Falha ao salvar modelo/estado antes do Markdown"; return false;
       }
+      if (!NoteFiles::writeAtomic(mdPath, summaryBuf, strlen(summaryBuf))) {
+        pipelineError_ = "Nao foi possivel salvar o Markdown completo";
+        return false;
+      }
+      if (!recordAiResult(wavPath, "resumo", sttClient_.lastModel(), "", sttClient_.lastStatusCode())) {
+        pipelineError_ = "Markdown salvo; falha ao salvar diagnostico";
+        return false;
+      }
+      Serial.printf("[AI] Markdown salvo; modelo %s, %u bytes\n", sttClient_.lastModel().c_str(), (unsigned)strlen(summaryBuf));
     } else {
+      pipelineError_ = "Markdown: " + sttClient_.lastError();
+      recordAiResult(wavPath, "resumo", sttClient_.lastModel(), sttClient_.lastError(), sttClient_.lastStatusCode());
       Serial.println("[App] Falha ao gerar resumo .md.");
       return false;
     }
   }
 
-  return true;
+  if (!aiMetadataReady(wavPath) && !recordAiResult(wavPath, "resumo", "", "", 200)) {
+    pipelineError_ = "Textos salvos; diagnostico ainda pendente"; return false;
+  }
+  notes_.markDirty();
+  return NoteFiles::validText(txtPath) && NoteFiles::validText(mdPath);
 }
 
 // So roda logo apos gravar (se autoSyncEnabled) - o resto das notas fica
@@ -479,44 +571,11 @@ void App::transcribeIfPossible(const char *wavPath) {
   Screens::drawState(canvas_, epd_, Screens::StateIcon::Activity, "transcrevendo",
                       "enviando audio para o servico de STT");
 
-  static char textBuf[SttClient::kMaxTextLen];
-  if (!sttClient_.transcribe(cfg, wavPath, textBuf, sizeof(textBuf))) {
-    Serial.println("Transcricao falhou, nota continua salva sem .txt.");
-    return;
-  }
-
-  String txtPath = String(wavPath);
-  txtPath.replace(".wav", ".txt");
-  File f = LittleFS.open(txtPath, FILE_WRITE);
-  if (f) {
-    f.print(textBuf);
-    f.close();
-    strncpy(lastTxtPath_, txtPath.c_str(), sizeof(lastTxtPath_) - 1);
-    notes_.markDirty();
-  }
-
-  Screens::drawState(canvas_, epd_, Screens::StateIcon::Activity, "resumindo",
-                      "gerando resumo em topicos via IA");
-
-  static char summaryBuf[SttClient::kMaxTextLen];
-  if (sttClient_.generateSummary(cfg, textBuf, summaryBuf, sizeof(summaryBuf))) {
-    String mdPath = String(wavPath);
-    mdPath.replace(".wav", ".md");
-    File mf = LittleFS.open(mdPath, FILE_WRITE);
-    if (mf) {
-      mf.print(summaryBuf);
-      mf.close();
-      strncpy(lastMdPath_, mdPath.c_str(), sizeof(lastMdPath_) - 1);
-      notes_.markDirty();
-    }
-  }
-
-  if (lastMdPath_[0] != '\0') {
-    Screens::drawText(canvas_, epd_, "Resumo gerado:", summaryBuf, "BOOT grava | PWR menu");
-  } else {
-    Screens::drawText(canvas_, epd_, "Nota transcrita:", textBuf, "BOOT grava | PWR menu");
-  }
-  delay(3000); // da tempo de ler antes de seguir pra tela inicial
+  if (!transcribeNote(wavPath)) { showSyncResult(pipelineError_); return; }
+  String txtPath(wavPath); txtPath.replace(".wav", ".txt");
+  String mdPath(wavPath); mdPath.replace(".wav", ".md");
+  setVal(lastTxtPath_, sizeof(lastTxtPath_), txtPath.c_str());
+  setVal(lastMdPath_, sizeof(lastMdPath_), mdPath.c_str());
 }
 
 void App::syncIfPossible(const char *wavPath) {
@@ -536,7 +595,9 @@ void App::syncIfPossible(const char *wavPath) {
   const char *txtPath = lastTxtPath_[0] ? lastTxtPath_ : nullptr;
   const char *mdPath = lastMdPath_[0] ? lastMdPath_ : nullptr;
   if (!gdrive_.uploadNote(settingsStore_, wavPath, txtPath, mdPath)) {
-    Serial.println("Sincronizacao falhou, nota continua so local.");
+    showSyncResult("Drive: " + gdrive_.lastError());
+  } else {
+    showSyncResult("Audio, transcricao e Markdown confirmados no Google Drive.");
   }
   notes_.markDirty(); // uploadNote() cria o .snc/.sync quando da certo
 }
@@ -549,7 +610,7 @@ void App::syncOneNote(int index) {
   bool hasDrive = settingsStore_.hasDriveAuth();
   bool hasStt = (cfg.sttEndpoint[0] != '\0');
 
-  if (!hasDrive && !hasStt) {
+  if (!hasDrive && !hasStt && !settingsStore_.hasDriveApp()) {
     Screens::drawText(canvas_, epd_, "Sincronizacao",
                        "Nenhum servico configurado. Configure STT ou Drive no menu.",
                        "PWR volta");
@@ -562,6 +623,11 @@ void App::syncOneNote(int index) {
     return;
   }
 
+  hasDrive = settingsStore_.hasDriveAuth();
+  if (settingsStore_.hasDriveApp() && !hasDrive) {
+    showSyncResult("Drive nao autorizado. Conecte novamente e conclua o pareamento.", true);
+    return;
+  }
   String txtPath = String(e.path);
   txtPath.replace(".wav", ".txt");
   String mdPath = String(e.path);
@@ -569,7 +635,7 @@ void App::syncOneNote(int index) {
 
   bool sttOk = true;
   if (hasStt) {
-    if (!LittleFS.exists(txtPath) || !LittleFS.exists(mdPath)) {
+    if (!NoteFiles::validText(txtPath) || !NoteFiles::validText(mdPath) || !aiMetadataReady(e.path)) {
       Screens::drawState(canvas_, epd_, Screens::StateIcon::Activity, "transcrevendo", e.label);
       sttOk = transcribeNote(e.path);
     }
@@ -582,8 +648,8 @@ void App::syncOneNote(int index) {
       driveOk = false;
     } else {
       Screens::drawState(canvas_, epd_, Screens::StateIcon::Activity, "enviando Drive", e.label);
-      bool hasTxt = LittleFS.exists(txtPath);
-      bool hasMd = LittleFS.exists(mdPath);
+      bool hasTxt = NoteFiles::validText(txtPath);
+      bool hasMd = NoteFiles::validText(mdPath);
       driveOk = gdrive_.uploadNote(settingsStore_, e.path,
                                    hasTxt ? txtPath.c_str() : nullptr,
                                    hasMd ? mdPath.c_str() : nullptr);
@@ -594,19 +660,20 @@ void App::syncOneNote(int index) {
   if (wasOffline) wifiMgr_.disconnect();
 
   bool success = (hasDrive ? driveOk : sttOk);
-  Screens::drawText(canvas_, epd_, "Sincronizar",
-                     success ? "Nota sincronizada com sucesso!" : "Falha na sincronizacao.",
-                     "qualquer botao volta");
+  String message = success ? (hasDrive ? "Arquivos confirmados no Google Drive." : "Transcricao e Markdown salvos localmente.")
+                           : (!sttOk ? pipelineError_ : "Drive: " + gdrive_.lastError());
+  showSyncResult(message, true);
 }
 
 // Varre /notes procurando o que falta transcrever (sem .txt/.md) ou subir
 // (sem .sync/.snc) e resolve tudo numa passada so, com progresso na tela.
 void App::runManualSync() {
+  pipelineError_ = "";
   const Settings &cfg = settingsStore_.get();
   bool hasDrive = settingsStore_.hasDriveAuth();
   bool hasStt = (cfg.sttEndpoint[0] != '\0');
 
-  if (!hasDrive && !hasStt) {
+  if (!hasDrive && !hasStt && !settingsStore_.hasDriveApp()) {
     Screens::drawText(canvas_, epd_, "Sincronizacao",
                        "Nenhum servico configurado. Configure STT ou Drive no menu.",
                        "PWR volta");
@@ -619,6 +686,11 @@ void App::runManualSync() {
     return;
   }
 
+  hasDrive = settingsStore_.hasDriveAuth();
+  if (settingsStore_.hasDriveApp() && !hasDrive) {
+    showSyncResult("Drive nao autorizado. Conecte novamente e conclua o pareamento.");
+    return;
+  }
   refreshNotes();
   int total = noteCount_;
 
@@ -628,18 +700,15 @@ void App::runManualSync() {
     if (!notes_.getAt(i, e)) continue;
     String txtPath = String(e.path); txtPath.replace(".wav", ".txt");
     String mdPath = String(e.path); mdPath.replace(".wav", ".md");
-    String sncPath = String(e.path); sncPath.replace(".wav", ".snc");
-    String syncPath = String(e.path); syncPath.replace(".wav", ".sync");
 
-    bool isSynced = LittleFS.exists(sncPath);
-    bool needsAi = hasStt && (!LittleFS.exists(txtPath) || !LittleFS.exists(mdPath));
-    bool needsUpload = hasDrive && !isSynced;
+    bool needsAi = hasStt && (!NoteFiles::validText(txtPath) || !NoteFiles::validText(mdPath) || !aiMetadataReady(e.path));
+    bool needsUpload = hasDrive; // Sincronizacao explicita tambem confere backups remotos.
     if (needsAi || needsUpload) pendingTotal++;
   }
 
   if (pendingTotal == 0) {
     if (wasOffline) wifiMgr_.disconnect();
-    Screens::drawSyncSummary(canvas_, epd_, 0, 0, 0, 0);
+    showSyncResult("Nenhuma nota pendente. Arquivos locais ja sincronizados.");
     return;
   }
 
@@ -647,6 +716,7 @@ void App::runManualSync() {
   uint32_t sessionDeadline = millis() + 10 * 60 * 1000UL;
 
   int transcribed = 0, uploaded = 0, failed = 0, done = 0;
+  String lastFailure;
   for (int i = 0; i < total; i++) {
     if ((int32_t)(sessionDeadline - millis()) <= 0) {
       Serial.println("[Sync] Limite de 10 minutos atingido na sessao.");
@@ -657,12 +727,9 @@ void App::runManualSync() {
     if (!notes_.getAt(i, e)) continue;
     String txtPath = String(e.path); txtPath.replace(".wav", ".txt");
     String mdPath = String(e.path); mdPath.replace(".wav", ".md");
-    String sncPath = String(e.path); sncPath.replace(".wav", ".snc");
-    String syncPath = String(e.path); syncPath.replace(".wav", ".sync");
 
-    bool isSynced = LittleFS.exists(sncPath);
-    bool needsAi = hasStt && (!LittleFS.exists(txtPath) || !LittleFS.exists(mdPath));
-    bool needsUpload = hasDrive && !isSynced;
+    bool needsAi = hasStt && (!NoteFiles::validText(txtPath) || !NoteFiles::validText(mdPath) || !aiMetadataReady(e.path));
+    bool needsUpload = hasDrive;
     if (!needsAi && !needsUpload) continue;
 
     done++;
@@ -687,6 +754,7 @@ void App::runManualSync() {
       } else {
         Serial.printf("[Sync] Transcricao falhou para %s\n", e.label);
         failed++;
+        lastFailure = pipelineError_;
         // Conforme escolha: nao envia ao Drive se STT falhou
         continue;
       }
@@ -695,21 +763,35 @@ void App::runManualSync() {
     if (hasDrive && aiOk && needsUpload) {
       Screens::drawState(canvas_, epd_, Screens::StateIcon::Activity, "enviando Drive", e.label,
                           done, pendingTotal);
-      bool hasTxt = LittleFS.exists(txtPath);
-      bool hasMd = LittleFS.exists(mdPath);
+      bool hasTxt = NoteFiles::validText(txtPath);
+      bool hasMd = NoteFiles::validText(mdPath);
       if (gdrive_.uploadNote(settingsStore_, e.path,
                              hasTxt ? txtPath.c_str() : nullptr,
                              hasMd ? mdPath.c_str() : nullptr)) {
         uploaded++;
       } else {
         failed++;
+        pipelineError_ = "Drive: " + gdrive_.lastError();
+        lastFailure = pipelineError_;
       }
     }
   }
 
   notes_.markDirty();
   if (wasOffline) wifiMgr_.disconnect();
-  Screens::drawSyncSummary(canvas_, epd_, transcribed, uploaded, failed, pendingTotal);
+  String report = "IA: " + String(transcribed) + " | Drive: " + String(uploaded) +
+                  " | Falhas: " + String(failed);
+  if (done < pendingTotal) report += "\nAinda pendentes: " + String(pendingTotal - done);
+  if (lastFailure.length()) report += "\n" + lastFailure;
+  showSyncResult(report);
+}
+
+void App::showSyncResult(const String &message, bool forNote) {
+  screen_ = Screen::SyncResult;
+  syncResultForNote_ = forNote;
+  markActivity();
+  Screens::drawText(canvas_, epd_, "Sincronizar", message.c_str(), "qualquer botao volta");
+  Serial.printf("[Sync] %s\n", message.c_str());
 }
 
 void App::startWifiScanFlow() {
@@ -762,6 +844,9 @@ void App::deleteAllNotes() {
 void App::onButton(BtnId id, BtnAction action) {
   markActivity();
   switch (screen_) {
+    case Screen::SyncResult:
+      if (syncResultForNote_) goNoteDetail(notesSel_); else goHome();
+      break;
     case Screen::Home: onButtonHome(id, action); break;
     case Screen::Recording: onButtonRecording(id, action); break;
     case Screen::RootMenu: onButtonRootMenu(id, action); break;
@@ -1194,12 +1279,17 @@ void App::loop() {
     if (now - lastUiUpdate >= 1000) {
       lastUiUpdate = now;
       uint32_t elapsedSec = (now - recordingStartMs_) / 1000;
-      uint32_t freeSec = (uint32_t)(notes_.freeBytes() / bytesPerSec());
+      uint32_t freeSec = (uint32_t)(NoteFiles::recordingBytes() / bytesPerSec());
       Screens::drawRecording(canvas_, epd_, elapsedSec, freeSec);
       if (recorder_.overflowCount() > 0) {
         Serial.printf("!! AVISO: %lu overflow(s) no ring buffer de audio\n",
                       (unsigned long)recorder_.overflowCount());
       }
+    }
+    if (recorder_.storageFull() || recorder_.writeFailed()) {
+      stopRecording();
+      if (recorder_.writeFailed()) showSyncResult("Falha ao gravar/finalizar WAV; arquivo preservado para recuperacao.");
+      else showSyncResult("Memoria de gravacao cheia; audio finalizado e preservado.");
     }
     return;
   }
@@ -1209,7 +1299,51 @@ void App::loop() {
   // gastar bateria com a tela acesa mesmo se o usuario for embora no
   // meio de um menu.
   uint32_t timeoutMs = settingsStore_.get().screensaverTimeoutSec * 1000UL;
-  if (millis() - lastActivityMs_ >= timeoutMs) {
+  if (!diagnosticAwake_ && millis() - lastActivityMs_ >= timeoutMs) {
     if (onSleepRequested_) onSleepRequested_(); // nao retorna
+  }
+}
+
+void App::diagnosticCommand(const String &command) {
+  DiagnosticDone done{command};
+  markActivity();
+  if (command == "status") {
+    const Settings &cfg = settingsStore_.get();
+    Serial.printf("[Status] notas=%d pendentes=%d livres=%llu gravaveis=%llu psram=%u\n",
+                  notes_.count(), notes_.countPendingSync(cfg.sttEndpoint[0], settingsStore_.hasDriveAuth()),
+                  (unsigned long long)NoteFiles::freeBytes(), (unsigned long long)NoteFiles::recordingBytes(),
+                  ESP.getFreePsram());
+    Serial.printf("[Status] IA auto=%d gratuito_confirmado=%d STT=%s MD=%s Drive_config=%d autorizado=%d\n",
+                  cfg.sttAutoModel, cfg.geminiFreeConfirmed, cfg.sttModel, cfg.summaryModel,
+                  settingsStore_.hasDriveApp(), settingsStore_.hasDriveAuth());
+    for (int i = 0; i < notes_.count(); ++i) {
+      NoteEntry note; if (!notes_.getAt(i, note)) continue;
+      NoteSyncState state; GDriveClient::getNoteSyncState(note.path, state);
+      Serial.printf("[Note] %s bytes=%u txt=%d md=%d synced=%d wav=%d txtup=%d mdup=%d HTTP=%d erro=%s\n",
+                    note.path, note.sizeBytes, note.hasTxt, note.hasMd, state.fullySynced,
+                    state.wavUploaded, state.txtUploaded, state.mdUploaded,
+                    state.lastStatusCode, state.lastError);
+    }
+  } else if (command == "stayawake 1") {
+    diagnosticAwake_ = true; Serial.println("[Diag] descanso suspenso durante testes USB");
+  } else if (command == "stayawake 0") {
+    diagnosticAwake_ = false; Serial.println("[Diag] descanso normal restaurado");
+  } else if (!recording_ && command == "sync") {
+    runManualSync();
+  } else if (!recording_ && command == "sync-one") {
+    syncOneNote(0);
+  } else if (!recording_ && command == "wifi") {
+    ensureOnline();
+  } else if (!recording_ && command == "repair-drive") {
+    if (!settingsStore_.saveDriveRefreshToken("")) {
+      Serial.println("[Diag] Falha ao invalidar autorizacao do Drive"); return;
+    }
+    notes_.markDirty();
+    wifiMgr_.disconnect();
+    bool connected = ensureOnline();
+    markActivity();
+    Serial.printf("[Diag] Pareamento Drive: %s\n", connected && settingsStore_.hasDriveAuth() ? "autorizado" : "pendente");
+  } else {
+    Serial.println("[Diag] comandos: status | stayawake 1/0 | wifi | sync | sync-one | repair-drive");
   }
 }

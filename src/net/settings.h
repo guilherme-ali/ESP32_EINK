@@ -17,13 +17,18 @@ struct Settings {
   char favoriteWifiSsid[33] = "";
 
   char sttEndpoint[128] = "";
-  char sttModel[32] = "gemini-3.5-flash-lite";
+  char sttModel[96] = "gemini-3.5-transcribe";
+  char summaryModel[96] = "gemini-3.8-flash";
+  bool sttAutoModel = true;
+  bool geminiFreeOnly = true;
+  bool geminiFreeConfirmed = false;
   char sttApiKey[128] = "";
 
   char driveClientId[128] = "";
   char driveClientSecret[64] = "";
-  char driveRefreshToken[256] = "";
-  char driveFolderId[64] = ""; // preenchido sozinho na primeira sincronizacao
+  char driveRefreshToken[513] = "";
+  char driveFolderId[128] = ""; // preenchido sozinho na primeira sincronizacao
+  uint32_t driveAuthGeneration = 1;
 
   bool autoSyncEnabled = false; // padrao: nao transcreve/envia sozinho apos gravar, so via "Sincronizar"
   uint16_t screensaverTimeoutSec = 120;
@@ -50,6 +55,7 @@ public:
   bool removeWifiNetwork(int index);
   bool saveFavoriteWifi(const char *ssid); // "" limpa a favorita
   bool saveStt(const char *endpoint, const char *model, const char *apiKey);
+  bool saveAiPolicy(bool automatic, const char *summaryModel, bool freeConfirmed);
   bool saveDriveApp(const char *clientId, const char *clientSecret);
   bool saveDriveRefreshToken(const char *refreshToken);
   bool saveDriveFolderId(const char *folderId);
@@ -62,6 +68,7 @@ public:
   bool hasWifi() const { return settings_.wifiNetworkCount > 0; }
   bool hasDriveApp() const { return settings_.driveClientId[0] != '\0'; }
   bool hasDriveAuth() const { return settings_.driveRefreshToken[0] != '\0'; }
+  static uint32_t currentDriveGeneration();
 
 private:
   Settings settings_;

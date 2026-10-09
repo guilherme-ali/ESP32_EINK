@@ -6,6 +6,7 @@
 #include <freertos/task.h>
 #include <freertos/stream_buffer.h>
 #include <esp_heap_caps.h>
+#include "../storage/note_files.h"
 
 namespace {
 // Dimensionado pro PIOR caso (48kHz, a maior taxa configuravel em
@@ -27,25 +28,37 @@ constexpr BaseType_t kAudioCore = 0; // loop() do Arduino roda no core 1
 bool Recorder::start(const char *path, uint32_t sampleRate, AudioCodec *codec) {
   if (active_) return false;
 
-  file_ = LittleFS.open(path, FILE_WRITE);
+  file_ = NoteFiles::fs().open(path, FILE_WRITE);
   if (!file_) return false;
 
   sampleRate_ = sampleRate;
   codec_ = codec;
   dataBytes_ = 0;
   overflowCount_ = 0;
+  storageFull_ = false;
+  writeFailed_ = false;
+  maximumBytes_ = static_cast<uint32_t>(NoteFiles::recordingBytes()) & ~1UL;
+  if (maximumBytes_ < sampleRate * 2) { file_.close(); NoteFiles::fs().remove(path); return false; }
   stopRequested_ = false;
 
   WavHeader placeholder = makeWavHeader(sampleRate_, 1, 0);
-  file_.write((const uint8_t *)&placeholder, sizeof(placeholder));
+  if (file_.write((const uint8_t *)&placeholder, sizeof(placeholder)) != sizeof(placeholder)) {
+    file_.close(); NoteFiles::fs().remove(path); return false;
+  }
 
   if (!ringStorage_) {
     ringStorage_ = (uint8_t *)heap_caps_malloc(kRingBytes + 1, MALLOC_CAP_SPIRAM);
     ringStruct_ = malloc(sizeof(StaticStreamBuffer_t));
-    if (!ringStorage_ || !ringStruct_) return false;
+    if (!ringStorage_ || !ringStruct_) {
+      free(ringStorage_); free(ringStruct_); ringStorage_ = nullptr; ringStruct_ = nullptr;
+      file_.close(); NoteFiles::fs().remove(path); return false;
+    }
     ring_ = xStreamBufferCreateStatic(kRingBytes, 1, ringStorage_,
                                        (StaticStreamBuffer_t *)ringStruct_);
-    if (!ring_) return false;
+    if (!ring_) {
+      free(ringStorage_); free(ringStruct_); ringStorage_ = nullptr; ringStruct_ = nullptr;
+      file_.close(); NoteFiles::fs().remove(path); return false;
+    }
   } else {
     xStreamBufferReset((StreamBufferHandle_t)ring_);
   }
@@ -54,13 +67,20 @@ bool Recorder::start(const char *path, uint32_t sampleRate, AudioCodec *codec) {
   writeTaskDone_ = false;
   active_ = true;
 
-  xTaskCreatePinnedToCore(captureTaskFn, "audio_cap", 4096, this, kCapturePriority,
-                           &captureTaskHandle_, kAudioCore);
+  if (xTaskCreatePinnedToCore(captureTaskFn, "audio_cap", 4096, this, kCapturePriority,
+                            &captureTaskHandle_, kAudioCore) != pdPASS) {
+    active_ = false; captureTaskDone_ = writeTaskDone_ = true;
+    file_.close(); NoteFiles::fs().remove(path); return false;
+  }
   // File::write() do LittleFS estourou uma stack de 4096 bytes na
   // pratica (Guru Meditation: "Stack canary watchpoint triggered
   // (audio_wr)") - o driver de flash usa varios KB internamente.
-  xTaskCreatePinnedToCore(writeTaskFn, "audio_wr", 8192, this, kWritePriority,
-                           &writeTaskHandle_, kAudioCore);
+  if (xTaskCreatePinnedToCore(writeTaskFn, "audio_wr", 8192, this, kWritePriority,
+                            &writeTaskHandle_, kAudioCore) != pdPASS) {
+    stopRequested_ = true; writeTaskDone_ = true;
+    while (!captureTaskDone_) vTaskDelay(pdMS_TO_TICKS(5));
+    active_ = false; file_.close(); NoteFiles::fs().remove(path); return false;
+  }
   return true;
 }
 
@@ -72,9 +92,16 @@ void Recorder::captureTaskFn(void *arg) {
   while (!self->stopRequested_) {
     size_t bytesRead = 0;
     if (self->codec_->read(buf, sizeof(buf), &bytesRead, 200) && bytesRead > 0) {
-      size_t sent = xStreamBufferSend(ring, buf, bytesRead, pdMS_TO_TICKS(50));
+      bytesRead -= bytesRead % 4;
+      if (xStreamBufferSpacesAvailable(ring) < bytesRead) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        if (xStreamBufferSpacesAvailable(ring) < bytesRead) { self->overflowCount_++; continue; }
+      }
+      size_t sent = xStreamBufferSend(ring, buf, bytesRead, 0);
       if (sent < bytesRead) {
         self->overflowCount_++;
+        self->writeFailed_ = true;
+        self->stopRequested_ = true;
       }
     }
   }
@@ -107,6 +134,20 @@ void Recorder::writeTaskFn(void *arg) {
   static int16_t monoBuf[kChunkBytes / 4];
   static uint8_t writeAccum[kWriteChunkBytes];
   size_t accumLen = 0;
+  auto flush = [&]() {
+    if (!accumLen) return;
+    if (!self->writeFailed_) {
+      size_t room = self->maximumBytes_ - self->dataBytes_;
+      size_t wanted = accumLen < room ? accumLen : room;
+      size_t written = wanted ? self->file_.write(writeAccum, wanted) : 0;
+      self->dataBytes_ += written & ~static_cast<size_t>(1);
+      if (written != wanted) { self->writeFailed_ = true; self->stopRequested_ = true; }
+      if (wanted < accumLen || self->dataBytes_ >= self->maximumBytes_) {
+        self->storageFull_ = true; self->stopRequested_ = true;
+      }
+    }
+    accumLen = 0;
+  };
 
   for (;;) {
     size_t got = xStreamBufferReceive(ring, stereoBuf, sizeof(stereoBuf), pdMS_TO_TICKS(100));
@@ -126,17 +167,16 @@ void Recorder::writeTaskFn(void *arg) {
         accumLen += take;
         offset += take;
         if (accumLen == kWriteChunkBytes) {
-          self->dataBytes_ += self->file_.write(writeAccum, accumLen);
-          accumLen = 0;
+          flush();
         }
       }
     }
 
-    if (self->stopRequested_ && xStreamBufferIsEmpty(ring)) break;
+    if (self->stopRequested_ && self->captureTaskDone_ && xStreamBufferIsEmpty(ring)) break;
   }
 
   if (accumLen > 0) {
-    self->dataBytes_ += self->file_.write(writeAccum, accumLen);
+    flush();
   }
 
   self->writeTaskDone_ = true;
@@ -153,8 +193,8 @@ uint32_t Recorder::stop() {
   active_ = false;
 
   WavHeader hdr = makeWavHeader(sampleRate_, 1, dataBytes_);
-  file_.seek(0);
-  file_.write((const uint8_t *)&hdr, sizeof(hdr));
+  if (!file_.seek(0) || file_.write((const uint8_t *)&hdr, sizeof(hdr)) != sizeof(hdr)) writeFailed_ = true;
+  file_.flush();
   file_.close();
   return dataBytes_;
 }

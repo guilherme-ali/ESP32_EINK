@@ -1,12 +1,19 @@
 #pragma once
 #include <Arduino.h>
 #include "settings.h"
+#include "gemini_client.h"
 
-// Envia um WAV (LittleFS) para uma API de transcricao (Gemini / OpenAI /
-// Groq) e gera resumos estruturados em Markdown via LLM.
+// O chamador fornece os buffers (preferencialmente em PSRAM). Falhas sempre
+// deixam o destino vazio; texto parcial/truncado nunca representa sucesso.
 class SttClient {
 public:
-  static constexpr size_t kMaxTextLen = 4096;
+  static constexpr size_t kMaxTextLen = 32768; // capacidade, incluindo NUL
   bool transcribe(const Settings &cfg, const char *wavPath, char *outText, size_t outLen);
   bool generateSummary(const Settings &cfg, const char *transcriptText, char *outMarkdown, size_t outLen);
+  const String &lastError() const { return diagnostics_.error; }
+  int lastStatusCode() const { return diagnostics_.status; }
+  const String &lastModel() const { return diagnostics_.model; }
+
+private:
+  SttNet::Diagnostics diagnostics_;
 };

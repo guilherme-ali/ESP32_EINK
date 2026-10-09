@@ -11,7 +11,7 @@ bool readLineUntil(WiFiClientSecure &client, String &line, uint32_t deadline) {
       if (value == '\r') continue;
       if (value == '\n') return true;
       line += (char)value;
-      if (line.length() > 512) return false;
+      if (line.length() > 4096) return false;
     }
     if (!client.connected() && !client.available()) return line.length() > 0;
     delay(1);
@@ -139,6 +139,10 @@ bool HttpClient::readResponse(WiFiClientSecure &client, HttpResponse &out,
     out.bodyComplete = true;
     return true;
   }
+  if (out.statusCode == 204 || out.statusCode == 304) {
+    out.bodyComplete = true;
+    return true;
+  }
 
   if (out.chunked) {
     while (true) {
@@ -148,17 +152,19 @@ bool HttpClient::readResponse(WiFiClientSecure &client, HttpResponse &out,
       }
       line.trim();
       if (line.length() == 0) continue;
-      size_t semicolon = line.indexOf(';');
+      int semicolon = line.indexOf(';');
       if (semicolon >= 0) line = line.substring(0, semicolon);
-      long chunkSize = strtol(line.c_str(), nullptr, 16);
-      if (chunkSize < 0) {
+      char *end = nullptr;
+      long chunkSize = strtol(line.c_str(), &end, 16);
+      if (chunkSize < 0 || end == line.c_str() || *end != '\0') {
         client.stop();
         return false;
       }
       if (chunkSize == 0) {
         // Trailer headers, if any, are irrelevant to our bounded JSON body.
-        while (readLineUntil(client, line, deadline) && line.length() > 0) {
-        }
+        do {
+          if (!readLineUntil(client, line, deadline)) { client.stop(); return false; }
+        } while (line.length() > 0);
         out.bodyComplete = true;
         return true;
       }
@@ -167,7 +173,7 @@ bool HttpClient::readResponse(WiFiClientSecure &client, HttpResponse &out,
         client.stop();
         return false;
       }
-      if (!readLineUntil(client, line, deadline)) {
+      if (!readLineUntil(client, line, deadline) || line.length() != 0) {
         client.stop();
         return false;
       }
@@ -236,7 +242,7 @@ bool HttpClient::isRetryableStatus(int statusCode, const String &body) {
 }
 
 uint32_t HttpClient::retryDelayMs(int attempt, uint32_t retryAfterSec) {
-  if (retryAfterSec > 60) return 0;
+  if (retryAfterSec > 60) return UINT32_MAX;
   if (retryAfterSec > 0) return retryAfterSec * 1000UL;
   int boundedAttempt = constrain(attempt, 0, 5);
   uint32_t base = 1000UL << boundedAttempt;

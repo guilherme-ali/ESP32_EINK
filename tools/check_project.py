@@ -125,6 +125,15 @@ def main() -> int:
                        str(HOST / "progress_tests.cpp"), "-o", str(portable)], diagnostics=True)
     print(f"Host build (progress_tests, sem SDK): {'OK' if portable_ok else 'FALHOU'}")
     ok = (run([str(portable)], timeout=30) if portable_ok else False) and ok
+    recorder = BUILD / ("recorder_tests" + (".exe" if os.name == "nt" else ""))
+    recorder_ok = run([cxx, *flags, "-pthread", "-Werror",
+                       str(ROOT / "src" / "audio" / "recorder.cpp"),
+                       *(str(path) for path in SOURCES), str(HOST / "fakes.cpp"),
+                       str(HOST / "recorder_tests.cpp"), str(obj), "-Wl,--gc-sections", "-o", str(recorder)],
+                      diagnostics=True)
+    print(f"Host build (recorder_tests): {'OK' if recorder_ok else 'FALHOU'}")
+    ok = (run([str(recorder)], timeout=60) if recorder_ok else False) and ok
+    ok = run([sys.executable, str(ROOT / "tools" / "check_littlefs_recording.py"), "--cxx", cxx], timeout=180) and ok
     # There was no existing project linter/test runner; this lint is opt-in.
     if args.cppcheck:
         lint = shutil.which("cppcheck")
@@ -138,7 +147,8 @@ def main() -> int:
                            "--std=c++17", "--inline-suppr", "--quiet", "-DCJSON_HIDE_SYMBOLS",
                            "--suppress=normalCheckLevelMaxBranches",
                            "-I" + str(HOST / "stubs"), "-I" + str(cjson),
-                           *(str(path) for path in SOURCES)], cwd=lint_cwd,
+                            *(str(path) for path in SOURCES),
+                            str(ROOT / "src" / "audio" / "recorder.cpp")], cwd=lint_cwd,
                           diagnostics=True)
             print(f"cppcheck: {'OK' if lint_ok else 'FALHOU'}")
             ok = lint_ok and ok

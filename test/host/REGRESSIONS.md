@@ -13,4 +13,22 @@
   Não há `xfail`, remoção do caso ou expectativa que aceite o defeito.
 
 Fases literais sem bytes conservam mensagens descritivas. O conjunto atual
-passa nos 155 testes, incluindo as regressões de fila, cache e contadores.
+passa nos 196 testes, incluindo as regressões de fila, cache, contadores e gravação.
+
+## Gravação longa: finalização e recuperação
+
+- O gravador antigo fazia `seek(0)` e atualizava o cabeçalho de um arquivo
+  LittleFS grande. A cadeia CTZ exige copiar o restante, podendo falhar por
+  falta de espaço. Não havia checkpoints reais de `File::flush` durante a captura.
+- O gravador real agora escreve PCM append-only e um cabeçalho separado. A suíte
+  compara todas as 960.000 amostras do canal esquerdo de 60 s a 16 kHz, além de
+  gravações consecutivas, overflow terminal, falhas de tasks/escrita/flush,
+  preservação de prefixo e recuperação somente leitura.
+- Drive recebe o WAV canônico de 1.920.044 bytes; hash e confirmação usam a mesma
+  view, incluindo recuperação de placeholder legado. Escrita zero não é WAV válido.
+- Uma suíte adicional usa LittleFS upstream real em NOR simulado. A atualização
+  de header do novo desenho não programa nem apaga blocos pertencentes ao PCM.
+  Checkpoints e rename são verificados por remontagem de snapshots.
+- Exclusão com falha retém tombstone e pode ser repetida, sem perder o caminho
+  para limpar PCM. Colisões não sobrescrevem sessões anteriores.
+- Detalhes e o que ainda requer hardware: `test/VALIDACAO_GRAVACAO_LONGA.md`.

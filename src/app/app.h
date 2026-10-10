@@ -50,11 +50,13 @@ public:
   void loop();
   void diagnosticCommand(const String &command);
   bool isSyncActive() const { return syncJob_.isActive(); }
+  bool isAudioActive() const { return recording_; }
 
 private:
   enum class Screen {
     Home,
     Recording,
+    Saving,
     RootMenu,
     NotesList,
     NoteDetail,
@@ -116,6 +118,8 @@ private:
   char kbPassBuf_[65] = "";
 
   bool recording_ = false;
+  bool discardRecording_ = false;
+  uint32_t savingStartMs_ = 0, savingLastDrawMs_ = 0;
   char currentRecordingPath_[48] = "";
   uint32_t recordingStartMs_ = 0;
   bool syncResultForNote_ = false;
@@ -164,7 +168,9 @@ private:
   void drawWifiScanList();
 
   void startRecording();
-  void stopRecording();
+  void stopRecording(bool discard = false);
+  void finishRecording();
+  void serviceRecordingSave();
   void playSelected(int index);
 
   bool startSync(int index = -1, bool forNote = false, const char *wavPath = nullptr);

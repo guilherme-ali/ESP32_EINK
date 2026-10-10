@@ -202,7 +202,12 @@ void WifiManager::handleListNotes() {
       String name = f.name();
       int slash = name.lastIndexOf('/');
       if (slash >= 0) name = name.substring(slash + 1);
-      out += name + "\t" + String((unsigned long)f.size()) + "\n";
+      size_t size = f.size();
+      if (name.endsWith(".wav")) {
+        File audio = NoteFiles::openRead("/notes/" + name);
+        if (audio) size = audio.size();
+      }
+      out += name + "\t" + String((unsigned long)size) + "\n";
     }
     f = dir.openNextFile();
   }
@@ -223,7 +228,7 @@ void WifiManager::handleGetNote() {
     return;
   }
   String path = "/notes/" + name;
-  File f = NoteFiles::fs().open(path, FILE_READ);
+  File f = NoteFiles::openRead(path);
   if (!f) {
     server_.send(404, "text/plain", "nao encontrado");
     return;

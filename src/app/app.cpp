@@ -106,8 +106,9 @@ void App::markActivity() { lastActivityMs_ = millis(); }
 uint32_t App::bytesPerSec() const { return settingsStore_.get().audioSampleRateHz * 2; }
 
 void App::formatDuration(uint32_t bytes, uint32_t sampleRateHz, char *out, size_t outLen) const {
-  uint32_t bps = sampleRateHz > 0 ? sampleRateHz * 2 : bytesPerSec();
-  float secs = bytes / (float)bps;
+  if (!sampleRateHz || bytes <= sizeof(WavHeader)) { snprintf(out, outLen, "sem audio"); return; }
+  uint32_t bps = sampleRateHz * 2;
+  float secs = (bytes - sizeof(WavHeader)) / (float)bps;
   snprintf(out, outLen, "%.0fs", secs);
 }
 
@@ -396,32 +397,80 @@ void App::startRecording() {
   codec_.enable(true);
   codec_.setMicGain(settingsStore_.get().micGainDb);
   if (!recorder_.start(currentRecordingPath_, sampleRate, &codec_)) {
+    codec_.enable(false);
     Serial.println("!! ERRO: Recorder.start falhou.");
+    showSyncResult("Nao foi possivel iniciar gravacao; nenhum audio existente foi sobrescrito.");
     return;
   }
 
   recording_ = true;
+  discardRecording_ = false;
   screen_ = Screen::Recording;
   recordingStartMs_ = millis();
-  Screens::drawRecording(canvas_, epd_, 0, (uint32_t)(NoteFiles::recordingBytes() / bytesPerSec()));
+  Screens::drawRecording(canvas_, epd_, 0, recorder_.maximumBytes() / bytesPerSec());
   Serial.printf("Gravando em %s (%lu Hz)\n", currentRecordingPath_, (unsigned long)sampleRate);
 }
 
-void App::stopRecording() {
-  uint32_t bytes = recorder_.stop();
+void App::stopRecording(bool discard) {
+  if (!recording_ || screen_ == Screen::Saving) return;
+  discardRecording_ = discard;
+  recorder_.requestStop();
+  screen_ = Screen::Saving;
+  savingStartMs_ = millis(); savingLastDrawMs_ = millis() - 2000;
+  markActivity();
+  serviceRecordingSave();
+}
+
+void App::serviceRecordingSave() {
+  // Nada de sono, rede, leitura de notas ou operacoes concorrentes enquanto
+  // o writer ainda possui o PCM. O loop continua atendendo o watchdog.
+  if (recorder_.isFinished()) { finishRecording(); return; }
+  uint32_t now = millis();
+  if (now - savingLastDrawMs_ >= 2000) {
+    savingLastDrawMs_ = now;
+    char message[128];
+    snprintf(message, sizeof(message), "%lus persistidos\n%lu KiB escritos\nFinalizando audio...",
+             (unsigned long)(recorder_.checkpointBytes() / bytesPerSec()),
+             (unsigned long)(recorder_.bytesWritten() / 1024));
+    Screens::drawText(canvas_, epd_, discardRecording_ ? "Descartando" : "Salvando", message, "Aguarde finalizar");
+  }
+}
+
+void App::finishRecording() {
+  uint32_t bytes = recorder_.finish();
   codec_.enable(false);
   recording_ = false;
+  markActivity();
   Serial.printf("Gravacao parada: %u bytes, %u overflow(s) no ring buffer\n", bytes,
                 (unsigned)recorder_.overflowCount());
+  Serial.printf("[Record] finalize_ms=%lu checkpoint=%lu full=%d failed=%d\n",
+                (unsigned long)(millis() - savingStartMs_), (unsigned long)recorder_.checkpointBytes(),
+                recorder_.storageFull(), recorder_.writeFailed());
+  if (discardRecording_) {
+    bool removed = NoteFiles::removeWav(currentRecordingPath_); notes_.markDirty();
+    if (!removed) { showSyncResult("Falha ao descartar; exclusao sera retomada ao reiniciar."); return; }
+    Serial.println("Gravacao descartada."); goHome(); return;
+  }
+
+  // Nunca apresentar um marcador vazio como nota 0s. Confirmar ausencia
+  // de PCM por uma abertura independente; erro de leitura nao autoriza apagar.
+  File payload = NoteFiles::fs().open(NoteFiles::pcmPath(currentRecordingPath_), FILE_READ);
+  bool knownEmpty = payload && !payload.isDirectory() && payload.size() == 0;
+  payload.close();
+  if (knownEmpty) {
+    bool removed = NoteFiles::removeWav(currentRecordingPath_); notes_.markDirty();
+    if (!removed) showSyncResult("Falha ao limpar gravacao vazia; limpeza sera retomada no reinicio.");
+    else if (recorder_.writeFailed()) showSyncResult("Falha de gravacao: nenhuma amostra de audio foi salva.");
+    else goHome();
+    return;
+  }
 
   if (recorder_.writeFailed() || (bytes && !NoteFiles::validWav(currentRecordingPath_))) {
     notes_.markDirty();
-    showSyncResult("Falha ao finalizar WAV. Arquivo preservado para recuperacao; envio retido.");
+    showSyncResult("Gravacao interrompida ou falha de escrita. Audio persistido preservado; confira a nota antes de enviar.");
     return;
   }
-  if (bytes == 0) {
-    LittleFS.remove(currentRecordingPath_);
-  } else {
+  if (bytes != 0) {
     notes_.markDirty(); // nota nova no disco - refaz a varredura na proxima leitura
     if (settingsStore_.get().autoSyncEnabled) {
       // Com o toggle desligado (padrao), a nota fica so local ate o
@@ -429,6 +478,9 @@ void App::stopRecording() {
       // exatamente para nao depender de Wi-Fi logo apos gravar.
       startSync(-1, false, currentRecordingPath_);
       return;
+    }
+    if (recorder_.storageFull()) {
+      showSyncResult("Memoria cheia; audio finalizado e preservado. Libere espaco antes de gravar novamente."); return;
     }
     Screens::drawSaved(canvas_, epd_, notes_.count());
     delay(1200);
@@ -581,7 +633,9 @@ void App::startWifiScanFlow() {
 }
 
 void App::deleteSelectedNote() {
-  notes_.deleteAt(notesSel_);
+  if (!notes_.deleteAt(notesSel_)) {
+    notes_.markDirty(); showSyncResult("Exclusao incompleta; dados preservados ou limpeza pendente de reinicio."); return;
+  }
   goNotesList();
 }
 
@@ -602,6 +656,7 @@ void App::onButton(BtnId id, BtnAction action) {
     return;
   }
   switch (screen_) {
+    case Screen::Saving: break;
     case Screen::SyncBusy: break;
     case Screen::SyncResult:
       if (syncResultForNote_) goNoteDetail(notesSel_); else goHome();
@@ -641,12 +696,7 @@ void App::onButtonRecording(BtnId id, BtnAction action) {
   if (action == BtnAction::ShortClick) {
     stopRecording();
   } else if (action == BtnAction::LongPress) {
-    recorder_.stop();
-    codec_.enable(false);
-    recording_ = false;
-    LittleFS.remove(currentRecordingPath_);
-    Serial.println("Gravacao descartada.");
-    goHome();
+    stopRecording(true);
   }
 }
 
@@ -1036,13 +1086,15 @@ void App::onButtonKeyboardPassword(BtnId id, BtnAction action) {
 
 void App::loop() {
   if (isSyncActive()) { serviceSync(); return; }
+  if (screen_ == Screen::Saving) { serviceRecordingSave(); return; }
   if (screen_ == Screen::Recording) {
     static uint32_t lastUiUpdate = 0;
     uint32_t now = millis();
     if (now - lastUiUpdate >= 1000) {
       lastUiUpdate = now;
       uint32_t elapsedSec = (now - recordingStartMs_) / 1000;
-      uint32_t freeSec = (uint32_t)(NoteFiles::recordingBytes() / bytesPerSec());
+      uint32_t written = recorder_.bytesWritten();
+      uint32_t freeSec = (recorder_.maximumBytes() - written) / bytesPerSec();
       Screens::drawRecording(canvas_, epd_, elapsedSec, freeSec);
       if (recorder_.overflowCount() > 0) {
         Serial.printf("!! AVISO: %lu overflow(s) no ring buffer de audio\n",
@@ -1051,9 +1103,6 @@ void App::loop() {
     }
     if (recorder_.storageFull() || recorder_.writeFailed()) {
       stopRecording();
-      if (isSyncActive()) return;
-      if (recorder_.writeFailed()) showSyncResult("Falha ao gravar/finalizar WAV; arquivo preservado para recuperacao.");
-      else showSyncResult("Memoria de gravacao cheia; audio finalizado e preservado.");
     }
     return;
   }
@@ -1071,6 +1120,13 @@ void App::loop() {
 void App::diagnosticCommand(const String &command) {
   DiagnosticDone done{command};
   markActivity();
+  if (recording_) {
+    Serial.printf("[Record] busy=1 saving=%d bytes=%lu checkpoint=%lu overflow=%lu full=%d failed=%d\n",
+                  screen_ == Screen::Saving, (unsigned long)recorder_.bytesWritten(),
+                  (unsigned long)recorder_.checkpointBytes(), (unsigned long)recorder_.overflowCount(),
+                  recorder_.storageFull(), recorder_.writeFailed());
+    return;
+  }
   if (isSyncActive()) {
     SyncJob::Snapshot snapshot;
     if (command == "status" && syncJob_.snapshot(snapshot)) {

@@ -11,7 +11,7 @@ int16_t stereoBuf[kChunkFrames * 2];
 } // namespace
 
 bool Player::play(AudioCodec &codec, const char *path) {
-  File file = NoteFiles::fs().open(path, FILE_READ);
+  File file = NoteFiles::openRead(path);
   if (!file) return false;
 
   WavHeader hdr;
@@ -19,7 +19,7 @@ bool Player::play(AudioCodec &codec, const char *path) {
     file.close();
     return false;
   }
-  if (memcmp(hdr.riff, "RIFF", 4) != 0 || memcmp(hdr.wave, "WAVE", 4) != 0) {
+  if (!validWavHeader(hdr, file.size())) {
     file.close();
     return false;
   }

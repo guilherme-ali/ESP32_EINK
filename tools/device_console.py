@@ -41,7 +41,7 @@ def main():
         elif args.command == "listen":
             markers = ("[Diag]", "[Status]", "[Sync] IA:", "[Sync] Arquivos confirmados", "[Sync] Drive:", "[Sync] Transcricao:", "[Sync] Markdown:")
         elif args.command == "status":
-            markers = ("[Status]",)
+            markers = ("[DiagDone] status",)
         elif args.command == "wifi":
             markers = ("RTC sincronizado",)
         else:

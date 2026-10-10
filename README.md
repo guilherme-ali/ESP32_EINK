@@ -26,7 +26,7 @@ A pinagem completa está em `src/config/pins.h`.
 
 ## Funcionalidades
 
-- Gravação de voz em WAV PCM 16-bit, 8 kHz mono, sem compressão
+- Gravação de voz em WAV PCM 16-bit mono, com taxa configurável entre 8 e 48 kHz, sem compressão
 - Lista de notas na tela com horário e duração, navegável e reproduzível
 - Transcrição automática (Gemini por padrão; qualquer API compatível
   com o formato da OpenAI também funciona — Groq, OpenAI, etc.)
@@ -133,6 +133,32 @@ o resto (~4,75 MB na versão V2 da placa) para o LittleFS, onde ficam
 as gravações — sem cartão SD isso dá poucos minutos de áudio no total.
 
 ## Sincronização resiliente
+
+### Salvamento de gravações maiores
+
+- Novas notas armazenam um cabeçalho de 44 bytes em `.wav` e o áudio em
+  `.pcm`, escrito apenas por append. Parar a gravação atualiza atomicamente
+  somente o cabeçalho; não reescreve megabytes de áudio no LittleFS.
+- Reprodução, transcrição, hash, Drive e download HTTP recebem um WAV completo
+  e canônico por `NoteFiles::openRead`. Copiar só o `.wav` físico de uma imagem
+  da flash não exporta o áudio novo: use o download HTTP/Drive ou conserve
+  também o `.pcm`. Notas antigas com WAV completo continuam funcionando.
+- O writer chama `flush` a cada aproximadamente um segundo de áudio escrito.
+  Após interrupção, a leitura reconstrói duração/cabeçalho a partir das amostras
+  completas persistidas. A cauda ainda em RAM/I2S pode ser perdida; checkpoints
+  não equivalem à proteção de todas as amostras capturadas contra falta de energia.
+- WAVs antigos com cabeçalho placeholder e PCM persistido são recuperados na
+  leitura, sem reescrever o original. Um arquivo apenas com 44 bytes não contém
+  áudio recuperável. Arquivos inválidos aparecem como `sem audio`, fora do lote
+  normal; uma falha de escrita confirmadamente vazia é limpa ao finalizar.
+- A tela `Salvando` acompanha o dreno sem bloquear o loop principal. Sono,
+  operações concorrentes de notas e atendimento HTTP ficam suspensos enquanto
+  captura/finalização possuem o arquivo; o writer cede CPU entre blocos.
+- Falta de espaço encerra e preserva o prefixo. Saturação do buffer interrompe
+  explicitamente a sessão, sem continuar descartando trechos silenciosamente.
+- Exclusões usam `.wav.delete` e são retomadas no boot caso tenham sido interrompidas.
+
+Regressões e limites de validação: `test/VALIDACAO_GRAVACAO_LONGA.md`.
 
 - O WAV é finalizado e validado antes de transcrever. TXT/Markdown são
   escritos em arquivos temporários, verificados e promovidos ao destino.

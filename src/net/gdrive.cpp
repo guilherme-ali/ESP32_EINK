@@ -209,7 +209,7 @@ struct ContentGuard {
 bool fileSnapshot(const char *path, bool text, size_t &size, String &hash,
                   ContentGuard *guard = nullptr) {
   if (!path || !*path || (text ? !NoteFiles::validText(path) : !NoteFiles::validWav(path))) return false;
-  File f = NoteFiles::fs().open(path, FILE_READ);
+  File f = NoteFiles::openRead(path);
   if (!f || f.isDirectory() || f.size() == 0) return false;
   size = f.size();
   MD5Builder md5;
@@ -1097,7 +1097,7 @@ struct GDriveClient::Job {
     }
     bool valid = snapshot && snapshot->size == a.size && snapshot->hash.equalsIgnoreCase(a.hash) &&
                  (text ? NoteFiles::validText(path) : NoteFiles::validWav(path));
-    File file = valid ? NoteFiles::fs().open(path, FILE_READ) : File();
+    File file = valid ? NoteFiles::openRead(path) : File();
     ContentGuard guard;
     size_t remaining = a.size;
     uint8_t buffer[1024];
@@ -1401,7 +1401,7 @@ struct GDriveClient::Job {
       target += "?uploadType=multipart&fields=" + urlEncode(kFileFields);
       String extra = "Content-Type: multipart/related; boundary=" + boundary + "\r\n";
       if (!localUnchanged(a, path, text) || !persist()) return false;
-      File file = NoteFiles::fs().open(path, FILE_READ);
+      File file = NoteFiles::openRead(path);
       if (!file || file.size() != a.size) return error("Arquivo local indisponivel para multipart", 0);
       freshReservation[index] = false;
       inspected[index] = Remote::Unknown;
@@ -1460,7 +1460,7 @@ struct GDriveClient::Job {
         if (a.uploaded) return true;
       }
       if (a.offset == a.size) return complete(a, path, name.c_str(), stage, text);
-      File file = NoteFiles::fs().open(path, FILE_READ);
+      File file = NoteFiles::openRead(path);
       if (!file || file.size() != a.size) return error("Arquivo local indisponivel para enviar bloco", 0);
       size_t start = a.offset;
       size_t length = a.size - start < kChunkBytes ? a.size - start : kChunkBytes;

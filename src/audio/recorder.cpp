@@ -26,38 +26,41 @@ constexpr BaseType_t kAudioCore = 0; // loop() do Arduino roda no core 1
 } // namespace
 
 bool Recorder::start(const char *path, uint32_t sampleRate, AudioCodec *codec) {
-  if (active_) return false;
-
-  file_ = NoteFiles::fs().open(path, FILE_WRITE);
-  if (!file_) return false;
+  if (active_ || !path || !codec || strlen(path) >= sizeof(path_) ||
+      !String(path).endsWith(".wav") || !validPcmFormat(makeWavHeader(sampleRate, 1, 0)) ||
+      NoteFiles::noteExists(path)) return false;
 
   sampleRate_ = sampleRate;
   codec_ = codec;
   dataBytes_ = 0;
+  checkpointBytes_ = 0;
   overflowCount_ = 0;
   storageFull_ = false;
   writeFailed_ = false;
-  maximumBytes_ = static_cast<uint32_t>(NoteFiles::recordingBytes()) & ~1UL;
-  if (maximumBytes_ < sampleRate * 2) { file_.close(); NoteFiles::fs().remove(path); return false; }
+  uint64_t available = NoteFiles::recordingBytes();
+  available = available > sizeof(WavHeader) ? available - sizeof(WavHeader) : 0;
+  maximumBytes_ = static_cast<uint32_t>(std::min<uint64_t>(available, UINT32_MAX - 44)) & ~uint32_t(1);
+  if (maximumBytes_ < sampleRate * 2) return false;
+  strlcpy(path_, path, sizeof(path_));
   stopRequested_ = false;
 
   WavHeader placeholder = makeWavHeader(sampleRate_, 1, 0);
-  if (file_.write((const uint8_t *)&placeholder, sizeof(placeholder)) != sizeof(placeholder)) {
-    file_.close(); NoteFiles::fs().remove(path); return false;
-  }
+  if (!NoteFiles::writeWavHeader(path, placeholder)) return false;
+  file_ = NoteFiles::fs().open(NoteFiles::pcmPath(path), FILE_APPEND);
+  if (!file_) { NoteFiles::removeWav(path); return false; }
 
   if (!ringStorage_) {
     ringStorage_ = (uint8_t *)heap_caps_malloc(kRingBytes + 1, MALLOC_CAP_SPIRAM);
     ringStruct_ = malloc(sizeof(StaticStreamBuffer_t));
     if (!ringStorage_ || !ringStruct_) {
       free(ringStorage_); free(ringStruct_); ringStorage_ = nullptr; ringStruct_ = nullptr;
-      file_.close(); NoteFiles::fs().remove(path); return false;
+      file_.close(); NoteFiles::removeWav(path); return false;
     }
     ring_ = xStreamBufferCreateStatic(kRingBytes, 1, ringStorage_,
                                        (StaticStreamBuffer_t *)ringStruct_);
     if (!ring_) {
       free(ringStorage_); free(ringStruct_); ringStorage_ = nullptr; ringStruct_ = nullptr;
-      file_.close(); NoteFiles::fs().remove(path); return false;
+      file_.close(); NoteFiles::removeWav(path); return false;
     }
   } else {
     xStreamBufferReset((StreamBufferHandle_t)ring_);
@@ -70,7 +73,7 @@ bool Recorder::start(const char *path, uint32_t sampleRate, AudioCodec *codec) {
   if (xTaskCreatePinnedToCore(captureTaskFn, "audio_cap", 4096, this, kCapturePriority,
                             &captureTaskHandle_, kAudioCore) != pdPASS) {
     active_ = false; captureTaskDone_ = writeTaskDone_ = true;
-    file_.close(); NoteFiles::fs().remove(path); return false;
+    file_.close(); NoteFiles::removeWav(path); finish(); return false;
   }
   // File::write() do LittleFS estourou uma stack de 4096 bytes na
   // pratica (Guru Meditation: "Stack canary watchpoint triggered
@@ -79,7 +82,7 @@ bool Recorder::start(const char *path, uint32_t sampleRate, AudioCodec *codec) {
                             &writeTaskHandle_, kAudioCore) != pdPASS) {
     stopRequested_ = true; writeTaskDone_ = true;
     while (!captureTaskDone_) vTaskDelay(pdMS_TO_TICKS(5));
-    active_ = false; file_.close(); NoteFiles::fs().remove(path); return false;
+    active_ = false; file_.close(); NoteFiles::removeWav(path); finish(); return false;
   }
   return true;
 }
@@ -95,7 +98,10 @@ void Recorder::captureTaskFn(void *arg) {
       bytesRead -= bytesRead % 4;
       if (xStreamBufferSpacesAvailable(ring) < bytesRead) {
         vTaskDelay(pdMS_TO_TICKS(50));
-        if (xStreamBufferSpacesAvailable(ring) < bytesRead) { self->overflowCount_++; continue; }
+        if (xStreamBufferSpacesAvailable(ring) < bytesRead) {
+          self->overflowCount_++; self->writeFailed_ = true;
+          self->stopRequested_ = true; break;
+        }
       }
       size_t sent = xStreamBufferSend(ring, buf, bytesRead, 0);
       if (sent < bytesRead) {
@@ -134,17 +140,29 @@ void Recorder::writeTaskFn(void *arg) {
   static int16_t monoBuf[kChunkBytes / 4];
   static uint8_t writeAccum[kWriteChunkBytes];
   size_t accumLen = 0;
+  bool ioFailed = false;
   auto flush = [&]() {
     if (!accumLen) return;
-    if (!self->writeFailed_) {
+    // Overflow na captura interrompe a sessao mas ainda drenamos todo o
+    // prefixo aceito no ring. Apenas falha de I/O impede novas escritas.
+    if (!ioFailed) {
       size_t room = self->maximumBytes_ - self->dataBytes_;
       size_t wanted = accumLen < room ? accumLen : room;
       size_t written = wanted ? self->file_.write(writeAccum, wanted) : 0;
       self->dataBytes_ += written & ~static_cast<size_t>(1);
-      if (written != wanted) { self->writeFailed_ = true; self->stopRequested_ = true; }
+      if (written != wanted) { ioFailed = true; self->writeFailed_ = true; self->stopRequested_ = true; }
       if (wanted < accumLen || self->dataBytes_ >= self->maximumBytes_) {
         self->storageFull_ = true; self->stopRequested_ = true;
       }
+      // Commit append-only a cada ~1s de audio. Um reset preserva os
+      // checkpoints anteriores; nao depende de close() no fim da sessao.
+      if (self->dataBytes_.load() - self->checkpointBytes_.load() >= self->sampleRate_ * 2) {
+        self->file_.flush();
+        self->checkpointBytes_ = self->dataBytes_.load();
+      }
+      // taskYIELD nao libera CPU para IDLE0 (prioridade menor). Bloquear
+      // pelo menos um tick evita starvation do watchdog no dreno da fila.
+      vTaskDelay(1);
     }
     accumLen = 0;
   };
@@ -179,6 +197,17 @@ void Recorder::writeTaskFn(void *arg) {
     flush();
   }
 
+  self->file_.flush();
+  self->file_.close();
+  File persisted = NoteFiles::fs().open(NoteFiles::pcmPath(self->path_), FILE_READ);
+  uint32_t expected = self->dataBytes_.load();
+  bool committed = persisted && persisted.size() == expected;
+  persisted.close();
+  if (!committed) self->writeFailed_ = true;
+  else self->checkpointBytes_ = expected;
+  // Somente 44 bytes atomicos: nunca seek(0) no arquivo grande de PCM.
+  if (committed && !NoteFiles::writeWavHeader(self->path_, makeWavHeader(self->sampleRate_, 1, expected)))
+    self->writeFailed_ = true;
   self->writeTaskDone_ = true;
   vTaskDelete(nullptr);
 }
@@ -186,15 +215,20 @@ void Recorder::writeTaskFn(void *arg) {
 uint32_t Recorder::stop() {
   if (!active_) return dataBytes_;
 
-  stopRequested_ = true;
-  while (!captureTaskDone_ || !writeTaskDone_) {
+  requestStop();
+  while (!isFinished()) {
     vTaskDelay(pdMS_TO_TICKS(5));
   }
-  active_ = false;
+  return finish();
+}
 
-  WavHeader hdr = makeWavHeader(sampleRate_, 1, dataBytes_);
-  if (!file_.seek(0) || file_.write((const uint8_t *)&hdr, sizeof(hdr)) != sizeof(hdr)) writeFailed_ = true;
-  file_.flush();
-  file_.close();
+uint32_t Recorder::finish() {
+  if (!isFinished()) return dataBytes_;
+  active_ = false;
+  if (ring_) vStreamBufferDelete((StreamBufferHandle_t)ring_);
+  ring_ = nullptr;
+  free(ringStorage_); free(ringStruct_);
+  ringStorage_ = nullptr; ringStruct_ = nullptr;
+  captureTaskHandle_ = writeTaskHandle_ = nullptr;
   return dataBytes_;
 }

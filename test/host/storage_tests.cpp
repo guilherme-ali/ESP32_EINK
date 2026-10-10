@@ -326,6 +326,109 @@ TEST(note_valid_wav_requires_canonical_header_and_exact_size) {
   }
 }
 
+TEST(split_wav_sixty_seconds_uploads_canonical_header_and_entire_pcm) {
+  auto s = driveSettings();
+  const auto bytes = Fixtures::sizedWav(44 + 60 * 16000 * 2);
+  auto placeholder = makeWavHeader(16000, 1, 0);
+  LittleFS.put(wav, std::string(reinterpret_cast<const char *>(&placeholder), sizeof(placeholder)));
+  LittleFS.put("/notes/test.pcm", bytes.substr(44));
+  newUploadReplies(bytes);
+  GDriveClient client; CHECK(client.uploadNote(s, wav));
+  CHECK(Host::requests.size() == 6 && Host::requests[4].find(bytes) != std::string::npos);
+  auto state = load();
+  CHECK(state.fullySynced && state.wavSize == bytes.size() && state.wavBytesUploaded == bytes.size());
+  CHECK(std::string(state.wavMd5) == Host::mockFileHash(bytes).c_str());
+  CHECK(LittleFS.bytes(wav).size() == 44 && LittleFS.bytes("/notes/test.pcm") == bytes.substr(44));
+  CHECK(!GDriveClient::needsUpload(wav, false));
+}
+
+TEST(split_wav_payload_change_invalidates_confirmed_hash_without_touching_header) {
+  auto s = driveSettings(); const auto bytes = Fixtures::wav();
+  LittleFS.put(wav, bytes.substr(0, 44)); LittleFS.put("/notes/test.pcm", bytes.substr(44));
+  newUploadReplies(bytes); GDriveClient client; CHECK(client.uploadNote(s, wav));
+  const auto header = LittleFS.bytes(wav);
+  auto changed = bytes.substr(44); changed.back() ^= 1;
+  LittleFS.put("/notes/test.pcm", changed);
+  CHECK(GDriveClient::needsUpload(wav, false) && LittleFS.bytes(wav) == header);
+}
+
+TEST(legacy_placeholder_is_uploaded_recovered_without_rewriting_source) {
+  auto s = driveSettings(); const auto bytes = Fixtures::sizedWav(44 + 32000);
+  auto header = makeWavHeader(16000, 1, 0);
+  const std::string broken = std::string(reinterpret_cast<const char *>(&header), sizeof(header)) + bytes.substr(44);
+  LittleFS.put(wav, broken); newUploadReplies(bytes);
+  GDriveClient client; CHECK(client.uploadNote(s, wav));
+  CHECK(Host::requests[4].find(bytes) != std::string::npos && load().fullySynced);
+  CHECK(LittleFS.bytes(wav) == broken && !LittleFS.exists("/notes/test.pcm"));
+}
+
+TEST(split_wav_unrecoverable_or_empty_payload_never_reaches_network) {
+  auto cfg = driveSettings(); auto header = makeWavHeader(16000, 1, 0);
+  const std::string marker(reinterpret_cast<const char *>(&header), sizeof(header));
+  for (const auto &pcm : {std::string(), std::string("x")}) {
+    LittleFS.put(wav, marker); LittleFS.put("/notes/test.pcm", pcm);
+    GDriveClient client; CHECK(!client.uploadNote(cfg, wav));
+    CHECK(Host::requests.empty() && !NoteFiles::validWav(wav));
+  }
+  auto corrupt = marker; corrupt[4] ^= 1;
+  LittleFS.put(wav, corrupt); LittleFS.put("/notes/test.pcm", "ab");
+  CHECK(!NoteFiles::validWav(wav) && Host::requests.empty());
+}
+
+TEST(split_wav_odd_tail_recovers_complete_samples_and_seek_crossing_header) {
+  auto header = makeWavHeader(16000, 1, 0);
+  LittleFS.put(wav, std::string(reinterpret_cast<const char *>(&header), sizeof(header)));
+  LittleFS.put("/notes/test.pcm", "abcdx");
+  File file = NoteFiles::openRead(wav);
+  CHECK(file.size() == 48 && NoteFiles::validWav(wav));
+  CHECK(file.seek(42)); uint8_t bytes[6]; CHECK(file.read(bytes, sizeof(bytes)) == 6);
+  CHECK(bytes[0] == 0 && bytes[1] == 0 && std::string(reinterpret_cast<char *>(bytes + 2), 4) == "abcd");
+  CHECK(file.available() == 0 && LittleFS.bytes("/notes/test.pcm") == "abcdx");
+}
+
+TEST(split_delete_retries_failed_pcm_removal_with_durable_tombstone) {
+  LittleFS.put(wav, "header"); LittleFS.put("/notes/test.pcm", "saved audio");
+  LittleFS.put("/notes/test.wav.tmp", "temporary header");
+  LittleFS.faults->failRemove = "/notes/test.pcm";
+  CHECK(!NoteFiles::removeWav(wav));
+  CHECK(!LittleFS.exists(wav) && LittleFS.bytes("/notes/test.wav.delete") == "header");
+  CHECK(LittleFS.bytes("/notes/test.pcm") == "saved audio");
+  LittleFS.faults->failRemove.clear(); CHECK(NoteFiles::removeWav(wav));
+  CHECK(!LittleFS.exists("/notes/test.pcm") && !LittleFS.exists("/notes/test.wav.tmp") &&
+        !LittleFS.exists("/notes/test.wav.delete"));
+  CHECK(NoteFiles::removeWav(wav)); // idempotente apos completar exclusao
+}
+
+TEST(split_delete_rename_failure_preserves_original_note_and_pcm) {
+  LittleFS.put(wav, "header"); LittleFS.put("/notes/test.pcm", "audio");
+  LittleFS.faults->failRename = wav;
+  CHECK(!NoteFiles::removeWav(wav) && LittleFS.bytes(wav) == "header" &&
+        LittleFS.bytes("/notes/test.pcm") == "audio" && !LittleFS.exists("/notes/test.wav.delete"));
+}
+
+TEST(split_delete_retries_crash_after_pcm_removed_before_tombstone_removed) {
+  LittleFS.put("/notes/test.wav.delete", "header");
+  LittleFS.faults->failRemove = "/notes/test.wav.delete";
+  CHECK(!NoteFiles::removeWav(wav) && LittleFS.exists("/notes/test.wav.delete"));
+  LittleFS.faults->failRemove.clear(); CHECK(NoteFiles::removeWav(wav));
+  CHECK(!LittleFS.exists("/notes/test.wav.delete"));
+}
+
+TEST(split_delete_keeps_tombstone_until_text_and_sync_assets_are_removed) {
+  LittleFS.put(wav, "header"); LittleFS.put("/notes/test.pcm", "audio");
+  LittleFS.put("/notes/test.txt", "old transcript"); LittleFS.put("/notes/test.md", "old markdown");
+  LittleFS.put(sync, "old state"); LittleFS.put("/notes/test.ai.tmp", "old metadata");
+  LittleFS.faults->failRemove = "/notes/test.txt";
+  CHECK(!NoteFiles::removeWav(wav));
+  CHECK(!LittleFS.exists(wav) && !LittleFS.exists("/notes/test.pcm"));
+  CHECK(LittleFS.exists("/notes/test.wav.delete") && NoteFiles::noteExists(wav));
+  CHECK(LittleFS.bytes("/notes/test.txt") == "old transcript" && LittleFS.bytes(sync) == "old state");
+  LittleFS.faults->failRemove.clear(); CHECK(NoteFiles::removeWav(wav));
+  CHECK(!NoteFiles::noteExists(wav) && !LittleFS.exists("/notes/test.txt") && !LittleFS.exists(sync));
+  CHECK(!LittleFS.exists("/notes/test.md") && !LittleFS.exists("/notes/test.ai.tmp"));
+  LittleFS.put("/notes/test.txt", "legacy orphan"); CHECK(NoteFiles::noteExists(wav));
+}
+
 TEST(drive_generate_id_persist_before_requests_and_final_get_verify) {
   auto s = driveSettings(); const auto bytes = Fixtures::wav(); LittleFS.put(wav, bytes); newUploadReplies(bytes);
   Host::onConnect = [](size_t index) {

@@ -3,6 +3,7 @@
 #include <Wire.h>
 #include <esp_sleep.h>
 #include <esp_heap_caps.h>
+#include <esp_system.h>
 
 #include "config/pins.h"
 #include "board/power.h"
@@ -290,6 +291,7 @@ void setup() {
   if (psramFound()) heap_caps_malloc_extmem_enable(8192);
   delay(2000);
   Serial.println("=================================");
+  Serial.printf("[Boot] reset_reason=%d wakeup=%d\n", (int)esp_reset_reason(), (int)esp_sleep_get_wakeup_cause());
   Serial.println("Gravador de Ideias - sincronizacao otimizada v3");
   Serial.println("=================================");
 
@@ -329,7 +331,7 @@ void setup() {
 
 void loop() {
   buttons.poll();
-  if (!app.isSyncActive()) wifiMgr.loop();
+  if (!app.isSyncActive() && !app.isAudioActive()) wifiMgr.loop();
   serviceNtpRtc();
   app.loop();
 #if ARDUINO_USB_CDC_ON_BOOT

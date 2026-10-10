@@ -4,14 +4,13 @@
 
 // Gerencia as gravacoes em /notes/ no LittleFS: listar, gerar o proximo
 // nome de arquivo (carimbado com hora do RTC) e reportar espaco livre.
-// Cada nota e por enquanto so um .wav (Fase 5 acrescenta o .txt da
-// transcricao, Fase 6 marca upload).
+// Novas notas usam .wav (cabecalho) + .pcm (payload), expostos como WAV
+// continuo por NoteFiles::openRead; legados completos continuam aceitos.
 struct NoteEntry {
   char path[48]; // "/notes/YYYYMMDD-HHMMSS.wav"
   char label[24]; // "YYYYMMDD-HHMMSS" sem extensao, para exibir na tela
   uint32_t sizeBytes;
-  uint32_t sampleRateHz; // lido do cabecalho WAV - notas antigas podem
-                          // ter sido gravadas numa taxa diferente da atual
+  uint32_t sampleRateHz; // taxa validada; zero indica nota sem WAV/PCM valido
   bool hasTxt; // tem NOME.txt (transcrita) do lado
   bool hasMd;  // tem NOME.md (resumo em topicos) do lado
   bool hasSnc; // tem NOME.snc (ja enviada ao Drive) do lado

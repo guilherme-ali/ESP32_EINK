@@ -33,13 +33,16 @@ inline WavHeader makeWavHeader(uint32_t sampleRate, uint16_t channels, uint32_t 
   return h;
 }
 
-inline bool validWavHeader(const WavHeader &h, size_t actualSize) {
-  return actualSize > sizeof(WavHeader) &&
-         memcmp(h.riff, "RIFF", 4) == 0 && memcmp(h.wave, "WAVE", 4) == 0 &&
+inline bool validPcmFormat(const WavHeader &h) {
+  return memcmp(h.riff, "RIFF", 4) == 0 && memcmp(h.wave, "WAVE", 4) == 0 &&
          memcmp(h.fmt, "fmt ", 4) == 0 && memcmp(h.data, "data", 4) == 0 &&
          h.fmtSize == 16 && h.audioFormat == 1 && h.numChannels == 1 &&
          h.bitsPerSample == 16 && h.blockAlign == 2 && h.sampleRate >= 8000 &&
-         h.sampleRate <= 48000 && h.byteRate == h.sampleRate * 2 && h.dataSize > 0 &&
+         h.sampleRate <= 48000 && h.byteRate == h.sampleRate * 2;
+}
+
+inline bool validWavHeader(const WavHeader &h, size_t actualSize) {
+  return actualSize > sizeof(WavHeader) && validPcmFormat(h) && h.dataSize > 0 &&
          h.dataSize % 2 == 0 && actualSize == sizeof(WavHeader) + h.dataSize &&
          h.chunkSize == 36 + h.dataSize;
 }

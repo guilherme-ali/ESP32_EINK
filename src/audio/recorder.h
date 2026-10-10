@@ -2,9 +2,10 @@
 #include <Arduino.h>
 #include <FS.h>
 #include "codec.h"
+#include <atomic>
 
 // Grava PCM 16-bit mono a partir do ES8311 (que fala I2S estereo - so o
-// canal esquerdo e mantido) direto num arquivo WAV em LittleFS.
+// canal esquerdo e mantido) em PCM append-only e cabecalho WAV separado.
 //
 // A leitura do I2S e a escrita em flash rodam em duas tasks proprias no
 // core 0 (o loop() do Arduino roda no core 1), ligadas por um ring
@@ -20,13 +21,17 @@ public:
   // configurados pelo chamador) durante toda a gravacao.
   bool start(const char *path, uint32_t sampleRate, AudioCodec *codec);
 
-  // Sinaliza parada, espera as duas tasks terminarem, corrige o
-  // cabecalho WAV com o tamanho final e fecha o arquivo. Bloqueia por
-  // no maximo alguns ms (so o tempo de esvaziar o que ja estava no ar).
+  // API bloqueante para chamadores sem UI. A UI usa requestStop/finish:
+  // o dreno/finalizacao roda no worker, sem bloquear o loop/watchdog.
   uint32_t stop();
+  void requestStop() { stopRequested_.store(true); }
+  bool isFinished() const { return captureTaskDone_.load() && writeTaskDone_.load(); }
+  uint32_t finish(); // somente depois de isFinished(); libera ring e marca inativo
 
   bool isActive() const { return active_; }
   uint32_t bytesWritten() const { return dataBytes_; }
+  uint32_t maximumBytes() const { return maximumBytes_; }
+  uint32_t checkpointBytes() const { return checkpointBytes_; }
 
   // Quantas vezes o ring buffer encheu e a task leitora teve que
   // descartar audio - deve ficar em 0 sempre; exposto para diagnostico.
@@ -36,18 +41,20 @@ public:
 
 private:
   File file_;
+  char path_[64] = "";
   AudioCodec *codec_ = nullptr;
   uint32_t sampleRate_ = 16000;
-  volatile uint32_t dataBytes_ = 0;
-  volatile uint32_t overflowCount_ = 0;
+  std::atomic<uint32_t> dataBytes_{0};
+  std::atomic<uint32_t> checkpointBytes_{0};
+  std::atomic<uint32_t> overflowCount_{0};
   uint32_t maximumBytes_ = 0;
-  volatile bool storageFull_ = false;
-  volatile bool writeFailed_ = false;
+  std::atomic<bool> storageFull_{false};
+  std::atomic<bool> writeFailed_{false};
   bool active_ = false;
 
-  volatile bool stopRequested_ = false;
-  volatile bool captureTaskDone_ = true;
-  volatile bool writeTaskDone_ = true;
+  std::atomic<bool> stopRequested_{false};
+  std::atomic<bool> captureTaskDone_{true};
+  std::atomic<bool> writeTaskDone_{true};
 
   void *ring_ = nullptr;    // StreamBufferHandle_t (tipo escondido do .h)
   void *ringStruct_ = nullptr; // StaticStreamBuffer_t*

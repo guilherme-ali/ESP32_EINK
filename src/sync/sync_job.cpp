@@ -268,6 +268,7 @@ SyncJob::StartResult SyncJob::start(NotesStore &notes, int onlyIndex, const char
     if (onlyIndex >= 0 && i != onlyIndex) continue;
     NoteEntry e;
     if (!notes.getAt(i, e) || (onlyPath && strcmp(e.path, onlyPath))) continue;
+    if (!e.sampleRateHz && onlyIndex < 0 && !onlyPath) continue;
     bool ai = ctx->hasStt && (!e.hasTxt || !e.hasMd);
     if (!ai && ctx->hasStt && !ctx->hasDrive) {
       Snapshot metadata;
@@ -282,7 +283,7 @@ SyncJob::StartResult SyncJob::start(NotesStore &notes, int onlyIndex, const char
     entry.initialTranscript = e.hasTxt; entry.initialMarkdown = e.hasMd;
     entry.needsAI = ctx->hasStt; // inclui reparo .ai somente na selecao pendente
     entry.needsUpload = upload; entry.forceVerify = force;
-    File file = NoteFiles::fs().open(e.path, FILE_READ);
+    File file = NoteFiles::openRead(e.path);
     WavHeader header;
     size_t size = file ? file.size() : 0;
     bool valid = file && file.read(reinterpret_cast<uint8_t *>(&header), sizeof(header)) == sizeof(header) &&

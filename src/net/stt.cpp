@@ -3,10 +3,7 @@
 #include <FS.h>
 #include <string.h>
 #include "../audio/wav.h"
-
-// Interface implementada pelo principal na camada de armazenamento. Não
-// vincular esta integração a LittleFS: fs() também permite SD/outros backends.
-namespace NoteFiles { fs::FS &fs(); }
+#include "../storage/note_files.h"
 
 namespace {
 using namespace SttNet;
@@ -170,7 +167,7 @@ bool SttClient::transcribe(const Settings &cfg, const char *wavPath, char *outTe
   uint16_t port = 443;
   if (!prepare(cfg, outText, outLen, host, port, path, diagnostics_)) return false;
   if (!wavPathValid(wavPath)) { diagnostics_.error = "caminho WAV fora de /notes/"; return false; }
-  File wav = NoteFiles::fs().open(wavPath, FILE_READ);
+  File wav = NoteFiles::openRead(wavPath);
   if (!wavValid(wav)) { diagnostics_.error = "WAV ausente, vazio ou inválido"; return false; }
   bool ok;
   if (host == "generativelanguage.googleapis.com" && port == 443) {

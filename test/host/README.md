@@ -26,15 +26,18 @@ upload serial, nem instala pacotes Python.
 - `src/net/settings.cpp`: carga/migrações, política gratuita, persistência de
   STT/Drive/política AI, limites 512/513 do refresh token e geração de autorização.
 - `src/storage/note_files.cpp`: implementação real de `fs`, espaço/reserva,
-  `readText`, `validText`, `validWav`, `writeAtomic` e `recoverText`.
+  `readText`, `validText`, `validWav`, `writeAtomic`, `recoverText`, WAV virtual,
+  atualização atômica do cabeçalho e exclusão retomável.
+- `src/audio/recorder.cpp`: captura, conversão estéreo/mono, checkpoints,
+  finalização, limites de espaço, falhas de escrita, overflow e ciclo das tasks.
 - `src/net/gdrive.cpp`: save/load/migração de `NoteSyncState` v3, consultas
   conservadoras, OAuth, IDs em lote, multipart binário, retomável em blocos de
   1 MiB, PATCH, TTL de token/pasta e confirmação estrita de tamanho/hash.
 - `src/sync/telemetry.cpp`: relógio, wrap, fases, esperas e contadores reais.
 - `src/sync/progress_model.cpp`: modelo real em build separado **sem SDK/mocks**.
 
-São quatro suítes: HTTP/STT/telemetria, Storage/Drive, integração Gemini e
-progresso portátil. As três primeiras compilam os nove `.cpp` reais acima.
+São seis suítes: HTTP/STT/telemetria, Storage/Drive, integração Gemini,
+progresso portátil, gravador e regressão com LittleFS upstream real.
 Gemini executa cada caso em processo novo: `endSession()` fecha TLS, mas preserva
 cache/fila de produção; os testes de reutilização fazem múltiplas chamadas no
 mesmo caso. Não há reset fictício nem alteração nos clientes. `main`/app não são
@@ -55,6 +58,13 @@ não de uma biblioteca pré-compilada para ESP32. A descoberta procura um par
 do PlatformIO. Se não encontrar, baixa **v1.7.17 do upstream DaveGamble/cJSON**
 para `test/host/.build/v1.7.17/`. O cache permite executar offline depois.
 Os arquivos oficiais mantêm os avisos/licença originais.
+
+O runner também baixa LittleFS **v2.9.3** do upstream oficial para
+`test/host/.build/littlefs-v2.9.3/`, verificando SHA-256 fixado dos quatro
+sources. Compila o filesystem como C99 e emula flash NOR em memória para
+comparar atualizações, espaço e remontagem após interrupção. Essa versão é
+fixada para a regressão; não foi identificada como a versão binária do SDK.
+Pode executar somente essa suíte com `python tools/check_littlefs_recording.py`.
 
 Para fornecer outra cópia oficial local, inclusive offline:
 
@@ -79,10 +89,16 @@ Para fornecer outra cópia oficial local, inclusive offline:
 - `File`/`fs::FS`/`LittleFS`: bytes compartilhados entre handles, reads/escritas
   curtos, seek, flush, existência, rename com replacement indivisível e espaço
   contabilizado em memória. `NoteFiles::fs()` agora é a implementação real.
-  `faults` permite falhar open/rename por caminho, limitar reads/write,
+  `faults` permite falhar open/rename/remove por caminho, limitar reads/write,
   interromper leitura com orçamento e corromper bytes no flush. Não simula
   journal, desgaste nem perda física de energia; capacidade controla os
   checks de admissão, não a alocação física de blocos.
+- `FileImpl`: delegação compatível com a interface do core 2.0.17; a view WAV
+  é código de produção, não uma montagem de bytes dentro do fake.
+- `FreeRTOS`/codec na suíte recorder: threads host, stream buffer limitado e
+  sinal determinístico estéreo. Inspeção de FS ocorre depois do join das tasks.
+  Não simula prioridades/core/DMA/watchdog do ESP32 nem usa o relógio Arduino fake
+  entre threads. `vTaskDelay` usa espera host e registra os yields do writer.
 - `Preferences`: fake NVS tipado por namespace, `isKey`, strings vazias,
   contagens de bytes dos puts e limite das strings lidas sem truncamento.
   `Host::failPuts` usa chaves `cfg/nome`; `failNvsBegin` falha abertura.
@@ -104,8 +120,8 @@ Para fornecer outra cópia oficial local, inclusive offline:
 ## Regressões cobertas
 
 O checker exige sucesso em todos os casos registrados e informa contagens reais.
-Resultado atual: HTTP/STT 56, Storage/Drive 58, Gemini integrado 26 e progresso
-portatil 15: **155 testes**. Gemini tambem cobre fila Files com quatro uploads,
+Resultado atual: HTTP/STT 56, Storage/Drive 67, Gemini integrado 26, progresso
+portátil 15, gravador 23 e LittleFS real 9: **196 testes**. Gemini tambem cobre fila Files com quatro uploads,
 fila restaurada com epoch zero/socket fechado, orcamento agregado de limpeza,
 troca de fingerprint, timestamp futuro e separacao de bytes por fase.
 Leitura de metadados em blocos e exercitada com arquivo parcial/grande e contador
@@ -117,8 +133,8 @@ multipart/IDs em lote. Um trio WAV/TXT/MD usa **9 requests**, conservando os tr�
 IDs antes do primeiro POST e recusando hash errado até na última resposta.
 Inclui resposta perdida → GET do mesmo ID; fontes alteradas durante/depois do
 upload; falhas de commit; 401 reativo; invalid_grant/NVS; 308/Range; keep-alive
-misto 2xx/4xx/5xx e erros antecipados de mídia. `cppcheck` analisa os nove arquivos
-reais; não há `xfail` nem supressão dessas regressões. Uma falha retorna 1.
+misto 2xx/4xx/5xx e erros antecipados de mídia. `cppcheck` também analisa o gravador;
+não há `xfail` nem supressão dessas regressões. Uma falha retorna 1.
 O fake de filesystem também recusa rename de arquivos abertos, conforme
 observado no LittleFS físico durante a atualização dos metadados `.ai`.
 Testes de resposta antecipada preservam HTTP 403/429 após envio interrompido
@@ -132,7 +148,7 @@ ou limitada a 15 s após a entrega sem alterar diagnóstico. O modelo cobre peso
 esperas congeladas, ETA/overdue/wrap, reutilização TXT/MD e 99% até `verified()`.
 
 Não exercitados end-to-end: slow_down/cancelamento/expiração OAuth, criação e
-paginação de pastas, concorrência real, TLS/MD5/SHA reais, NVS/LittleFS físicos e
+paginação de pastas, concorrência/prioridades do ESP32, TLS/MD5/SHA reais, NVS/LittleFS físicos e
 hardware. Setters antigos de Wi-Fi/áudio/UI não têm cobertura nesta suíte.
 Regressões de produção pendentes estão em `test/host/REGRESSIONS.md`.
 

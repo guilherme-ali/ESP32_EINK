@@ -7,7 +7,7 @@ namespace Assistant {
 // RFC 6455, sections 4, 5 and 8. No SDK, allocation or I/O in the parser.
 class WsParser {
 public:
-  enum class Event { None, Message, Ping, Pong, Close, Error };
+  enum class Event { None, Message, Ping, Pong, Close, Error, Audio };
   WsParser(uint8_t *storage, size_t capacity);
   Event feed(uint8_t byte);
   bool finish(); // EOF with an incomplete frame/message is an error.

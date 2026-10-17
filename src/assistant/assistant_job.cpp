@@ -6,13 +6,18 @@
 #include <ctime>
 #include <new>
 #include <vector>
+#if defined(ARDUINO_ARCH_ESP32)
+#include <esp_heap_caps.h>
+#endif
 
 namespace {
 constexpr size_t kCaptureBytes = 16000 * 2 * 30; // immutable prefix, no overwrite
 constexpr size_t kOutputBytes = 2 * 1024 * 1024;
 constexpr size_t kMaxAudioBytes = 192 * 1024;
 constexpr size_t kWifiPrebufferBytes = 24000; // 500 ms de PCM mono, 24 kHz/16 bits.
+constexpr size_t kOpusPrebufferBytes = 72000; // 1500 ms de PCM mono, 24 kHz/16 bits (evita starvation em jitter BLE).
 constexpr uint32_t kTurnMs = 180000;
+std::atomic<uint32_t> nextTurnId{1};
 void copyText(char *to, size_t cap, const char *from) {
   if (!cap) return;
   size_t n = std::min(strlen(from), cap - 1);
@@ -32,11 +37,17 @@ struct AssistantJob::Impl {
   std::atomic<size_t> captured{0}, produced{0}, consumed{0};
   std::atomic<bool> released{false}, cancelled{false}, captureDone{false};
   std::atomic<bool> launched{false}, networkDone{false}, workerStop{false}, failed{false};
+  std::atomic<bool> responseReady{false};
   std::atomic<bool> limited{false};
   std::atomic<bool> bufferedAudio{false};
+  std::atomic<bool> compressedAudio{false};
   std::atomic<uint32_t> rebufferCount{0};
   TaskHandle_t audioHandle = nullptr, networkHandle = nullptr, gatewayHandle = nullptr;
   uint32_t started = 0;
+  uint64_t startedUs = 0;
+  mutable portMUX_TYPE telemetryMux = portMUX_INITIALIZER_UNLOCKED;
+  AssistantJob::Telemetry telemetry;
+  std::atomic<size_t> sentInput{0};
   uint64_t nonce = 0;
   bool tools = false;
   float playbackVolume = 20;
@@ -53,6 +64,39 @@ struct AssistantJob::Impl {
   std::string workPayload, workId, workResult;
   size_t workIndex = 0;
   explicit Impl(AssistantJob *o, AudioCodec *c, ConnectFn fn) : owner(o), codec(c), connect(fn) {}
+  void stamp(uint32_t AssistantJob::Telemetry::*field) {
+    portENTER_CRITICAL(&telemetryMux);
+    uint32_t &value = telemetry.*field;
+    if (!value) value = static_cast<uint32_t>(assistantMonotonicUs() - startedUs);
+    portEXIT_CRITICAL(&telemetryMux);
+  }
+  void update(uint32_t AssistantJob::Telemetry::*field, uint32_t value) {
+    portENTER_CRITICAL(&telemetryMux); telemetry.*field = value; portEXIT_CRITICAL(&telemetryMux);
+  }
+  void updateMaxBacklog(size_t value) {
+    portENTER_CRITICAL(&telemetryMux);
+    telemetry.maxBacklogBytes = std::max(telemetry.maxBacklogBytes,
+      static_cast<uint32_t>(std::min(value, size_t(UINT32_MAX))));
+    portEXIT_CRITICAL(&telemetryMux);
+  }
+  void setRoutePhone(bool value) {
+    portENTER_CRITICAL(&telemetryMux); telemetry.routeKnown = true; telemetry.phoneRoute = value; portEXIT_CRITICAL(&telemetryMux);
+  }
+  void markRelease(bool physicalButton) {
+    portENTER_CRITICAL(&telemetryMux);
+    if (!telemetry.releaseUs) {
+      telemetry.releaseUs = static_cast<uint32_t>(assistantMonotonicUs() - startedUs);
+      telemetry.releaseSource = physicalButton ? 1 : 2;
+      const size_t capturedNow = captured.load(std::memory_order_acquire);
+      const size_t sentNow = sentInput.load(std::memory_order_acquire);
+      telemetry.backlogAtRelease = static_cast<uint32_t>(capturedNow > sentNow ? capturedNow - sentNow : 0);
+    }
+    portEXIT_CRITICAL(&telemetryMux);
+  }
+  AssistantJob::Telemetry metrics() const {
+    portENTER_CRITICAL(&telemetryMux); const auto copy = telemetry; portEXIT_CRITICAL(&telemetryMux);
+    return copy;
+  }
   ~Impl() {
     if (!key.empty()) std::fill(key.begin(), key.end(), '\0');
     if (!token.empty()) std::fill(token.begin(), token.end(), '\0');
@@ -82,14 +126,19 @@ struct AssistantJob::Impl {
     if (!Assistant::unbase64(data, strlen(data), pcm, kMaxAudioBytes) || (pcm.size() & 1)) {
       fail("Áudio Gemini inválido ou acima do limite de mensagem."); return false;
     }
+    return queuePcm(pcm.data(), pcm.size());
+  }
+  bool queuePcm(const uint8_t *data, size_t size) {
+    if ((size & 1) || size > kMaxAudioBytes) { fail("PCM de resposta invalido."); return false; }
     size_t offset = 0; const uint32_t begin = millis();
-    while (offset < pcm.size() && !stopped(this)) {
+    while (offset < size && !stopped(this)) {
       size_t p = produced.load(), c = consumed.load();
       size_t room = kOutputBytes - (p - c);
-      size_t take = std::min(pcm.size() - offset, room);
+      size_t take = std::min(size - offset, room);
       take = std::min(take, kOutputBytes - p % kOutputBytes);
       if (take) {
-        memcpy(output + p % kOutputBytes, pcm.data() + offset, take);
+        memcpy(output + p % kOutputBytes, data + offset, take);
+        if (!produced.load(std::memory_order_relaxed)) stamp(&AssistantJob::Telemetry::firstPcmUs);
         produced.store(p + take, std::memory_order_release); offset += take;
       } else {
         if (!captureDone.load()) { fail("Resposta antecipada excedeu o buffer; solte o botão e tente novamente."); return false; }
@@ -97,7 +146,7 @@ struct AssistantJob::Impl {
         vTaskDelay(1);
       }
     }
-    return offset == pcm.size();
+    return offset == size;
   }
   bool message(const uint8_t *data, size_t length, bool &setupComplete, bool &turnComplete, bool &response) {
     using namespace Assistant;
@@ -105,7 +154,9 @@ struct AssistantJob::Impl {
     if (!json) { fail("Mensagem Gemini inválida ou acima dos limites JSON."); return false; }
     const cJSON *root = json.get();
     if (field(root, "error")) { fail("Gemini retornou erro. Verifique modelo, chave, acesso gratuito e cota."); return false; }
-    if (field(root, "setupComplete")) setupComplete = true;
+    if (field(root, "setupComplete")) {
+      setupComplete = true; stamp(&AssistantJob::Telemetry::setupCompleteUs);
+    }
     const cJSON *cancellation = field(field(root, "toolCallCancellation"), "ids");
     if (cJSON_IsArray(cancellation)) for (const cJSON *id = cancellation->child; id; id = id->next) {
       if (!cJSON_IsString(id)) continue;
@@ -167,6 +218,7 @@ struct AssistantJob::Impl {
         if (*text && !trueField(part, "thought") && !*transcript) { owner->appendText(text); response = true; }
         const cJSON *audio = field(part, "inlineData");
         if (audio) {
+          stamp(&AssistantJob::Telemetry::firstAudioMessageUs);
           const char *mime = stringField(audio, "mimeType"), *encoded = stringField(audio, "data");
           if (strcmp(mime, "audio/pcm;rate=24000") && strcmp(mime, "audio/pcm")) {
             fail("Formato de áudio Gemini não suportado (esperado PCM 24 kHz)."); return false;
@@ -175,7 +227,9 @@ struct AssistantJob::Impl {
           if (*encoded) response = true;
         }
       }
-      if (trueField(content, "turnComplete")) turnComplete = true;
+      if (trueField(content, "turnComplete")) {
+        turnComplete = true; stamp(&AssistantJob::Telemetry::turnCompleteUs);
+      }
     }
     return true;
   }
@@ -217,6 +271,8 @@ bool AssistantJob::start(const Settings &s, AudioCodec &codec, ConnectFn connect
   p->key = s.sttApiKey; p->model = s.assistantModel; p->gateway = s.assistantGatewayUrl;
   p->token = s.assistantGatewayToken; p->zone = s.assistantTimeZone;
   p->playbackVolume = s.speakerVolumeDb;
+  p->startedUs = assistantMonotonicUs();
+  p->telemetry.turnId = nextTurnId.fetch_add(1, std::memory_order_relaxed);
   std::string path;
   p->tools = Assistant::gatewayOrigin(p->gateway, path) && p->token.size() >= 32 && p->token.size() <= 128;
   p->capture = static_cast<uint8_t *>(heap_caps_malloc(kCaptureBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
@@ -230,10 +286,27 @@ bool AssistantJob::start(const Settings &s, AudioCodec &codec, ConnectFn connect
     portENTER_CRITICAL(&mux_); view_.finished = true; portEXIT_CRITICAL(&mux_); return false;
   }
   status(State::Connecting, "Ouvindo enquanto conecta...");
+  uint32_t networkStack = 16384;
+#if defined(ARDUINO_ARCH_ESP32)
+  const auto media = NetworkRoute::diagnosticMedia();
+  if (media != DiagnosticMedia::Legacy && media != DiagnosticMedia::Pcm &&
+      NetworkRoute::diagnosticRoute() != DiagnosticRoute::WifiOnly) networkStack = 32768;
+#endif
   // All tasks start behind a gate, so handles exist before any task can retire.
-  bool ok = xTaskCreatePinnedToCore(audioTask, "as_audio", 6144, p, 5, &p->audioHandle, 0) == pdPASS;
-  if (ok) ok = xTaskCreatePinnedToCore(gatewayTask, "as_tools", 12288, p, 2, &p->gatewayHandle, 1) == pdPASS;
-  if (ok) ok = xTaskCreatePinnedToCore(networkTask, "as_live", 16384, p, 3, &p->networkHandle, 1) == pdPASS;
+  // Allocate the optional codec stack before small tasks fragment internal RAM.
+  // All tasks still wait at the launch gate; the Wi-Fi task order is unchanged.
+  bool ok = true;
+  if (networkStack > 16384)
+    ok = xTaskCreatePinnedToCore(networkTask, "as_live", networkStack, p, 3, &p->networkHandle, 1) == pdPASS;
+  if (ok) ok = xTaskCreatePinnedToCore(audioTask, "as_audio", 5120, p, 5, &p->audioHandle, 0) == pdPASS;
+  const uint32_t gatewayStack = p->tools ? 12288 : 3072;
+  if (ok) ok = xTaskCreatePinnedToCore(gatewayTask, "as_tools", gatewayStack, p, 2, &p->gatewayHandle, 1) == pdPASS;
+  if (ok && !p->networkHandle) ok = xTaskCreatePinnedToCore(networkTask, "as_live", networkStack, p, 3, &p->networkHandle, 1) == pdPASS;
+#if defined(ARDUINO_ARCH_ESP32)
+  if (networkStack > 16384) Serial.printf("[OpusResources] tasks_ok=%d heap=%u largest=%u stack=%lu\n", ok,
+    heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+    heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT), static_cast<unsigned long>(networkStack));
+#endif
   if (!ok) {
     p->fail("Falha ao criar tasks do assistente."); p->cancelled = true; p->workerStop = true; p->networkDone = true;
     if (!p->audioHandle) { p->captureDone = true; codec.enable(false); }
@@ -241,9 +314,14 @@ bool AssistantJob::start(const Settings &s, AudioCodec &codec, ConnectFn connect
   p->launched = true;
   return ok;
 }
-void AssistantJob::release() {
+void AssistantJob::release(bool physicalButton) {
   portENTER_CRITICAL(&mux_);
-  if (impl_) impl_->released = true;
+  if (impl_) {
+    if (!impl_->released.load()) {
+      impl_->markRelease(physicalButton);
+    }
+    impl_->released = true;
+  }
   view_.released = true;
   portEXIT_CRITICAL(&mux_);
 }
@@ -267,6 +345,7 @@ void AssistantJob::reap() {
   view_.receivedAudioMs = static_cast<uint32_t>(p->produced.load() / 48);
   view_.playedAudioMs = static_cast<uint32_t>(p->consumed.load() / 48);
   view_.rebufferCount = p->rebufferCount.load(); view_.bufferedAudio = p->bufferedAudio.load();
+  view_.telemetry = p->metrics();
   view_.released = p->released.load(); view_.finished = true;
   if (view_.state != State::Failed) {
     view_.state = p->cancelled ? State::Failed : State::Done;
@@ -289,6 +368,7 @@ bool AssistantJob::snapshot(Snapshot &out) const {
     out.receivedAudioMs = static_cast<uint32_t>(impl_->produced.load() / 48);
     out.playedAudioMs = static_cast<uint32_t>(impl_->consumed.load() / 48);
     out.rebufferCount = impl_->rebufferCount.load(); out.bufferedAudio = impl_->bufferedAudio.load();
+    out.telemetry = impl_->metrics();
   }
   portEXIT_CRITICAL(&mux_); return true;
 }
@@ -309,6 +389,10 @@ void AssistantJob::audioTask(void *ptr) {
     uint32_t lastData = millis(), captureStart = millis();
     while (!p->released.load() && !Impl::stopped(p)) {
       if (uint32_t(millis() - captureStart) >= 30000) {
+        if (!p->released.exchange(true)) {
+          p->stamp(&AssistantJob::Telemetry::releaseUs);
+          portENTER_CRITICAL(&p->telemetryMux); p->telemetry.releaseSource = 3; portEXIT_CRITICAL(&p->telemetryMux);
+        }
         p->limited = true; p->released = true;
         p->owner->status(State::Thinking, "Captura interrompida no limite de 30 s."); break;
       }
@@ -329,6 +413,10 @@ void AssistantJob::audioTask(void *ptr) {
       p->captured.store(accepted + take * 2, std::memory_order_release);
       carry = n % 4; if (carry) memmove(stereo, stereo + n - carry, carry);
       if (accepted + take * 2 == kCaptureBytes) {
+        if (!p->released.exchange(true)) {
+          p->stamp(&AssistantJob::Telemetry::releaseUs);
+          portENTER_CRITICAL(&p->telemetryMux); p->telemetry.releaseSource = 3; portEXIT_CRITICAL(&p->telemetryMux);
+        }
         p->limited = true; p->released = true;
         p->owner->status(State::Thinking, "Captura interrompida no limite de 30 s."); break;
       }
@@ -336,9 +424,11 @@ void AssistantJob::audioTask(void *ptr) {
     }
     if (carry) p->fail("Microfone encerrou com frame estéreo incompleto.");
     p->captureDone.store(true, std::memory_order_release);
+    p->stamp(&AssistantJob::Telemetry::captureDoneUs);
     bool playback = false, feeding = false, buffering = false; uint32_t lastWrite = 0;
     while (!Impl::stopped(p)) {
       const bool done = p->networkDone.load(std::memory_order_acquire);
+      const bool responseReady = p->responseReady.load(std::memory_order_acquire);
       size_t c = p->consumed.load(), available = p->produced.load(std::memory_order_acquire) - c;
       if (!available) {
         if (done) break;
@@ -346,8 +436,10 @@ void AssistantJob::audioTask(void *ptr) {
       }
       // BLE nao garante os 48 kB/s do PCM. Prefere fala continua a tocar cada
       // fragmento assim que chega. Respostas > buffer ainda progridem sem deadlock.
-      const size_t prebuffer = p->bufferedAudio.load() ? kOutputBytes - kMaxAudioBytes : kWifiPrebufferBytes;
-      if (!feeding && !done && available < prebuffer) {
+      const size_t prebuffer = p->bufferedAudio.load() ? kOutputBytes - kMaxAudioBytes :
+                               (p->compressedAudio.load() ? kOpusPrebufferBytes : kWifiPrebufferBytes);
+      const bool readyForBlePlayback = p->bufferedAudio.load() && responseReady && NetworkRoute::diagnosticEarlyPlayback();
+      if (!feeding && !done && !readyForBlePlayback && available < prebuffer) {
         if (!buffering && p->bufferedAudio.load()) p->owner->status(State::Thinking, "Recebendo resposta pelo celular...");
         buffering = true;
         vTaskDelay(1); continue;
@@ -374,7 +466,12 @@ void AssistantJob::audioTask(void *ptr) {
           p->fail("Falha ou timeout na reprodução de áudio."); break;
         }
         offset += written; if (!written) vTaskDelay(1);
-        if (written) lastWrite = millis();
+        if (written) {
+          lastWrite = millis();
+          if (!p->consumed.load(std::memory_order_relaxed)) p->stamp(&AssistantJob::Telemetry::firstI2sUs);
+          p->update(&AssistantJob::Telemetry::lastI2sUs,
+            static_cast<uint32_t>(assistantMonotonicUs() - p->startedUs));
+        }
       }
       if (offset != wanted) break;
       p->consumed.store(c + samples * 2, std::memory_order_release); vTaskDelay(1);
@@ -429,12 +526,23 @@ void AssistantJob::networkTask(void *ptr) {
     LiveSocket socket(p->incoming, kJsonLimit + 1, Impl::stopped, p);
     bool setup = false, complete = false, response = false, ended = false, started = false;
     size_t sent = 0; uint32_t setupBegin = millis(), endAt = 0;
+    p->stamp(&AssistantJob::Telemetry::routeBeginUs);
     bool ready = !Impl::stopped(p) && p->connect();
+    p->stamp(&AssistantJob::Telemetry::routeReadyUs);
     if (!ready && !Impl::stopped(p)) p->fail("Sem conexão Wi-Fi ou ponte TLS pelo celular.");
     if (ready && !Impl::stopped(p)) ready = socket.connect(p->key.c_str());
+    if (ready) {
+      p->setRoutePhone(socket.isPhone());
+      p->update(&AssistantJob::Telemetry::networkConnectUs, socket.networkConnectUs());
+      p->update(&AssistantJob::Telemetry::wsUpgradeUs, socket.wsUpgradeUs());
+      portENTER_CRITICAL(&p->telemetryMux);
+      copyText(p->telemetry.media, sizeof(p->telemetry.media), socket.mediaName());
+      portEXIT_CRITICAL(&p->telemetryMux);
+    }
     if (!ready && !Impl::stopped(p)) p->fail(socket.error());
     if (ready && !Impl::stopped(p)) {
-      p->bufferedAudio = NetworkRoute::phoneSelected();
+      p->compressedAudio = socket.compressedAudio();
+      p->bufferedAudio = socket.isPhone() && !p->compressedAudio.load();
       std::string json = setupJson(p->model.c_str(), true, p->zone.c_str(), static_cast<int64_t>(time(nullptr)), p->tools);
       ready = socket.send(json); setupBegin = millis();
       if (!ready) p->fail(socket.error());
@@ -445,6 +553,12 @@ void AssistantJob::networkTask(void *ptr) {
       for (unsigned i = 0; i < 16 && !Impl::stopped(p); ++i) {
         auto event = socket.poll();
         if (event == WsParser::Event::Error || event == WsParser::Event::Close) { p->fail(socket.error()); break; }
+        if (event == WsParser::Event::Audio) {
+          p->stamp(&AssistantJob::Telemetry::firstAudioMessageUs);
+          if (!p->queuePcm(socket.data(), socket.size())) break;
+          if (socket.size()) response = true;
+          continue;
+        }
         if (event != WsParser::Event::Message) break;
         if (!p->message(socket.data(), socket.size(), setup, complete, response)) break;
       }
@@ -460,14 +574,23 @@ void AssistantJob::networkTask(void *ptr) {
           p->released ? "Enviando fala preservada..." : "Ouvindo; solte para responder.");
       }
       size_t available = p->captured.load(std::memory_order_acquire) - sent;
+      p->updateMaxBacklog(available);
       if (available >= 2048 || (p->captureDone.load(std::memory_order_acquire) && available)) {
         size_t n = std::min(available, size_t(2048)); // 64 ms; final tail may be shorter.
-        if (!socket.send(audioJson(p->capture + sent, n))) { p->fail(socket.error()); break; }
+        p->stamp(&AssistantJob::Telemetry::firstInputUs);
+        if (!socket.sendAudio(p->capture + sent, n)) { p->fail(socket.error()); break; }
         sent += n;
+        p->sentInput.store(sent, std::memory_order_release);
+        p->update(&AssistantJob::Telemetry::lastInputUs,
+          static_cast<uint32_t>(assistantMonotonicUs() - p->startedUs));
+        portENTER_CRITICAL(&p->telemetryMux);
+        p->telemetry.inputBytes = static_cast<uint32_t>(std::min(sent, size_t(UINT32_MAX)));
+        portEXIT_CRITICAL(&p->telemetryMux);
       }
       if (!ended && p->captureDone.load(std::memory_order_acquire) && sent == p->captured.load()) {
         if (!sent) { p->fail("Nenhum áudio foi capturado."); break; }
-        if (!socket.send(activityJson(false))) { p->fail(socket.error()); break; }
+        if (!socket.endInput()) { p->fail(socket.error()); break; }
+        p->stamp(&AssistantJob::Telemetry::activityEndUs);
         ended = true; endAt = millis(); p->owner->status(State::Thinking, "Aguardando resposta...");
       }
       if (p->work.load(std::memory_order_acquire) == Impl::Complete) {
@@ -494,7 +617,11 @@ void AssistantJob::networkTask(void *ptr) {
           p->work.store(Impl::Pending, std::memory_order_release);
         }
       }
-      if (ended && complete && response && !toolsPending && p->work.load() == Impl::Empty) break;
+      if (ended && complete && response && !toolsPending && p->work.load() == Impl::Empty) {
+        p->responseReady.store(true, std::memory_order_release);
+        p->stamp(&AssistantJob::Telemetry::responseReadyUs);
+        break;
+      }
       // Tool work can precede the first audio; all are still bounded by 180 s.
       if (ended && !response && !toolsPending && uint32_t(millis() - endAt) >= 45000) {
         p->fail("Gemini não enviou áudio nem texto em 45 s após a fala."); break;
@@ -505,8 +632,18 @@ void AssistantJob::networkTask(void *ptr) {
     if (uint32_t(millis() - p->started) >= kTurnMs && !p->failed.load() && !p->cancelled.load())
       p->fail("Tempo máximo de conversa (180 s) excedido.");
     p->released = true; p->workerStop = true;
+    p->update(&AssistantJob::Telemetry::mediaSentBytes, socket.mediaSentBytes());
+    p->update(&AssistantJob::Telemetry::mediaReceivedBytes, socket.mediaReceivedBytes());
+    uint32_t encodeUs = 0, decodeUs = 0; socket.codecTiming(encodeUs, decodeUs);
+    p->update(&AssistantJob::Telemetry::encodeUs, encodeUs);
+    p->update(&AssistantJob::Telemetry::decodeUs, decodeUs);
+#if defined(ARDUINO_ARCH_ESP32)
+    p->update(&AssistantJob::Telemetry::networkStackFreeBytes,
+      static_cast<uint32_t>(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t)));
+#endif
     socket.close();
     p->networkDone.store(true, std::memory_order_release);
+    p->stamp(&AssistantJob::Telemetry::networkDoneUs);
   }
   vTaskSuspend(nullptr);
 }

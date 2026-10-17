@@ -53,6 +53,15 @@ def main():
     suite("button_tests", [ROOT / "src/board/buttons.cpp", ROOT / "src/board/multi_button.c", HOST / "button_tests.cpp"],
           ["-Itest/host/button_tests_stubs"])
     run([sys.executable, HOST / "assistant_check.py"])
+    run([sys.executable, HOST / "voice_opus_check.py"])
+    benchmark_venv = ROOT / "tools/.venv-benchmark/Scripts/python.exe"
+    if benchmark_venv.is_file():
+        run([benchmark_venv, ROOT / "tools/benchmark_voice_test.py"])
+    elif subprocess.run([sys.executable, "-c", "import numpy"], cwd=ROOT, check=False,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+        run([sys.executable, ROOT / "tools/benchmark_voice_test.py"])
+    else:
+        print("SKIP: testes analiticos do benchmark requerem tools/requirements-benchmark.txt", flush=True)
     npm = shutil.which("npm")
     if not npm:
         raise RuntimeError("Node/npm necessário para verificar o gateway")

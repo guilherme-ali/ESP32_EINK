@@ -23,6 +23,7 @@ def main():
         "IdeiaRec-debug.apk": args.apk,
         "gateway-Code.gs": ROOT / "gateway/dist/Code.gs",
         "gateway-appsscript.json": ROOT / "gateway/dist/appsscript.json",
+        "libopus-COPYING.txt": args.build_dir / "voice-opus/opus-1.5.2/COPYING",
     }
     for path in files.values():
         if not path.is_file():

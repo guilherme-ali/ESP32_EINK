@@ -49,6 +49,7 @@ struct LocalChannel {
     P::Channel protocol;
     uint32_t lastProgress = 0;
     bool writing = false;
+    TaskHandle_t writerTask = nullptr;
 };
 struct Queued {
     P::Frame frame;
@@ -73,6 +74,9 @@ std::atomic<const char*> errorText{""};
 std::atomic<uint32_t> pairingPin{0};
 std::atomic<int> securityResult{0}, bondResult{0}, disconnectReason{0}, authenticationFlags{0};
 std::atomic<uint32_t> passkeyRequests{0};
+std::atomic<uint16_t> interval1250us{0}, latency{0}, supervisionTimeout10ms{0};
+std::atomic<uint16_t> maxTxOctets{0}, maxRxOctets{0}, maxTxTime{0}, maxRxTime{0};
+std::atomic<uint8_t> txPhy{0}, rxPhy{0};
 std::atomic_flag lifecycleBusy = ATOMIC_FLAG_INIT;
 std::atomic<bool> workerExit{false};
 std::atomic<bool> workerExited{false};
@@ -117,6 +121,12 @@ bool secureBond(const NimBLEConnInfo& info) {
 uint32_t bounded(uint32_t ms) { return ms < kMaxWaitMs ? ms : kMaxWaitMs; }
 bool expired(uint32_t start, uint32_t timeout) { return static_cast<uint32_t>(millis() - start) >= timeout; }
 void pause() { vTaskDelay(1); }
+void wakeWorkerLocked() { if (workerHandle) xTaskNotifyGive(workerHandle); }
+void wakeWriterLocked(LocalChannel& channel) {
+    if (channel.writerTask) xTaskNotifyGive(channel.writerTask);
+    channel.writerTask = nullptr;
+    channel.writing = false;
+}
 
 struct Lifecycle {
     bool held;
@@ -140,9 +150,10 @@ void failLinkLocked(const char* reason) {
     ++linkGeneration;
     clearQueueLocked();
     for (auto& channel : channels) {
+        wakeWriterLocked(channel);
         if (channel.protocol.state() != P::State::Idle) channel.protocol.abort();
-        channel.writing = false;
     }
+    wakeWorkerLocked();
 }
 
 bool enqueueLocked(const P::Frame& frame) {
@@ -156,6 +167,7 @@ bool enqueueLocked(const P::Frame& frame) {
     item.link = linkGeneration;
     item.generation = channels[frame.channel].protocol.generation();
     ++queueCount;
+    wakeWorkerLocked();
     return true;
 }
 P::Frame controlLocked(int channel, P::Type type) {
@@ -169,7 +181,7 @@ void abortChannelLocked(int channel, const char* reason, bool report = true) {
     LocalChannel& c = channels[channel];
     if (c.protocol.state() == P::State::Idle) return;
     c.protocol.abort();
-    c.writing = false;
+    wakeWriterLocked(c);
     setError(reason);
     if (report && readyLocked()) {
         P::Frame frame = controlLocked(channel, P::Type::Error);
@@ -199,6 +211,16 @@ void drainEmptyLocked(int channel) {
 int pairingDiagnostic(ble_gap_event* event, void*) {
     if (event->type == BLE_GAP_EVENT_ENC_CHANGE) securityResult.store(event->enc_change.status);
     if (event->type == BLE_GAP_EVENT_PASSKEY_ACTION) passkeyRequests.fetch_add(1);
+    if (event->type == BLE_GAP_EVENT_DATA_LEN_CHG) {
+        bool current;
+        { StateLock lock; current = phone == event->data_len_chg.conn_handle; }
+        if (current) {
+            maxTxOctets.store(event->data_len_chg.max_tx_octets);
+            maxRxOctets.store(event->data_len_chg.max_rx_octets);
+            maxTxTime.store(event->data_len_chg.max_tx_time);
+            maxRxTime.store(event->data_len_chg.max_rx_time);
+        }
+    }
     return 0;
 }
 
@@ -206,12 +228,16 @@ class ServerCallbacks final : public NimBLEServerCallbacks {
     void onConnect(NimBLEServer* s, NimBLEConnInfo& info) override {
         bool accept;
         const uint16_t connectedMtu = info.getMTU(); // API host fora de stateMux
+        const uint16_t interval = info.getConnInterval(), peerLatency = info.getConnLatency();
+        const uint16_t supervision = info.getConnTimeout();
         {
             StateLock lock;
             accept = enabled && !disconnectPending && phone == BLE_HS_CONN_HANDLE_NONE;
             if (accept) {
                 phone = info.getConnHandle();
                 mtu = connectedMtu;
+                interval1250us.store(interval); latency.store(peerLatency);
+                supervisionTimeout10ms.store(supervision);
                 authenticated = false; // só onAuthenticationComplete valida o bond SC
                 subscribed = false;
                 ++linkGeneration;
@@ -242,13 +268,16 @@ class ServerCallbacks final : public NimBLEServerCallbacks {
         if (enabled && !errorText.load(std::memory_order_acquire)[0]) setError("Telefone desconectado");
         phone = BLE_HS_CONN_HANDLE_NONE;
         mtu = 23;
+        interval1250us = latency = supervisionTimeout10ms = 0;
+        maxTxOctets = maxRxOctets = maxTxTime = maxRxTime = 0;
+        txPhy = rxPhy = 0;
         authenticated = subscribed = false;
         disconnectPending = false;
         ++linkGeneration;
         clearQueueLocked();
         for (auto& channel : channels) {
+            wakeWriterLocked(channel);
             if (channel.protocol.state() != P::State::Idle) channel.protocol.abort();
-            channel.writing = false;
         }
         // Sem reanúncio automático: somente begin() solicita rádio novamente.
     }
@@ -258,6 +287,17 @@ class ServerCallbacks final : public NimBLEServerCallbacks {
         const bool wasReady = readyLocked();
         mtu = newMtu;
         if (wasReady && newMtu < P::kMinMtu) failLinkLocked("MTU BLE insuficiente");
+    }
+    void onConnParamsUpdate(NimBLEConnInfo& info) override {
+        StateLock lock;
+        if (phone != info.getConnHandle()) return;
+        interval1250us.store(info.getConnInterval()); latency.store(info.getConnLatency());
+        supervisionTimeout10ms.store(info.getConnTimeout());
+    }
+    void onPhyUpdate(NimBLEConnInfo& info, uint8_t tx, uint8_t rx) override {
+        StateLock lock;
+        if (phone != info.getConnHandle()) return;
+        txPhy.store(tx); rxPhy.store(rx);
     }
     uint32_t onPassKeyDisplay() override {
         return pairingPin.load(std::memory_order_acquire);
@@ -331,10 +371,13 @@ class CharacteristicCallbacks final : public NimBLECharacteristicCallbacks {
         if (reception == P::Reception::Fault) {
             abortChannelLocked(frame.channel, "Sequencia ou janela BLE invalida");
         } else if (reception == P::Reception::RemoteError) {
-            c.writing = false;
+            wakeWriterLocked(c);
             setError("Ponte TLS retornou erro");
         } else if (reception == P::Reception::Accepted) {
-            if (frame.type == P::Type::Ack) c.lastProgress = millis();
+            if (frame.type == P::Type::Ack) {
+                c.lastProgress = millis();
+                if (c.writerTask) xTaskNotifyGive(c.writerTask);
+            }
             if (frame.type == P::Type::Data) drainEmptyLocked(frame.channel);
         }
     }
@@ -361,56 +404,62 @@ void stopRadio() {
 
 void worker(void*) {
     while (!workerExit.load(std::memory_order_acquire)) {
-        bool work;
+        bool work, stopping;
         {
             StateLock lock;
-            work = radioStopPending || queueCount || enabled;
-        }
-        if (work && xSemaphoreTake(ioMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            bool stopping;
-            {
-                StateLock lock;
-                stopping = radioStopPending;
+            const uint32_t now = millis();
+            if (readyLocked()) {
+                for (int i = 0; i < P::kChannels; ++i) {
+                    if (channels[i].protocol.pending() &&
+                        static_cast<uint32_t>(now - channels[i].lastProgress) >= kAckTimeoutMs)
+                        abortChannelLocked(i, "Timeout de ACK BLE");
+                }
             }
-            if (stopping) stopRadio();
+            stopping = radioStopPending;
+            work = stopping || queueCount;
+        }
+        if (!work) {
+            // ACK deadlines continuam sendo observados sem polling apertado.
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
+            continue;
+        }
+        if (xSemaphoreTake(ioMutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1));
+            continue;
+        }
+        if (stopping) stopRadio();
+        // Small bounded batch: drain queued work without a fixed sleep per GATT
+        // frame, then yield so radio/lifecycle work on this core remains fair.
+        for (unsigned sent = 0; sent < 8; ++sent) {
             Queued item;
-            bool send = false;
+            bool haveItem = false, send = false;
             uint16_t handle = BLE_HS_CONN_HANDLE_NONE;
             {
                 StateLock lock;
-                const uint32_t now = millis();
-                if (readyLocked()) {
-                    for (int i = 0; i < P::kChannels; ++i) {
-                        if (channels[i].protocol.pending() &&
-                            static_cast<uint32_t>(now - channels[i].lastProgress) >= kAckTimeoutMs) {
-                            abortChannelLocked(i, "Timeout de ACK BLE");
-                        }
-                    }
-                }
-                if (queueCount) {
-                    item = queue[queueHead];
-                    queue[queueHead] = Queued{};
-                    queueHead = (queueHead + 1) % kQueueSize;
-                    --queueCount;
-                    const auto& c = channels[item.frame.channel].protocol;
-                    send = readyLocked() && item.link == linkGeneration &&
-                           item.generation == c.generation() && item.frame.epoch == c.epoch();
-                    handle = phone;
-                }
+                if (radioStopPending || !queueCount) break;
+                item = queue[queueHead];
+                queue[queueHead] = Queued{};
+                queueHead = (queueHead + 1) % kQueueSize;
+                --queueCount;
+                haveItem = true;
+                const auto& c = channels[item.frame.channel].protocol;
+                send = readyLocked() && item.link == linkGeneration &&
+                       item.generation == c.generation() && item.frame.epoch == c.epoch();
+                handle = phone;
             }
+            if (!haveItem) break;
             if (send) {
                 uint8_t wire[P::kMaxFrame];
                 const size_t length = P::encode(item.frame, wire, sizeof(wire));
-                // NimBLE copia os bytes para mbuf antes de retornar; sem setValue compartilhado.
+                // NimBLE copies bytes into an mbuf before returning.
                 if (!length || !tx->notify(wire, length, handle)) {
                     StateLock lock;
                     if (item.link == linkGeneration) failLinkLocked("Envio BLE falhou");
                 }
             }
-            xSemaphoreGive(ioMutex);
         }
-        // Bounded, sem spin. O coordinator também executa write fora do loop MAIN.
-        vTaskDelay(pdMS_TO_TICKS(work ? 2 : 20) + 1);
+        xSemaphoreGive(ioMutex);
+        taskYIELD();
     }
     workerExited.store(true, std::memory_order_release);
     vTaskSuspend(nullptr); // lifecycle faz vTaskDelete depois do handshake
@@ -425,9 +474,10 @@ void stopState() {
     ++linkGeneration;
     clearQueueLocked();
     for (auto& channel : channels) {
+        wakeWriterLocked(channel);
         channel.protocol.release();
-        channel.writing = false;
     }
+    wakeWorkerLocked();
 }
 
 bool stopImpl(uint32_t timeout) {
@@ -492,6 +542,7 @@ bool begin(uint32_t passkey) {
             auto* service = server->createService(kService);
             if (service) {
                 auto* rx = service->createCharacteristic(kRx, NIMBLE_PROPERTY::WRITE |
+                    NIMBLE_PROPERTY::WRITE_NR |
                     NIMBLE_PROPERTY::WRITE_ENC | NIMBLE_PROPERTY::WRITE_AUTHEN, P::kMaxFrame);
                 tx = service->createCharacteristic(kTx, NIMBLE_PROPERTY::NOTIFY |
                     NIMBLE_PROPERTY::READ_ENC | NIMBLE_PROPERTY::READ_AUTHEN, P::kMaxFrame);
@@ -543,7 +594,9 @@ bool active() { StateLock lock; return enabled; }
 Diagnostics diagnostics() {
     StateLock lock;
     return {phone != BLE_HS_CONN_HANDLE_NONE, authenticated, subscribed, mtu,
-            securityResult.load(), bondResult.load(), disconnectReason.load(), authenticationFlags.load(), passkeyRequests.load()};
+            securityResult.load(), bondResult.load(), disconnectReason.load(), authenticationFlags.load(), passkeyRequests.load(),
+            interval1250us.load(), latency.load(), supervisionTimeout10ms.load(), maxTxOctets.load(), maxRxOctets.load(),
+            maxTxTime.load(), maxRxTime.load(), txPhy.load(), rxPhy.load()};
 }
 bool waitReady(uint32_t timeoutMs) {
     const uint32_t start = millis();
@@ -620,6 +673,7 @@ size_t write(int channel, const uint8_t* data, size_t size, uint32_t timeoutMs) 
         if (!readyLocked() || c.protocol.state() != P::State::Open) { setError("Canal TLS fechado"); return 0; }
         if (c.writing) { setError("Escrita concorrente no canal TLS"); return 0; }
         c.writing = true;
+        c.writerTask = xTaskGetCurrentTaskHandle();
         generation = c.protocol.generation();
     }
     size_t written = 0;
@@ -634,7 +688,7 @@ size_t write(int channel, const uint8_t* data, size_t size, uint32_t timeoutMs) 
                 abortChannelLocked(channel, "Canal TLS interrompido");
                 return written;
             }
-            if (c.protocol.credits()) {
+            while (c.protocol.credits() && written < size) {
                 P::Frame frame;
                 const size_t rest = size - written;
                 const size_t count = rest < P::kMaxPayload ? rest : P::kMaxPayload;
@@ -645,17 +699,22 @@ size_t write(int channel, const uint8_t* data, size_t size, uint32_t timeoutMs) 
                 }
                 if (wasEmpty) c.lastProgress = millis();
                 written += count;
-                if (written == size) {
-                    c.writing = false;
-                    return written;
-                }
+            }
+            if (written == size) {
+                c.writing = false;
+                c.writerTask = nullptr;
+                return written;
             }
             if (expired(start, timeout)) {
                 abortChannelLocked(channel, "Timeout de credito TLS");
                 return written;
             }
         }
-        pause();
+        const uint32_t elapsed = static_cast<uint32_t>(millis() - start);
+        const uint32_t remaining = elapsed >= timeout ? 0 : timeout - elapsed;
+        TickType_t ticks = pdMS_TO_TICKS(remaining);
+        if (!ticks && remaining) ticks = 1;
+        ulTaskNotifyTake(pdTRUE, ticks); // ACK/abort wakes this writer; no 1 ms credit polling.
     } while (true);
 }
 
@@ -695,7 +754,7 @@ void close(int channel) {
     auto& c = channels[channel];
     if (c.protocol.state() == P::State::Idle) return;
     c.protocol.release();
-    c.writing = false;
+    wakeWriterLocked(c);
     if (readyLocked()) enqueueLocked(controlLocked(channel, P::Type::Close));
 }
 const char* lastError() { return errorText.load(std::memory_order_acquire); }

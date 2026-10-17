@@ -30,6 +30,9 @@ struct Diagnostics {
     uint16_t mtu;
     int securityResult, bondResult, disconnectReason, authenticationFlags;
     uint32_t passkeyRequests;
+    uint16_t interval1250us, latency, supervisionTimeout10ms;
+    uint16_t maxTxOctets, maxRxOctets, maxTxTime, maxRxTime;
+    uint8_t txPhy, rxPhy;
 };
 Diagnostics diagnostics(); // somente metadados; nunca chaves/PIN/payloads
 

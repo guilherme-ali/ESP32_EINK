@@ -55,6 +55,14 @@ def main():
     run([cxx, *flags, *common, HOST / "assistant_protocol_tests.cpp", obj, "-o", protocol])
     run([protocol])
     run([sys.executable, HOST / "assistant_schema_test.py"])
+    media = BUILD / ("media_protocol_tests.exe" if os.name == "nt" else "media_protocol_tests")
+    run([cxx, *flags, ROOT / "src/assistant/media_protocol.cpp", HOST / "media_protocol_tests.cpp", "-o", media])
+    run([media])
+    phone = BUILD / ("phone_voice_tests.exe" if os.name == "nt" else "phone_voice_tests")
+    run([cxx, *flags, "-DARDUINO_ARCH_ESP32", "-DESP32", "-DASSISTANT_HOST_TEST", "-I" + str(rel(HOST)),
+         *common, ROOT / "src/assistant/media_protocol.cpp", ROOT / "src/assistant/phone_voice.cpp",
+         HOST / "phone_voice_tests.cpp", obj, "-o", phone])
+    run([phone])
     if os.name == "nt":
         runtime = BUILD / "assistant_runtime_tests.exe"
         run([cxx, *flags, "-pthread", "-DASSISTANT_HOST_TEST", "-I" + str(rel(HOST)), *common,

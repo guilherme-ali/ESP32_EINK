@@ -11,12 +11,17 @@ namespace NetworkRoute {
 namespace {
 std::atomic<bool> enabled{false}, phone{false};
 std::atomic<uint32_t> passkey{0};
+std::atomic<DiagnosticRoute> diagnostic{DiagnosticRoute::Auto};
+std::atomic<bool> earlyPlayback{true};
+std::atomic<DiagnosticMedia> media{DiagnosticMedia::Legacy};
 std::atomic_flag selecting = ATOMIC_FLAG_INIT;
 // Abaixo, somente sob Selection; nunca há espera segurando portMUX.
 WifiManager *manager = nullptr;
 SettingsStore *store = nullptr;
 bool wifiFailed = false;
 uint32_t wifiFailedAt = 0;
+std::atomic<bool> retainPhone{false};
+std::atomic<uint32_t> retainPhoneUntil{0};
 uint32_t left(uint32_t start, uint32_t budget) {
   uint32_t elapsed = millis() - start;
   return elapsed >= budget ? 0 : budget - elapsed;
@@ -76,6 +81,15 @@ bool probeWifi(uint32_t timeoutMs) {
 }
 bool selectRoute(uint32_t timeoutMs) {
   uint32_t start = millis();
+  const DiagnosticRoute policy = diagnostic.load(std::memory_order_acquire);
+  if (policy == DiagnosticRoute::PhoneOnly) return selectPhone(timeoutMs);
+  if (policy == DiagnosticRoute::WifiOnly) {
+    bool associated = WiFi.status() == WL_CONNECTED;
+    if (!associated && manager && store)
+      associated = manager->connect(*store, min(left(start, timeoutMs), uint32_t(5000)));
+    phone.store(false, std::memory_order_release);
+    return associated;
+  }
   bool readyPhone = enabled.load(std::memory_order_acquire) && PhoneRelay::ready();
   bool associated = WiFi.status() == WL_CONNECTED;
   // Telefone pronto: só testar Wi-Fi já associado/conhecido. Não perder um
@@ -113,6 +127,7 @@ bool connect(WifiManager &wifi, SettingsStore &settings, uint32_t timeoutMs) {
   uint32_t start = millis();
   Selection lock(timeoutMs);
   if (!lock.held) return false;
+  retainPhone.store(false, std::memory_order_release); // The awake retention window is now owned by this session.
   manager = &wifi; store = &settings; // donos persistem até finish()
   return selectRoute(left(start, timeoutMs));
 }
@@ -123,6 +138,8 @@ bool phoneSelected() { return phone.load(std::memory_order_acquire); }
 bool fallbackEnabled() { return enabled.load(std::memory_order_acquire); }
 const char *label() { return online() ? (phoneSelected() ? "Telefone BLE" : "Wi-Fi") : "offline"; }
 bool fallbackToPhone(uint32_t timeoutMs) {
+  const DiagnosticRoute policy = diagnostic.load(std::memory_order_acquire);
+  if (policy == DiagnosticRoute::WifiOnly) return false;
   uint32_t start = millis();
   Selection lock(timeoutMs);
   if (!lock.held) return false;
@@ -140,11 +157,49 @@ bool recover(uint32_t timeoutMs) {
   // pode tentar Wi-Fi novamente quando o telefone desapareceu.
   return selectRoute(left(start, timeoutMs));
 }
+void setDiagnosticRoute(DiagnosticRoute route) { diagnostic.store(route, std::memory_order_release); }
+DiagnosticRoute diagnosticRoute() { return diagnostic.load(std::memory_order_acquire); }
+void setDiagnosticEarlyPlayback(bool enabled) { earlyPlayback.store(enabled, std::memory_order_release); }
+bool diagnosticEarlyPlayback() { return earlyPlayback.load(std::memory_order_acquire); }
+void setDiagnosticMedia(DiagnosticMedia value) { media.store(value, std::memory_order_release); }
+DiagnosticMedia diagnosticMedia() { return media.load(std::memory_order_acquire); }
+void finishRetainingPhone(uint32_t timeoutMs) {
+  while (selecting.test_and_set(std::memory_order_acquire)) delay(1);
+  const bool keep = PhoneRelay::ready() && timeoutMs;
+  phone.store(false, std::memory_order_release);
+  manager = nullptr; store = nullptr;
+  diagnostic.store(DiagnosticRoute::Auto, std::memory_order_release);
+  earlyPlayback.store(true, std::memory_order_release);
+  media.store(DiagnosticMedia::Legacy, std::memory_order_release);
+  if (keep) {
+    retainPhoneUntil.store(millis() + min(timeoutMs, uint32_t(30000)), std::memory_order_release);
+    retainPhone.store(true, std::memory_order_release);
+  } else {
+    retainPhone.store(false, std::memory_order_release);
+    PhoneRelay::stop();
+  }
+  selecting.clear(std::memory_order_release);
+}
+void service() {
+  if (!retainPhone.load(std::memory_order_acquire) ||
+      static_cast<int32_t>(millis() - retainPhoneUntil.load(std::memory_order_acquire)) < 0) return;
+  while (selecting.test_and_set(std::memory_order_acquire)) delay(1);
+  if (retainPhone.load(std::memory_order_acquire) &&
+      static_cast<int32_t>(millis() - retainPhoneUntil.load(std::memory_order_acquire)) >= 0) {
+    retainPhone.store(false, std::memory_order_release);
+    PhoneRelay::stop();
+  }
+  selecting.clear(std::memory_order_release);
+}
 void finish() {
   // Precondição: workers encerrados e sockets fechados, inclusive Live/gateway.
   while (selecting.test_and_set(std::memory_order_acquire)) delay(1);
   PhoneRelay::stop();
   phone.store(false, std::memory_order_release);
+  diagnostic.store(DiagnosticRoute::Auto, std::memory_order_release);
+  earlyPlayback.store(true, std::memory_order_release);
+  media.store(DiagnosticMedia::Legacy, std::memory_order_release);
+  retainPhone.store(false, std::memory_order_release);
   manager = nullptr; store = nullptr;
   selecting.clear(std::memory_order_release);
 }

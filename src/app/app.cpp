@@ -525,12 +525,31 @@ void App::serviceAssistant() {
     if (!message.length()) message = view.detail;
     if (view.error[0] && view.text[0]) message += "\n\n" + String(view.text);
     if (!assistantJob_.acknowledgeFinished()) return;
-    Serial.printf("[AssistantDone] state=%d captured_ms=%lu audio_rx_ms=%lu audio_tx_ms=%lu rebuffer=%lu buffered=%d erro=%s texto=%s\n",
-                  static_cast<int>(view.state), static_cast<unsigned long>(view.capturedMs),
+    const AssistantJob::Telemetry &m = view.telemetry;
+    Serial.printf("[AssistantMetrics] turn=%lu route=%s release_src=%u release_us=%lu route_begin_us=%lu route_ready_us=%lu net_connect_us=%lu ws_upgrade_us=%lu setup_complete_us=%lu capture_done_us=%lu backlog_release=%lu backlog_max=%lu input_bytes=%lu first_input_us=%lu last_input_us=%lu activity_end_us=%lu first_audio_us=%lu first_pcm_us=%lu turn_complete_us=%lu response_ready_us=%lu first_i2s_us=%lu last_i2s_us=%lu network_done_us=%lu\n",
+                  static_cast<unsigned long>(m.turnId), m.routeKnown ? (m.phoneRoute ? "ble" : "wifi") : "none", m.releaseSource,
+                  static_cast<unsigned long>(m.releaseUs), static_cast<unsigned long>(m.routeBeginUs),
+                  static_cast<unsigned long>(m.routeReadyUs), static_cast<unsigned long>(m.networkConnectUs),
+                  static_cast<unsigned long>(m.wsUpgradeUs), static_cast<unsigned long>(m.setupCompleteUs),
+                  static_cast<unsigned long>(m.captureDoneUs), static_cast<unsigned long>(m.backlogAtRelease),
+                  static_cast<unsigned long>(m.maxBacklogBytes), static_cast<unsigned long>(m.inputBytes),
+                  static_cast<unsigned long>(m.firstInputUs), static_cast<unsigned long>(m.lastInputUs),
+                  static_cast<unsigned long>(m.activityEndUs), static_cast<unsigned long>(m.firstAudioMessageUs),
+                  static_cast<unsigned long>(m.firstPcmUs), static_cast<unsigned long>(m.turnCompleteUs),
+                  static_cast<unsigned long>(m.responseReadyUs), static_cast<unsigned long>(m.firstI2sUs),
+                  static_cast<unsigned long>(m.lastI2sUs), static_cast<unsigned long>(m.networkDoneUs));
+    Serial.printf("[AssistantMedia] turn=%lu media=%s tx_bytes=%lu rx_bytes=%lu encode_us=%lu decode_us=%lu stack_free_min_bytes=%lu\n",
+                  static_cast<unsigned long>(m.turnId), m.media, static_cast<unsigned long>(m.mediaSentBytes),
+                  static_cast<unsigned long>(m.mediaReceivedBytes), static_cast<unsigned long>(m.encodeUs),
+                  static_cast<unsigned long>(m.decodeUs), static_cast<unsigned long>(m.networkStackFreeBytes));
+    Serial.printf("[AssistantDone] turn=%lu state=%d captured_ms=%lu audio_rx_ms=%lu audio_tx_ms=%lu rebuffer=%lu buffered=%d erro=%s texto=%s\n",
+                  static_cast<unsigned long>(m.turnId), static_cast<int>(view.state), static_cast<unsigned long>(view.capturedMs),
                   static_cast<unsigned long>(view.receivedAudioMs), static_cast<unsigned long>(view.playedAudioMs),
                   static_cast<unsigned long>(view.rebufferCount), view.bufferedAudio,
                   view.error, view.text);
-    NetworkRoute::finish();
+    const bool diagnosticWifi = NetworkRoute::diagnosticRoute() == DiagnosticRoute::WifiOnly;
+    if (m.phoneRoute || (diagnosticWifi && PhoneRelay::ready())) NetworkRoute::finishRetainingPhone(30000);
+    else NetworkRoute::finish();
     wifiMgr_.disconnect();
     screen_ = Screen::AssistantResult;
     Screens::drawText(canvas_, epd_, view.error[0] ? "Assistente: aviso" : "Assistente",
@@ -787,7 +806,7 @@ void App::onButton(BtnId id, BtnAction action) {
   // A soltura longa só pertence ao PTT. Não deve virar uma segunda ação nas
   // telas que já tratam pressão longa (descartar gravação, voltar, cancelar).
   if (action == BtnAction::LongPressRelease) {
-    if (id == BtnId::Boot && assistantJob_.active()) assistantJob_.release();
+    if (id == BtnId::Boot && assistantJob_.active()) assistantJob_.release(true);
     return;
   }
   markActivity();
@@ -1251,6 +1270,7 @@ void App::onButtonKeyboardPassword(BtnId id, BtnAction action) {
 // ---------------------------------------------------------------------
 
 void App::loop() {
+  NetworkRoute::service();
   if (exportJob_.active() || screen_ == Screen::ExportBusy) { serviceNoteExport(); return; }
   if (assistantJob_.active() || screen_ == Screen::AssistantBusy) { serviceAssistant(); return; }
   if (screen_ == Screen::PhonePairing) {
@@ -1301,6 +1321,42 @@ void App::diagnosticCommand(const String &command) {
   if (exportJob_.active()) {
     Serial.println("[Diag] exportacao ao Obsidian em andamento"); return;
   }
+  if (command == "benchmark-route auto" || command == "benchmark-route wifi" || command == "benchmark-route phone") {
+    if (assistantJob_.active() || isSyncActive()) {
+      Serial.println("[Diag] rota de benchmark nao pode mudar durante uma operacao"); return;
+    }
+    const auto route = command == "benchmark-route wifi" ? DiagnosticRoute::WifiOnly :
+      command == "benchmark-route phone" ? DiagnosticRoute::PhoneOnly : DiagnosticRoute::Auto;
+    NetworkRoute::setDiagnosticRoute(route);
+    Serial.printf("[BenchmarkRoute] %s\n", route == DiagnosticRoute::WifiOnly ? "wifi" :
+      route == DiagnosticRoute::PhoneOnly ? "phone" : "auto");
+    return;
+  }
+  if (command == "benchmark-playback full" || command == "benchmark-playback ready") {
+    if (assistantJob_.active() || isSyncActive()) {
+      Serial.println("[Diag] buffer de benchmark nao pode mudar durante uma operacao"); return;
+    }
+    const bool early = command == "benchmark-playback ready";
+    NetworkRoute::setDiagnosticEarlyPlayback(early);
+    Serial.printf("[BenchmarkPlayback] %s\n", early ? "ready" : "full");
+    return;
+  }
+  if (command.startsWith("benchmark-media ")) {
+    if (assistantJob_.active() || isSyncActive()) {
+      Serial.println("[Diag] midia nao pode mudar durante uma operacao"); return;
+    }
+    const String name = command.substring(16);
+    DiagnosticMedia profile;
+    if (name == "legacy") profile = DiagnosticMedia::Legacy;
+    else if (name == "pcm") profile = DiagnosticMedia::Pcm;
+    else if (name == "opus64") profile = DiagnosticMedia::Opus64;
+    else if (name == "opus48") profile = DiagnosticMedia::Opus48;
+    else if (name == "opus32") profile = DiagnosticMedia::Opus32;
+    else { Serial.println("[Diag] midia invalida; use legacy/pcm/opus64/opus48/opus32"); return; }
+    NetworkRoute::setDiagnosticMedia(profile);
+    Serial.printf("[BenchmarkMedia] %s\n", name.c_str());
+    return;
+  }
   if (command == "assistant-models" || command == "assistant-enable") {
     probeAssistantModels(command == "assistant-enable"); return;
   }
@@ -1312,9 +1368,10 @@ void App::diagnosticCommand(const String &command) {
   if (assistantJob_.active()) {
     AssistantJob::Snapshot snapshot;
     assistantJob_.snapshot(snapshot);
-    Serial.printf("[Assistant] state=%d captured_ms=%lu released=%d finished=%d route=%s\n",
-                  static_cast<int>(snapshot.state), static_cast<unsigned long>(snapshot.capturedMs),
+    Serial.printf("[Assistant] turn=%lu state=%d captured_ms=%lu released=%d finished=%d route=%s\n",
+                  static_cast<unsigned long>(snapshot.telemetry.turnId), static_cast<int>(snapshot.state), static_cast<unsigned long>(snapshot.capturedMs),
                   snapshot.released, snapshot.finished, NetworkRoute::label());
+    if (command == "status") Serial.println("[DiagDone] status");
     return;
   }
   if (recording_) {
@@ -1322,6 +1379,7 @@ void App::diagnosticCommand(const String &command) {
                   screen_ == Screen::Saving, (unsigned long)recorder_.bytesWritten(),
                   (unsigned long)recorder_.checkpointBytes(), (unsigned long)recorder_.overflowCount(),
                   recorder_.storageFull(), recorder_.writeFailed());
+    if (command == "status") Serial.println("[DiagDone] status");
     return;
   }
   if (isSyncActive()) {
@@ -1359,8 +1417,10 @@ void App::diagnosticCommand(const String &command) {
                   cfg.assistantEnabled, cfg.assistantModel, cfg.assistantGatewayUrl[0] != '\0', ESP.getFreeHeap());
     Serial.printf("[Status] BLE_erro=%s\n", PhoneRelay::lastError());
     const PhoneRelay::Diagnostics ble = PhoneRelay::diagnostics();
-    Serial.printf("[BLE] ligado=%d autenticado=%d subscribed=%d mtu=%u security_rc=%d bond_rc=%d disconnect_reason=%d auth_flags=%d pin_requests=%lu\n",
-                  ble.linked, ble.authenticated, ble.subscribed, ble.mtu, ble.securityResult, ble.bondResult,
+    Serial.printf("[BLE] ligado=%d autenticado=%d subscribed=%d mtu=%u interval_1.25ms=%u latency=%u supervision_10ms=%u tx_phy=%u rx_phy=%u tx_octets=%u rx_octets=%u tx_time=%u rx_time=%u security_rc=%d bond_rc=%d disconnect_reason=%d auth_flags=%d pin_requests=%lu\n",
+                  ble.linked, ble.authenticated, ble.subscribed, ble.mtu, ble.interval1250us, ble.latency,
+                  ble.supervisionTimeout10ms, ble.txPhy, ble.rxPhy, ble.maxTxOctets, ble.maxRxOctets,
+                  ble.maxTxTime, ble.maxRxTime, ble.securityResult, ble.bondResult,
                   ble.disconnectReason, ble.authenticationFlags, static_cast<unsigned long>(ble.passkeyRequests));
     for (int i = 0; i < notes_.count(); ++i) {
       NoteEntry note; if (!notes_.getAt(i, note)) continue;
@@ -1397,6 +1457,6 @@ void App::diagnosticCommand(const String &command) {
     markActivity();
     Serial.printf("[Diag] Pareamento Drive: %s\n", connected && settingsStore_.hasDriveAuth() ? "autorizado" : "pendente");
   } else {
-    Serial.println("[Diag] comandos: status | stayawake 1/0 | wifi | sync | sync-one | repair-drive");
+    Serial.println("[Diag] comandos: status | stayawake 1/0 | wifi | sync | sync-one | repair-drive | benchmark-route auto/wifi/phone | benchmark-playback full/ready");
   }
 }

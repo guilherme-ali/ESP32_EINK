@@ -1,7 +1,9 @@
 #include "transport.h"
 #include "live_protocol.h"
+#include "phone_voice.h"
 #include <algorithm>
 #include <cstring>
+#include <new>
 
 namespace Assistant {
 static bool expired(uint32_t begin, uint32_t limit) { return uint32_t(millis() - begin) >= limit; }
@@ -10,7 +12,7 @@ static bool writeBytes(NetworkClient &client, const uint8_t *p, size_t n,
   const uint32_t begin = millis(); size_t at = 0;
   while (at < n) {
     if (stop(context) || expired(begin, timeout) || !client.connected()) return false;
-    size_t written = client.write(p + at, std::min(n - at, size_t(676)));
+    size_t written = client.write(p + at, std::min(n - at, size_t(1384)));
     if (written > n - at) return false;
     at += written;
     if (at < n) vTaskDelay(1);
@@ -18,7 +20,75 @@ static bool writeBytes(NetworkClient &client, const uint8_t *p, size_t n,
   return true;
 }
 LiveSocket::LiveSocket(uint8_t *storage, size_t capacity, StopFn stop, void *context)
-  : parser_(storage, capacity), stop_(stop), context_(context) {}
+  : storage_(storage), capacity_(capacity), parser_(storage, capacity), stop_(stop), context_(context) {}
+LiveSocket::~LiveSocket() {
+  close();
+#if defined(ARDUINO_ARCH_ESP32)
+  delete voice_;
+#endif
+}
+bool LiveSocket::connectMedia(const char *key) {
+#if defined(ARDUINO_ARCH_ESP32)
+  const auto profile = NetworkRoute::diagnosticMedia();
+  mediaBitrate_ = profile == DiagnosticMedia::Opus64 ? 64000 : profile == DiagnosticMedia::Opus48 ? 48000 :
+    profile == DiagnosticMedia::Opus32 ? 32000 : 0;
+  voice_ = new (std::nothrow) PhoneVoice(storage_, capacity_, stop_, context_);
+  if (!voice_) { error_ = "Sem memoria para midia BLE."; return false; }
+  const uint64_t begin = assistantMonotonicUs();
+  const bool ok = voice_->connect(key, mediaBitrate_);
+  networkConnectUs_ = static_cast<uint32_t>(assistantMonotonicUs() - begin);
+  return ok;
+#else
+  (void)key; return false;
+#endif
+}
+const char *LiveSocket::mediaName() const {
+  return !voice_ ? "legacy" : mediaBitrate_ == 64000 ? "opus64" : mediaBitrate_ == 48000 ? "opus48" :
+    mediaBitrate_ == 32000 ? "opus32" : "pcm";
+}
+const uint8_t *LiveSocket::data() const {
+#if defined(ARDUINO_ARCH_ESP32)
+  if (voice_) return voice_->data();
+#endif
+  return parser_.data();
+}
+size_t LiveSocket::size() const {
+#if defined(ARDUINO_ARCH_ESP32)
+  if (voice_) return voice_->size();
+#endif
+  return parser_.size();
+}
+bool LiveSocket::isPhone() const { return voice_ || client_.isPhone(); }
+const char *LiveSocket::error() const {
+#if defined(ARDUINO_ARCH_ESP32)
+  if (voice_) return voice_->error();
+#endif
+  return error_;
+}
+bool LiveSocket::inputPending() {
+#if defined(ARDUINO_ARCH_ESP32)
+  if (voice_) return voice_->pending();
+#endif
+  return client_.available() > 0 || parser_.pending();
+}
+uint32_t LiveSocket::mediaSentBytes() const {
+#if defined(ARDUINO_ARCH_ESP32)
+  if (voice_) return voice_->sentBytes();
+#endif
+  return 0;
+}
+uint32_t LiveSocket::mediaReceivedBytes() const {
+#if defined(ARDUINO_ARCH_ESP32)
+  if (voice_) return voice_->receivedBytes();
+#endif
+  return 0;
+}
+void LiveSocket::codecTiming(uint32_t &encodeUs, uint32_t &decodeUs) const {
+  encodeUs = decodeUs = 0;
+#if defined(ARDUINO_ARCH_ESP32)
+  if (voice_) { encodeUs = voice_->encodeUs(); decodeUs = voice_->decodeUs(); }
+#endif
+}
 bool LiveSocket::connect(const char *rawKey) {
   if (!rawKey) { error_ = "Chave Gemini ausente ou inválida."; return false; }
   while (*rawKey == ' ' || *rawKey == '\t') ++rawKey;
@@ -31,12 +101,24 @@ bool LiveSocket::connect(const char *rawKey) {
   for (const char *p = key; *p; ++p) if (!((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
       (*p >= '0' && *p <= '9') || *p == '-' || *p == '_' || *p == '.')) { error_ = "Chave Gemini inválida."; return false; }
   if (stop_(context_)) return false;
+#if defined(ARDUINO_ARCH_ESP32)
+  if (NetworkRoute::phoneSelected() && NetworkRoute::diagnosticMedia() != DiagnosticMedia::Legacy)
+    return connectMedia(key);
+#endif
   client_.setInsecure(); // Existing direct TLS policy; PhoneRelay verifies TLS in the app.
   client_.setTimeout(10); // Core 2.0.17: seconds; also sets 10s BLE write credit timeout.
   client_.setHandshakeTimeout(10);
-  if (!client_.connect("generativelanguage.googleapis.com", 443, 10000) || stop_(context_)) {
+  const uint64_t connectBegin = assistantMonotonicUs();
+  const bool connected = client_.connect("generativelanguage.googleapis.com", 443, 10000);
+  networkConnectUs_ = static_cast<uint32_t>(assistantMonotonicUs() - connectBegin);
+  if (!connected || stop_(context_)) {
     error_ = "Não foi possível conectar ao Gemini por Wi-Fi ou celular."; return false;
   }
+#if defined(ARDUINO_ARCH_ESP32)
+  if (client_.isPhone() && NetworkRoute::diagnosticMedia() != DiagnosticMedia::Legacy) {
+    client_.stop(); return connectMedia(key);
+  }
+#endif
   uint8_t nonce[16]; esp_fill_random(nonce, sizeof(nonce));
   std::string wsKey = base64(nonce, sizeof(nonce));
   std::string challenge = wsKey + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -48,6 +130,7 @@ bool LiveSocket::connect(const char *rawKey) {
   request += key;
   request += " HTTP/1.1\r\nHost: generativelanguage.googleapis.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ";
   request += wsKey + "\r\n\r\n";
+  const uint64_t upgradeBegin = assistantMonotonicUs();
   if (!writeBytes(client_, reinterpret_cast<const uint8_t *>(request.data()), request.size(), stop_, context_, 5000)) return false;
   request.assign(request.size(), '\0'); request.clear();
   std::string headers; headers.reserve(1024); const uint32_t begin = millis();
@@ -59,7 +142,9 @@ bool LiveSocket::connect(const char *rawKey) {
         if (!wsUpgradeValid(headers, base64(digest, sizeof(digest)))) {
           error_ = "Gemini recusou o handshake WebSocket ou enviou resposta inválida."; return false;
         }
-        upgraded_ = true; return true;
+        upgraded_ = true;
+        wsUpgradeUs_ = static_cast<uint32_t>(assistantMonotonicUs() - upgradeBegin);
+        return true;
       }
     } else {
       if (!client_.connected()) break;
@@ -70,7 +155,7 @@ bool LiveSocket::connect(const char *rawKey) {
 }
 bool LiveSocket::frame(uint8_t opcode, const uint8_t *data, size_t n, uint32_t timeout) {
   if (!upgraded_ || closeSent_ || n > kJsonLimit || (opcode >= 8 && n > 125)) return false;
-  uint8_t mask[4], header[14], chunk[676]; esp_fill_random(mask, sizeof(mask));
+  uint8_t mask[4], header[14], chunk[1384]; esp_fill_random(mask, sizeof(mask));
   size_t hn = wsClientHeader(header, opcode, n, mask);
   const uint32_t begin = millis();
   size_t firstPayload = std::min(n, sizeof(chunk) - hn);
@@ -94,12 +179,30 @@ bool LiveSocket::frame(uint8_t opcode, const uint8_t *data, size_t n, uint32_t t
   return true;
 }
 bool LiveSocket::send(const std::string &json) {
+#if defined(ARDUINO_ARCH_ESP32)
+  if (voice_) return voice_->sendJson(json);
+#endif
   if (json.empty() || !frame(1, reinterpret_cast<const uint8_t *>(json.data()), json.size())) {
     error_ = "Falha ou timeout ao enviar mensagem ao Gemini."; return false;
   }
   return true;
 }
+bool LiveSocket::sendAudio(const uint8_t *pcm, size_t n) {
+#if defined(ARDUINO_ARCH_ESP32)
+  if (voice_) return voice_->sendAudio(pcm, n);
+#endif
+  return send(audioJson(pcm, n));
+}
+bool LiveSocket::endInput() {
+#if defined(ARDUINO_ARCH_ESP32)
+  if (voice_) return voice_->endInput();
+#endif
+  return send(activityJson(false));
+}
 WsParser::Event LiveSocket::poll() {
+#if defined(ARDUINO_ARCH_ESP32)
+  if (voice_) return voice_->poll();
+#endif
   using E = WsParser::Event;
   if (framePending_ && expired(frameStarted_, 15000)) {
     closeCode_ = 1002; error_ = "Timeout ao receber frame WebSocket."; return E::Error;
@@ -128,6 +231,9 @@ WsParser::Event LiveSocket::poll() {
   return E::None;
 }
 void LiveSocket::close() {
+#if defined(ARDUINO_ARCH_ESP32)
+  if (voice_) { voice_->close(); return; }
+#endif
   if (upgraded_ && !closeSent_ && !stop_(context_) && client_.connected()) {
     const uint8_t code[] = {uint8_t(closeCode_ >> 8), uint8_t(closeCode_)};
     frame(8, code, sizeof(code), 300);

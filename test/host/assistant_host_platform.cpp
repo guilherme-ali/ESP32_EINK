@@ -11,6 +11,10 @@
 
 void portENTER_CRITICAL(portMUX_TYPE *p) { p->lock(); }
 void portEXIT_CRITICAL(portMUX_TYPE *p) { p->unlock(); }
+uint64_t assistantMonotonicUs() {
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+    std::chrono::steady_clock::now().time_since_epoch()).count());
+}
 
 namespace AssistantHost {
 std::mutex mutex;
@@ -28,8 +32,11 @@ std::atomic<bool> redirectForever{false};
 std::atomic<bool> gatewayLoseFirst{false};
 std::string gatewayBody;
 std::atomic<bool> phoneRoute{false}, releaseResponseTail{false}, responseHeadRead{false}, fastTaskYield{false};
+std::atomic<bool> earlyPlayback{true};
 std::string delayedAfterEnd;
 std::atomic<size_t> playbackWriteLimit{3};
+std::atomic<unsigned> closeDelayMs{0};
+std::atomic<bool> closingSocket{false}, writeDuringClose{false};
 void sleep(unsigned ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
 void reset() {
   assert(tasksAlive == 0 && socketsAlive == 0);
@@ -42,7 +49,9 @@ void reset() {
   gatewayBody.clear();
   timeOffset = 0; gatewayDelay = 0; redirectUrl.clear(); afterSetup.clear(); afterToolResponse.clear();
   phoneRoute = releaseResponseTail = responseHeadRead = fastTaskYield = false;
-  delayedAfterEnd.clear(); playbackWriteLimit = 3;
+  earlyPlayback = true;
+  delayedAfterEnd.clear(); playbackWriteLimit = 3; closeDelayMs = 0;
+  closingSocket = writeDuringClose = false;
   const uint8_t pcm[] = {0x34, 0x12, 0xfe, 0xff, 0, 0x80, 0xff, 0x7f};
   afterEnd = "{\"serverContent\":{\"modelTurn\":{\"parts\":[{\"inlineData\":{\"mimeType\":\"audio/pcm;rate=24000\",\"data\":\"" +
     Assistant::base64(pcm, sizeof(pcm)) + "\"}}]},\"turnComplete\":true}}";
@@ -51,6 +60,8 @@ std::vector<std::string> messages() { std::lock_guard<std::mutex> lock(mutex); r
 bool connectCallback() { callbackEntered = true; sleep(connectDelay.load()); callbackExit = true; return !networkUnavailable; }
 } // namespace AssistantHost
 namespace NetworkRoute { bool phoneSelected() { return AssistantHost::phoneRoute.load(); } }
+namespace NetworkRoute { bool diagnosticEarlyPlayback() { return AssistantHost::earlyPlayback.load(); } }
+bool NetworkClient::isPhone() const { return AssistantHost::phoneRoute.load(); }
 
 struct AssistantHostTask {
   std::thread thread;
@@ -128,6 +139,7 @@ bool AudioCodec::read(void *ptr, size_t capacity, size_t *n, uint32_t) {
   ++AssistantHost::captureReads; AssistantHost::captureInRead = false; return true;
 }
 bool AudioCodec::write(const void *ptr, size_t n, size_t *written, uint32_t) {
+  if (AssistantHost::closingSocket) AssistantHost::writeDuringClose = true;
   if (AssistantHost::captureInRead) AssistantHost::clockRace = true;
   if (AssistantHost::failWrite) { *written = 0; return false; }
   *written = std::min(n, AssistantHost::playbackWriteLimit.load()); // Also exercise partial stereo frames.
@@ -217,7 +229,16 @@ int NetworkClient::available() {
   return int(wire->input.size() - wire->received);
 }
 bool NetworkClient::connected() { return wire && wire->connected; }
-void NetworkClient::stop() { if (wire && wire->connected) { wire->connected = false; --AssistantHost::socketsAlive; } wire.reset(); }
+void NetworkClient::stop() {
+  if (wire && wire->connected) {
+    if (AssistantHost::closeDelayMs) {
+      AssistantHost::closingSocket = true; AssistantHost::sleep(AssistantHost::closeDelayMs);
+      AssistantHost::closingSocket = false;
+    }
+    wire->connected = false; --AssistantHost::socketsAlive;
+  }
+  wire.reset();
+}
 bool HttpClient::readResponse(NetworkClient &client, HttpResponse &out, size_t limit, uint32_t timeout) {
   assert(limit == 32768 && timeout <= 8000); assert(client.wire);
   AssistantHost::sleep(AssistantHost::gatewayDelay);

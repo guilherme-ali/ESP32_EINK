@@ -38,6 +38,7 @@ void vTaskDelay(unsigned);
 void vTaskSuspend(TaskHandle_t);
 void vTaskDelete(TaskHandle_t);
 uint32_t millis();
+uint64_t assistantMonotonicUs();
 void esp_fill_random(void *, size_t);
 int mbedtls_sha1_ret(const unsigned char *, size_t, unsigned char *);
 constexpr unsigned MALLOC_CAP_SPIRAM = 1, MALLOC_CAP_8BIT = 2;
@@ -65,6 +66,7 @@ public:
   void setInsecure() {}
   void setTimeout(unsigned) {}
   void setHandshakeTimeout(unsigned) {}
+  bool isPhone() const;
   int connect(const char *, uint16_t, int32_t);
   size_t write(const uint8_t *, size_t);
   int read();
@@ -76,7 +78,7 @@ class HttpClient {
 public:
   static bool readResponse(NetworkClient &, HttpResponse &, size_t, uint32_t);
 };
-namespace NetworkRoute { bool phoneSelected(); }
+namespace NetworkRoute { bool phoneSelected(); bool diagnosticEarlyPlayback(); }
 namespace AssistantHost {
 extern std::mutex mutex;
 extern std::vector<std::string> jsonSent, requests, hosts;
@@ -93,8 +95,11 @@ extern std::atomic<bool> redirectForever;
 extern std::atomic<bool> gatewayLoseFirst;
 extern std::string gatewayBody;
 extern std::atomic<bool> phoneRoute, releaseResponseTail, responseHeadRead, fastTaskYield;
+extern std::atomic<bool> earlyPlayback;
 extern std::string delayedAfterEnd;
 extern std::atomic<size_t> playbackWriteLimit;
+extern std::atomic<unsigned> closeDelayMs;
+extern std::atomic<bool> closingSocket, writeDuringClose;
 void reset();
 void sleep(unsigned ms);
 std::vector<std::string> messages();

@@ -8,6 +8,19 @@ class AssistantJob {
 public:
   using ConnectFn = bool (*)();
   enum class State { Idle, Connecting, Listening, Thinking, Speaking, Done, Failed };
+  struct Telemetry {
+    char media[8] = "legacy";
+    uint32_t mediaSentBytes = 0, mediaReceivedBytes = 0;
+    uint32_t encodeUs = 0, decodeUs = 0, networkStackFreeBytes = 0;
+    uint32_t turnId = 0;
+    uint32_t routeBeginUs = 0, routeReadyUs = 0, networkConnectUs = 0, wsUpgradeUs = 0;
+    uint32_t setupCompleteUs = 0, captureDoneUs = 0, firstInputUs = 0, lastInputUs = 0;
+    uint32_t activityEndUs = 0, firstAudioMessageUs = 0, firstPcmUs = 0;
+    uint32_t turnCompleteUs = 0, responseReadyUs = 0, firstI2sUs = 0, lastI2sUs = 0, networkDoneUs = 0;
+    uint32_t backlogAtRelease = 0, maxBacklogBytes = 0, inputBytes = 0, releaseUs = 0;
+    uint8_t releaseSource = 0; // 1 physical button, 2 serial/benchmark, 3 capture limit
+    bool routeKnown = false, phoneRoute = false;
+  };
   struct Snapshot {
     State state = State::Idle;
     char detail[96] = {};
@@ -17,12 +30,13 @@ public:
     uint32_t receivedAudioMs = 0, playedAudioMs = 0, rebufferCount = 0;
     bool bufferedAudio = false;
     bool released = false, finished = false;
+    Telemetry telemetry;
   };
   AssistantJob() = default;
   AssistantJob(const AssistantJob &) = delete;
   AssistantJob &operator=(const AssistantJob &) = delete;
   bool start(const Settings &, AudioCodec &, ConnectFn);
-  void release();
+  void release(bool physicalButton = false);
   void cancel();
   bool active() const;
   bool snapshot(Snapshot &) const;

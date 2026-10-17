@@ -6,3 +6,5 @@
 test/host/.build/
 __pycache__/
 dist/
+test/results/voice-benchmark/
+tools/.venv-benchmark/

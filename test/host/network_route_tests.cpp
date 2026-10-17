@@ -19,6 +19,7 @@ static_assert(std::has_virtual_destructor<NetworkClient>::value, "destrutor deve
 
 namespace RouteTest {
 bool enabled = true, phone = false, ready = true, allowFallback = true;
+DiagnosticRoute route = DiagnosticRoute::Auto;
 uint32_t fallbackCost = 0, lastFallbackBudget = 0, lastOpenBudget = 0, lastWriteBudget = 0;
 unsigned fallbacks = 0, opens = 0, closes = 0;
 size_t relayWriteLimit = SIZE_MAX;
@@ -30,6 +31,7 @@ void reset() {
   nativeSuccess = true; nativeCost = 0; nativeWriteLimit = SIZE_MAX;
   nativeHosts.clear(); nativeBytes.clear(); ca = nullptr; insecure = false;
   enabled = ready = allowFallback = true; phone = false;
+  route = DiagnosticRoute::Auto;
   fallbackCost = lastFallbackBudget = lastOpenBudget = lastWriteBudget = 0;
   fallbacks = opens = closes = 0; relayWriteLimit = SIZE_MAX; abortWrite = false;
   channels = {}; WiFi.state = WL_CONNECTED; Host::resetClock();
@@ -42,6 +44,10 @@ void reset() {
 namespace NetworkRoute {
 bool phoneSelected() { return RouteTest::phone; }
 bool fallbackEnabled() { return RouteTest::enabled; }
+DiagnosticRoute diagnosticRoute() { return RouteTest::route; }
+void setDiagnosticRoute(DiagnosticRoute route) { RouteTest::route = route; }
+void finishRetainingPhone(uint32_t) {}
+void service() {}
 bool fallbackToPhone(uint32_t budget) {
   using namespace RouteTest;
   ++fallbacks; lastFallbackBudget = budget;
@@ -199,6 +205,16 @@ void native_incomplete_write_never_switches_to_phone() {
   CHECK(!HttpClient::writeAll(client, String("ATION"), 50));
   CHECK(nativeBytes == "MUT" && opens == 0 && fallbacks == 0 && !client.isPhone());
 }
+void wifi_only_does_not_fallback_after_native_failure() {
+  reset(); route = DiagnosticRoute::WifiOnly; nativeSuccess = false;
+  NetworkClient client; CHECK(!client.connect("wifi-only.example", 443, 1500));
+  CHECK(nativeHosts.size() == 1 && fallbacks == 0 && opens == 0);
+}
+void phone_only_skips_native_even_when_wifi_is_healthy() {
+  reset(); route = DiagnosticRoute::PhoneOnly; nativeSuccess = true;
+  NetworkClient client; CHECK(client.connect("phone-only.example", 443, 1500));
+  CHECK(nativeHosts.empty() && fallbacks == 2 && opens == 1);
+}
 int main() {
   void (*tests[])() = {direct_tls_keeps_policy_and_no_phone, no_wifi_relay_has_no_local_dns,
     tls_failure_falls_back_before_any_body, dns_failure_and_late_callback_are_bounded,
@@ -207,7 +223,8 @@ int main() {
     independent_channels_and_raii_close, disabled_fallback_and_expired_deadline_do_not_open,
     timeout_seconds_and_write_milliseconds, dns_slots_quarantine_old_callbacks_without_uaf,
     channel_exhaustion_fails_closed_without_native_escape, connect_deadline_survives_millis_wrap,
-    native_incomplete_write_never_switches_to_phone};
+    native_incomplete_write_never_switches_to_phone, wifi_only_does_not_fallback_after_native_failure,
+    phone_only_skips_native_even_when_wifi_is_healthy};
   for (auto test : tests) test();
   std::printf("NetworkClient ESP32 real + SDK/PhoneRelay stubs: %zu/%zu OK\n", std::size(tests), std::size(tests));
 }

@@ -22,8 +22,11 @@ import org.junit.Test;
 
 public class RelayEngineTest {
     private static byte[] open(int channel, int epoch) {
-        byte[] host = "api.openai.com".getBytes(StandardCharsets.UTF_8);
-        byte[] payload = new byte[host.length + 2]; payload[0] = (byte) 0xbb; payload[1] = 1;
+        return openHost(channel, epoch, "api.openai.com", 443);
+    }
+    private static byte[] openHost(int channel, int epoch, String hostname, int port) {
+        byte[] host = hostname.getBytes(StandardCharsets.UTF_8);
+        byte[] payload = new byte[host.length + 2]; payload[0] = (byte) port; payload[1] = (byte) (port >>> 8);
         System.arraycopy(host, 0, payload, 2, host.length);
         return new Frame(Frame.OPEN, channel, epoch, 0, payload).encode();
     }
@@ -52,6 +55,7 @@ public class RelayEngineTest {
     private static final class FakeSocket implements RelayEngine.Duplex {
         final Pipe in = new Pipe();
         final ByteArrayOutputStream written = new ByteArrayOutputStream();
+        final java.util.concurrent.atomic.AtomicInteger writeCalls = new java.util.concurrent.atomic.AtomicInteger();
         final CountDownLatch writeEntered = new CountDownLatch(1), connectEntered = new CountDownLatch(1);
         final CountDownLatch gate = new CountDownLatch(1), connectGate = new CountDownLatch(1);
         final CountDownLatch wasClosed = new CountDownLatch(1);
@@ -69,10 +73,12 @@ public class RelayEngineTest {
         @Override public OutputStream output() {
             return new OutputStream() {
                 @Override public void write(int b) throws IOException { write(new byte[]{(byte) b}); }
-                @Override public void write(byte[] b) throws IOException {
+                @Override public void write(byte[] b) throws IOException { write(b, 0, b.length); }
+                @Override public void write(byte[] b, int off, int len) throws IOException {
                     writeEntered.countDown(); if (blockWrite) await(gate);
                     if (closed) throw new IOException("Fechado");
-                    synchronized (written) { written.write(b, 0, b.length); }
+                    writeCalls.incrementAndGet();
+                    synchronized (written) { written.write(b, off, len); }
                 }
             };
         }
@@ -130,6 +136,18 @@ public class RelayEngineTest {
             h.start(1, 1);
             s.gate.countDown(); Frame ack = h.take(Frame.ACK); assertEquals(0, ack.seq); assertEquals(0, ack.channel);
             synchronized (s.written) { assertArrayEquals(new byte[]{0}, s.written.toByteArray()); }
+        }
+    }
+
+    @Test public void consecutiveQueuedBleFramesAreBatchedIntoTlsButAckedIndividually() throws Exception {
+        try (Harness h = new Harness()) {
+            FakeSocket s = h.start(0, 101); s.blockWrite = true;
+            h.engine.receive(data(0, 101, 0)); assertTrue(s.writeEntered.await(2, TimeUnit.SECONDS));
+            for (int i = 1; i < 8; i++) h.engine.receive(data(0, 101, i));
+            s.gate.countDown();
+            for (int i = 0; i < 8; i++) assertEquals(i, h.take(Frame.ACK).seq);
+            synchronized (s.written) { assertArrayEquals(new byte[]{0,1,2,3,4,5,6,7}, s.written.toByteArray()); }
+            assertEquals("one TLS write for frame 0 and one for the seven already queued", 2, s.writeCalls.get());
         }
     }
 
@@ -261,5 +279,52 @@ public class RelayEngineTest {
         } finally {
             engine.close(); pool.shutdownNow(); assertTrue(pool.awaitTermination(3, TimeUnit.SECONDS));
         }
+    }
+
+    @Test public void legacyFunctionalFactoryRejectsVoiceEvenIfHostIsAllowlisted() throws Exception {
+        ExecutorService pool = Executors.newFixedThreadPool(2); BlockingQueue<Frame> frames = new LinkedBlockingQueue<>();
+        RelayEngine.SocketFactory legacy = () -> { fail("No DNS/TLS creation for reserved host"); return null; };
+        RelayEngine engine = new RelayEngine(new HostPolicy(List.of(RelayEngine.VOICE_HOST)), legacy,
+                (bytes, valid) -> { frames.add(Frame.decode(bytes)); return CompletableFuture.completedFuture(null); }, pool, () -> 1000L);
+        try {
+            assertFalse(legacy.supportsVoice()); assertThrows(IOException.class, legacy::createVoice);
+            engine.receive(openHost(0, 1, RelayEngine.VOICE_HOST, 443));
+            Frame error = frames.poll(2, TimeUnit.SECONDS); assertNotNull(error); assertEquals(Frame.ERROR, error.type);
+        } finally { engine.close(); pool.shutdownNow(); assertTrue(pool.awaitTermination(3, TimeUnit.SECONDS)); }
+    }
+
+    @Test public void reservedLiteralOnlyBypassesPolicyAndUsesVoiceWithoutTlsFactory() throws Exception {
+        ExecutorService pool = Executors.newFixedThreadPool(4); BlockingQueue<Frame> frames = new LinkedBlockingQueue<>();
+        Pipe pipe = new Pipe(); ByteArrayOutputStream written = new ByteArrayOutputStream();
+        java.util.concurrent.atomic.AtomicInteger created = new java.util.concurrent.atomic.AtomicInteger();
+        RelayEngine.SocketFactory factory = new RelayEngine.SocketFactory() {
+            @Override public RelayEngine.Duplex create() { fail("Reserved host must never reach DNS/TLS"); return null; }
+            @Override public boolean supportsVoice() { return true; }
+            @Override public RelayEngine.Duplex createVoice() {
+                created.incrementAndGet();
+                return new RelayEngine.Duplex() {
+                    @Override public void connect(String host, int port) { assertEquals(RelayEngine.VOICE_HOST, host); assertEquals(443, port); }
+                    @Override public InputStream input() { return pipe; }
+                    @Override public OutputStream output() { return written; }
+                    @Override public void close() { pipe.close(); }
+                };
+            }
+        };
+        RelayEngine engine = new RelayEngine(new HostPolicy(List.of(RelayEngine.VOICE_HOST)), factory,
+                (bytes, valid) -> { if (valid.getAsBoolean()) frames.add(Frame.decode(bytes)); return CompletableFuture.completedFuture(null); }, pool, () -> 1000L);
+        try {
+            int epoch = 10;
+            for (String near : List.of("VOICE-v1.ideiarec.invalid", RelayEngine.VOICE_HOST + ".", " " + RelayEngine.VOICE_HOST)) {
+                engine.receive(openHost(0, epoch++, near, 443));
+                Frame error = frames.poll(2, TimeUnit.SECONDS); assertNotNull(error); assertEquals(Frame.ERROR, error.type);
+            }
+            engine.receive(openHost(0, 100, RelayEngine.VOICE_HOST, 444));
+            assertEquals(Frame.ERROR, frames.poll(2, TimeUnit.SECONDS).type); assertEquals(0, created.get());
+            engine.receive(openHost(0, 101, RelayEngine.VOICE_HOST, 443));
+            Frame opened = frames.poll(2, TimeUnit.SECONDS); assertNotNull(opened); assertEquals(Frame.OPENED, opened.type); assertEquals(0, opened.payload().length);
+            assertEquals(1, created.get()); engine.receive(data(0, 101, 0));
+            Frame ack = frames.poll(2, TimeUnit.SECONDS); assertNotNull(ack); assertEquals(Frame.ACK, ack.type);
+            assertArrayEquals(new byte[]{0}, written.toByteArray());
+        } finally { engine.close(); pool.shutdownNow(); assertTrue(pool.awaitTermination(3, TimeUnit.SECONDS)); }
     }
 }

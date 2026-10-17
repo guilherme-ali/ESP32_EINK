@@ -34,6 +34,7 @@ final class GattTransport implements RelayEngine.BleWriter, AutoCloseable {
     interface Listener {
         void connected();
         void ready();
+        void linkMetrics(String metrics);
         void frame(byte[] value);
         void failed(String status);
     }
@@ -61,6 +62,7 @@ final class GattTransport implements RelayEngine.BleWriter, AutoCloseable {
     private BluetoothGattDescriptor cccd;
     private Operation active;
     private boolean closed, registered, discovered, subscribing, encrypted, ready;
+    private int negotiatedMtu = 23, txPhy, rxPhy;
     private final Runnable operationTimeout = () -> abort("Timeout GATT; sessão descartada");
     private final Runnable startupTimeout = () -> abort("Timeout de conexão, bond ou criptografia");
 
@@ -165,10 +167,13 @@ final class GattTransport implements RelayEngine.BleWriter, AutoCloseable {
             if (!ready || closed || copy.length > Frame.MAX_FRAME) {
                 future.completeExceptionally(new IllegalStateException("BLE indisponível")); return;
             }
+            final int writeType = (rx.getProperties() & BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0
+                    ? BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                    : BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT;
             enqueue(new Operation(Kind.WRITE, () -> {
-                if (Build.VERSION.SDK_INT >= 33) return gatt.writeCharacteristic(rx, copy,
-                        BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) == BluetoothStatusCodes.SUCCESS;
-                rx.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT); rx.setValue(copy);
+                if (Build.VERSION.SDK_INT >= 33) return gatt.writeCharacteristic(rx, copy, writeType)
+                        == BluetoothStatusCodes.SUCCESS;
+                rx.setWriteType(writeType); rx.setValue(copy);
                 return gatt.writeCharacteristic(rx);
             }, () -> { }, valid, future));
         })) future.completeExceptionally(new CancellationException());
@@ -191,8 +196,14 @@ final class GattTransport implements RelayEngine.BleWriter, AutoCloseable {
         }
         @Override public void onMtuChanged(BluetoothGatt source, int mtu, int status) {
             if (!current(source)) return;
+            if (status != BluetoothGatt.GATT_SUCCESS) { abort("Falha na negociacao do MTU"); return; }
             if (mtu < 183) { abort("MTU abaixo de 183; relay indisponível"); return; }
+            negotiatedMtu = mtu; publishLinkMetrics();
             finish(Kind.MTU, status);
+        }
+        @Override public void onPhyUpdate(BluetoothGatt source, int tx, int rx, int status) {
+            if (!current(source) || status != BluetoothGatt.GATT_SUCCESS) return;
+            txPhy = tx; rxPhy = rx; publishLinkMetrics();
         }
         @Override public void onServicesDiscovered(BluetoothGatt source, int status) {
             if (!current(source)) return;
@@ -233,6 +244,15 @@ final class GattTransport implements RelayEngine.BleWriter, AutoCloseable {
             if (Build.VERSION.SDK_INT < 33) notification(source, characteristic, characteristic.getValue());
         }
     };
+
+    private void publishLinkMetrics() {
+        listener.linkMetrics(linkMetricsText());
+    }
+
+    String linkMetricsText() {
+        return "BLE MTU=" + negotiatedMtu + " tx_phy=" + txPhy + " rx_phy=" + rxPhy
+                + " interval/latency/DLE=consultar ESP32";
+    }
 
     private void abort(String status) {
         if (closed) return;

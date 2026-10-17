@@ -136,31 +136,94 @@ Samsung. Validar no conjunto real:
 6. Mesmo teste por Wi-Fi com celular desligado.
 7. Retorno ao deep sleep e comparação de consumo.
 
-O protocolo atual transporta PCM/base64 do Live pelo canal BLE. A velocidade
+O caminho legado transporta PCM/base64 do Live pelo canal BLE. A velocidade
 e a latência dependem do rádio, do Android e da rede; não há garantia de
-“resposta instantânea” nem codec Opus nesta versão. O rádio negocia PHY/intervalo
-de sessão ativa e se desconecta ao terminar. O deep sleep desliga a conexão BLE.
+“resposta instantânea”. O link pode ser retido por até 30 s enquanto o aparelho
+já estiver acordado, sem prolongar o prazo de deep sleep. A sessão Gemini continua
+independente por pergunta. O deep sleep desliga a conexão BLE.
 
-### Correcao de repeticao de audio (17/10/2026)
+### Medição de latência e limites de vazão Wi-Fi vs BLE (17/10/2026)
 
-O I2S agora usa `tx_desc_auto_clear`: se faltarem amostras, transmite silencio
-em vez de repetir o conteudo antigo do DMA. Comportamento documentado no
-[driver I2S do ESP-IDF](https://docs.espressif.com/projects/esp-idf/en/v4.4.8/esp32s3/api-reference/peripherals/i2s.html).
-Nao se apaga o DMA inteiro durante a reproducao, preservando a cauda ainda em voo.
+Instrumentação com relógios monotônicos de microssegundos no ESP32 (`[AssistantMetrics]` e `[AssistantMedia]`),
+rotas exclusivas sem fallback (`benchmark-route wifi` e `benchmark-route phone`), janela de 8 créditos com `WRITE_NR`
+e perfis comparativos de mídia (`benchmark-media legacy|pcm|opus64|opus48|opus32`).
 
-O ring de saida usa 2 MiB de PSRAM, cerca de 43,7 s de PCM mono a 24 kHz/16 bits.
-Pelo BLE, espera-se a resposta completa; se ela exceder a reserva, a reproducao
-comeca antes da saturacao para permitir que a rede continue recebendo. Caso
-esvazie, acumula novamente. Respostas longas podem ter pausas entre blocos;
-o limite global continua em 180 s. Pelo Wi-Fi, o prebuffer inicial e de 500 ms.
-Essa politica prioriza fala continua em vez de menor latencia inicial pelo BLE.
+Resultados medidos no conjunto real (ESP32-S3 + Galaxy S26 + Gemini Live):
 
-Validacao fisica: pergunta emitida pelo alto-falante do PC e capturada no ESP32,
-com resposta Gemini Live via celular BLE. Log: `buffered=1`, `audio_rx_ms=1910`,
-`audio_tx_ms=1910`, `rebuffer=0`, sem erro. O usuario confirmou a frase
-"Ola, tudo bem com voce?" fluida, sem repeticoes. Os contadores medem PCM
-recebido/entregue ao codec; nao substituem medicao eletrica do I2S.
+| Perfil / Transporte | Dados TX | Dados RX | Tempo Upload | Tempo Download | Tempo Total do Turno | Início Reprodução I2S | Rebuffers | Estado |
+|---|---|---|---|---|---|---|---|---|
+| **Wi-Fi direto (PCM base64)** | ~152 KB | ~100 KB | ~4,7 s (tempo real) | ~3,8 s (progressivo) | **~8,5 s** | **~1,68 s** após soltura | 0 | OK |
+| **BLE Legado (PCM base64)** | 110,6 KB | 240,0 KB | 28,4 s (~4,0 KB/s) | 48,6 s (~5,2 KB/s) | **78,05 s** | **78,08 s** (acumulado) | 0 | OK |
+| **BLE Mídia v1 `pcm` (PCM binário)** | 87,7 KB | 92,0 KB | 16,4 s (~5,3 KB/s) | 27,5 s (~5,2 KB/s) | **44,01 s** | **44,03 s** (acumulado) | 0 | OK |
+| **BLE Mídia v1 `opus64` (64 kbit/s)** | 25,5 KB | 18,6 KB | 7,2 s (~3,5 KB/s) | 5,1 s (~3,6 KB/s) | **14,82 s** | **12,93 s** (progressivo) | 0 | OK |
+| **BLE Mídia v1 `opus32` (32 kbit/s)** | 14,5 KB | 13,5 KB | 4,8 s (~3,0 KB/s) | 4,1 s (~3,3 KB/s) | **10,55 s** | **8,94 s** (progressivo) | 0 | OK |
+| **BLE Mídia v1 `opus48` (48 kbit/s)** | 19,8 KB | 12,7 KB | 4,7 s (~4,2 KB/s) | 3,1 s (~4,1 KB/s) | **9,33 s** | **8,74 s** (progressivo) | 0 | OK |
 
-As regressoes host incluem entrega atrasada, Wi-Fi progressivo, cancelamento
-enquanto acumula, resposta curta e resposta maior que o ring, com comparacao
-exata das amostras. O teste host nao simula o DMA real.
+**Principais conclusões comprovadas:**
+1. **Meta de latência atingida no perfil `opus48`:** o tempo total do turno caiu de **78,05 s** (BLE legado) para **9,33 s** no BLE com Opus 48 kbit/s, ficando a apenas **0,83 s do Wi-Fi direto** (8,5 s).
+2. **Redução maciça de tráfego:** o volume de dados de upload foi reduzido em **82%** (de 110,6 KB para 19,8 KB) e o de download em **94,7%** (de 240 KB para 12,7 KB).
+3. **Reprodução progressiva fluida:** com o prebuffer de 1,5 s (`kOpusPrebufferBytes = 72000`), a reprodução de voz iniciou sem nenhum rebuffer (`rebuffer = 0`) em todos os ensaios Opus.
+4. **Custo de CPU no ESP32-S3:** o encode a 16 kHz consumiu cerca de 32% de 1 núcleo e o decode a 24 kHz apenas 15% de 1 núcleo, mantendo folga de stack superior a 9,6 KB.
+5. **Necessidade comprovada do codec:** o ensaio com PCM binário descompactado (`pcm`) demonstrou que remover apenas o base64 ainda resulta em 44 s de espera, pois o PCM descompactado demanda 32–48 KB/s contra ~5,3 KB/s de vazão sustentada do GATT BLE. O codec é indispensável para operar dentro da banda do rádio.
+
+### Canal de mídia BLE v1 (experimental)
+
+O Wi-Fi direto continua usando o PCM e o WebSocket existentes. HTTP, sincronização
+Drive e gateway permanecem no relay transparente. Somente a voz BLE opt-in usa um
+canal lógico reservado, aberto como `voice-v1.ideiarec.invalid:443`: esse nome é um
+serviço local explícito, nunca uma consulta DNS nem uma exceção geral à allowlist.
+Companions antigos recusam esse serviço antes do envio da chave ou de áudio.
+
+O companion novo termina a sessão Gemini com TLS verificado e limite de mensagem,
+converte mídia e mantém controle JSON, transcrições, ferramentas e cancelamento.
+A chave permanece em memória durante a sessão e não é salva em logs/configuração.
+É necessário atualizar firmware e APK; não existe troca silenciosa de codec no turno.
+
+| Perfil volátil | Transporte BLE da voz | Uso |
+|---|---|---|
+| `legacy` | WebSocket/JSON/base64 originais | Padrão seguro, sem mudança de qualidade |
+| `pcm` | PCM16 binário, 16 kHz entrada / 24 kHz saída | Referência sem perdas, bitrate negociado zero |
+| `opus64` | Opus mono, 64 kbit/s, frames de 20 ms | Primeiro candidato de qualidade |
+| `opus48` / `opus32` | Opus mono, 48 / 32 kbit/s, frames de 20 ms | Comparações de vazão e escuta |
+
+Cada registro usa cabeçalho de 12 bytes: magic `56 31`, tipo, flags, comprimento
+u32 LE e posição u32 LE em amostras PCM originais. Tipos: HELLO=1, JSON=2, OPUS=3,
+PCM=4, END_INPUT=5, ERROR=6. HELLO confirma versão, perfil, taxas, frame e lookahead.
+OPUS contém `skip:u16 LE`, `take:u16 LE` e pacote raw de até 1276 bytes, sem Ogg.
+A flag 1 reinicializa apenas o decoder no início de um segmento; posições continuam
+globais no turno. O flush/remove-delay é explícito e preserva a cauda original.
+O relay mantém epochs, sequências, ACK por consumo e limites de memória.
+
+Libopus oficial 1.5.2 tem fonte validada por SHA-256; a licença acompanha APK e pacote.
+No ESP32 são usados fixed-point, estados preferencialmente em PSRAM e nenhuma
+alocação no hot path. A task Opus reserva 64 KiB devido ao scratch C99; o watermark
+real é registrado em `AssistantMedia`. O caminho legado/Wi-Fi mantém sua stack.
+
+Opus não é lossless. Os perfis são experimentais e não viram padrão sem comparação
+de escuta com o mesmo PCM e aprovação de qualidade. A taxa nominal não inclui
+enquadramento, ACKs ou VBR; ficar abaixo da vazão média não garante ausência de cortes.
+PCM binário mantém a política acumulada BLE; Opus permite prebuffer progressivo,
+sem retirar o auto-clear do DMA e sem acelerar/descartar amostras para ocultar atrasos.
+
+### Bancada reproduzível
+
+```powershell
+python -m venv tools/.venv-benchmark
+tools/.venv-benchmark/Scripts/python.exe -m pip install -r tools/requirements-benchmark.txt
+pwsh -File tools/create_benchmark_wavs.ps1
+tools/.venv-benchmark/Scripts/python.exe tools/benchmark_voice.py --list-devices
+tools/.venv-benchmark/Scripts/python.exe tools/benchmark_voice.py --wav test/results/voice-benchmark/corpus/short.wav --routes wifi,phone --media opus64 --repeats 3 --input-device 15 --output-device 12
+```
+
+Os índices de áudio acima são exemplos: confirmar o microfone físico e a saída
+cabeada/local. Usar posições/volume constantes. Cada execução cria pasta exclusiva
+com WAV, JSON, CSV e eventos JSONL. O detector correlaciona o estímulo gravado e
+procura a resposta no mesmo eixo de amostras, sem descartar arbitrariamente os
+primeiros 350 ms. Reverberação, estalos, áudio fraco, overflow e ausência de vínculo
+de turno/perfil tornam o ensaio ambíguo/inválido, não uma latência favorável.
+
+`AssistantMetrics` informa estágios monotônicos do ESP32; `AssistantMedia` inclui
+perfil real, bytes de mídia, tempo do codec e watermark de stack. Aceite I2S não é
+som audível. O harness exige `turn` no status/resultado e restaura Auto/ready/legacy.
+Falhas devem aparecer nos resultados e no exit code. Um piloto não substitui as
+20 comparações pareadas, partida fria/quente e escuta cega previstos no plano.

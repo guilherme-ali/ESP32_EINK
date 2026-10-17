@@ -20,7 +20,13 @@ public final class RelayEngine implements AutoCloseable {
         OutputStream output() throws IOException;
         @Override void close();
     }
-    public interface SocketFactory { Duplex create() throws IOException; }
+    public static final String VOICE_HOST = "voice-v1.ideiarec.invalid";
+    @FunctionalInterface
+    public interface SocketFactory {
+        Duplex create() throws IOException;
+        default boolean supportsVoice() { return false; }
+        default Duplex createVoice() throws IOException { throw new IOException("Voz indisponivel"); }
+    }
     public interface BleWriter {
         /** Enfileira imediatamente. Verificar stillValid antes de iniciar a operação GATT. */
         CompletableFuture<Void> send(byte[] frame, BooleanSupplier stillValid);
@@ -67,7 +73,15 @@ public final class RelayEngine implements AutoCloseable {
             try {
                 byte[] p = f.payload();
                 int port = (p[0] & 255) | ((p[1] & 255) << 8);
-                host = policy.validate(HostPolicy.utf8(Arrays.copyOfRange(p, 2, p.length)), port);
+                String literal = HostPolicy.utf8(Arrays.copyOfRange(p, 2, p.length));
+                if (VOICE_HOST.equals(literal)) {
+                    if (port != 443 || !sockets.supportsVoice()) throw new IllegalArgumentException("Voz indisponivel");
+                    host = literal;
+                } else {
+                    host = policy.validate(literal, port);
+                    // Never allow normalization/allowlisting to turn a near match into the reserved host.
+                    if (VOICE_HOST.equals(host)) throw new IllegalArgumentException("Host reservado");
+                }
             } catch (IllegalArgumentException e) {
                 Channel denied = new Channel(f.channel, f.epoch, "", clock.getAsLong());
                 channels[f.channel] = denied;
@@ -109,7 +123,7 @@ public final class RelayEngine implements AutoCloseable {
     private void open(Channel c) {
         Duplex s = null;
         try {
-            s = sockets.create(); // Deve ser não bloqueante; registro anterior a DNS/connect/handshake.
+            s = VOICE_HOST.equals(c.host) ? sockets.createVoice() : sockets.create();
             synchronized (this) {
                 if (c.closed) { s.close(); return; }
                 c.socket = s;
@@ -167,21 +181,34 @@ public final class RelayEngine implements AutoCloseable {
     }
 
     private void writeLoop(Channel c) {
+        final Frame[] batch = new Frame[SendWindow.CAPACITY];
+        final byte[] bytes = new byte[Frame.MAX_PAYLOAD * SendWindow.CAPACITY];
         try {
             OutputStream out = c.socket.output();
             while (true) {
-                Frame f;
+                int count = 0, length = 0;
                 synchronized (this) {
                     if (c.closed) return;
-                    f = c.rx.peek();
-                    if (f == null) { c.writer = false; return; }
+                    if (c.rx.isEmpty()) { c.writer = false; return; }
                     c.writeAt = clock.getAsLong();
+                    for (Frame f : c.rx) {
+                        if (count == batch.length) break;
+                        byte[] payload = f.payload();
+                        System.arraycopy(payload, 0, bytes, length, payload.length);
+                        length += payload.length;
+                        batch[count++] = f;
+                    }
                 }
-                out.write(f.payload()); // ACK só após o consumo efetivo pelo OutputStream TLS.
+                out.write(bytes, 0, length); // Um write TLS; slots continuam contabilizados até sucesso.
                 synchronized (this) {
                     if (c.closed) return;
-                    c.rx.remove(); c.activityAt = clock.getAsLong();
-                    emit(c, Frame.ACK, f.seq, new byte[0], false);
+                    for (int i = 0; i < count; i++) {
+                        Frame consumed = c.rx.poll();
+                        if (consumed != batch[i]) { closeChannel(c, true, true); return; }
+                        c.activityAt = clock.getAsLong();
+                        emit(c, Frame.ACK, consumed.seq, new byte[0], false);
+                        batch[i] = null;
+                    }
                 }
             }
         } catch (IOException | RuntimeException e) { fail(c); }

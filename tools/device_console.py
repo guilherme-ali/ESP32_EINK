@@ -12,7 +12,11 @@ def main():
     parser.add_argument("command", nargs="?", default="status",
                         choices=["listen", "status", "sync", "sync-one", "wifi", "repair-drive", "stayawake 0", "stayawake 1",
                                  "phone-pair", "phone-stop", "assistant-start", "assistant-release", "assistant-cancel",
-                                 "assistant-ptt", "assistant-models", "assistant-enable"])
+                                  "assistant-ptt", "assistant-models", "assistant-enable",
+                                  "benchmark-route auto", "benchmark-route wifi", "benchmark-route phone",
+                                  "benchmark-playback full", "benchmark-playback ready",
+                                  "benchmark-media legacy", "benchmark-media pcm", "benchmark-media opus64",
+                                  "benchmark-media opus48", "benchmark-media opus32"])
     parser.add_argument("--port", default="COM7")
     parser.add_argument("--timeout", type=float, default=30)
     parser.add_argument("--capture-seconds", type=float, default=2.5,

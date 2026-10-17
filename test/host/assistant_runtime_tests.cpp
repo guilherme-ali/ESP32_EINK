@@ -258,12 +258,35 @@ static void longBufferedAudio() {
   CHECK(snap.receivedAudioMs == expected.size() / 48 && snap.playedAudioMs == snap.receivedAudioMs);
   ack(job);
 }
+static void blePlaybackCanStartBeforeSocketTeardown() {
+  ++cases; reset(); phoneRoute = true; playbackWriteLimit = 1024; closeDelayMs = 250;
+  Settings s; AudioCodec codec; AssistantJob job;
+  CHECK(job.start(s, codec, connectCallback)); CHECK(wait([] { return captureReads > 3; })); job.release();
+  CHECK(wait([] { return closingSocket.load(); }));
+  CHECK(wait([] { return writeDuringClose.load(); }));
+  auto snap = finish(job);
+  CHECK(snap.state == AssistantJob::State::Done && snap.telemetry.phoneRoute);
+  CHECK(snap.telemetry.responseReadyUs && snap.telemetry.networkDoneUs > snap.telemetry.responseReadyUs);
+  CHECK(playback == stereoPcm(std::vector<uint8_t>{0x34,0x12,0xfe,0xff,0,0x80,0xff,0x7f}));
+  ack(job);
+}
+static void fullBufferAblationWaitsForSocketTeardown() {
+  ++cases; reset(); phoneRoute = true; earlyPlayback = false; playbackWriteLimit = 1024; closeDelayMs = 250;
+  Settings s; AudioCodec codec; AssistantJob job;
+  CHECK(job.start(s, codec, connectCallback)); CHECK(wait([] { return captureReads > 3; })); job.release();
+  CHECK(wait([] { return closingSocket.load(); }));
+  sleep(80); CHECK(writes == 0);
+  auto snap = finish(job);
+  CHECK(snap.state == AssistantJob::State::Done && playback.size() == 16);
+  CHECK(snap.telemetry.responseReadyUs && snap.telemetry.networkDoneUs > snap.telemetry.responseReadyUs);
+  ack(job);
+}
 int main() {
   // RFC 6455's published accept vector, using real Windows SHA-1.
   const std::string challenge = "dGhlIHNhbXBsZSBub25jZQ==258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
   uint8_t digest[20]; CHECK(!mbedtls_sha1_ret(reinterpret_cast<const unsigned char *>(challenge.data()), challenge.size(), digest));
   CHECK(base64(digest, 20) == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
   preservationAndAudioOnly(); earlyAudio(); configurationAndResources(); failuresAndTimeouts(); toolsAndCancellation(); gatewayRedirectTransport(); timeLimitsAndRedaction();
-  delayedAudioPlayback(); longBufferedAudio();
+  delayedAudioPlayback(); longBufferedAudio(); blePlaybackCanStartBeforeSocketTeardown(); fullBufferAblationWaitsForSocketTeardown();
   std::cout << "Assistant runtime: " << cases << " grupos de cenários / " << checks << " verificações OK\n";
 }

@@ -18,6 +18,7 @@ import android.os.IBinder;
 import android.os.SystemClock;
 import br.com.ideiarec.companion.protocol.HostPolicy;
 import br.com.ideiarec.companion.protocol.RelayEngine;
+import br.com.ideiarec.companion.voice.VoiceDuplex;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -99,9 +100,16 @@ public final class RelayService extends Service {
                 @Override public void connected() { if (owner == RelayService.this) linkConnected = true; }
                 @Override public void ready() {
                     if (stopping.get()) return;
-                    engine = new RelayEngine(new HostPolicy(config.hosts()), new TlsSocketFactory(), transport, io, SystemClock::elapsedRealtime);
-                    config.status("Pronto — GATT seguro; aguardando OPEN do ESP32"); handler.post(tick);
+                    RelayEngine.SocketFactory sockets = new RelayEngine.SocketFactory() {
+                        @Override public RelayEngine.Duplex create() { return new TlsSocketFactory().create(); }
+                        @Override public boolean supportsVoice() { return true; }
+                        @Override public RelayEngine.Duplex createVoice() { return new VoiceDuplex(); }
+                    };
+                    engine = new RelayEngine(new HostPolicy(config.hosts()), sockets, transport, io, SystemClock::elapsedRealtime);
+                    config.status("Pronto — GATT seguro; aguardando OPEN do ESP32; " + transport.linkMetricsText());
+                    handler.post(tick);
                 }
+                @Override public void linkMetrics(String metrics) { config.status(metrics); }
                 @Override public void frame(byte[] value) {
                     try { if (engine != null && !stopping.get()) engine.receive(value); }
                     catch (RuntimeException e) { finish("Protocolo inválido; sessão encerrada"); }

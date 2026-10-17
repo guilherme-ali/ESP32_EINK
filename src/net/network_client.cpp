@@ -68,6 +68,10 @@ int NetworkClient::connect(const char *host, uint16_t port, int32_t timeoutMs) {
   stop();
   if (!host || !*host || !port || timeoutMs <= 0) return 0;
   uint32_t budget = static_cast<uint32_t>(timeoutMs), start = millis();
+  if (NetworkRoute::diagnosticRoute() == DiagnosticRoute::PhoneOnly) {
+    if (!NetworkRoute::phoneSelected() && !NetworkRoute::fallbackToPhone(budget)) return 0;
+    return connectPhone(host, port, left(start, budget));
+  }
   if (NetworkRoute::phoneSelected()) return connectPhone(host, port, budget);
   if (WiFi.status() == WL_CONNECTED) {
     // Reserva tempo para pareamento/open; DNS, TCP e TLS dividem o mesmo prazo.
@@ -77,6 +81,7 @@ int NetworkClient::connect(const char *host, uint16_t port, int32_t timeoutMs) {
   WiFiClientSecure::stop();
   // Somente connect pode trocar rota: ainda não há headers/body de aplicação.
   uint32_t remaining = left(start, budget);
+  if (NetworkRoute::diagnosticRoute() == DiagnosticRoute::WifiOnly) return 0;
   if (!remaining || !NetworkRoute::fallbackToPhone(remaining)) return 0;
   return connectPhone(host, port, left(start, budget));
 }

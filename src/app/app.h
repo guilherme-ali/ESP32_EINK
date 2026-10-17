@@ -15,6 +15,8 @@
 #include "../net/stt.h"
 #include "../net/gdrive.h"
 #include "../sync/sync_job.h"
+#include "../assistant/assistant_job.h"
+#include "../assistant/note_export.h"
 
 // Maquina de estados de toda a UI interativa: tela inicial, gravacao,
 // menus, notas (com detalhe/apagar) e configuracoes. Tudo que roda so
@@ -41,7 +43,7 @@ public:
   // configurar STT/Drive, que nao cabem no teclado de 2 botoes.
   using PortalRequestFn = void (*)();
   void begin(SleepRequestFn onSleepRequested, ConnectRequestFn onConnectRequested,
-             PortalRequestFn onPortalRequested);
+             PortalRequestFn onPortalRequested, ConnectRequestFn onAssistantConnectRequested);
 
   void onButton(BtnId id, BtnAction action);
 
@@ -50,7 +52,8 @@ public:
   void loop();
   void diagnosticCommand(const String &command);
   bool isSyncActive() const { return syncJob_.isActive(); }
-  bool isAudioActive() const { return recording_; }
+  bool isAudioActive() const { return recording_ || assistantJob_.active(); }
+  bool isExportActive() const { return exportJob_.active(); }
 
 private:
   enum class Screen {
@@ -72,6 +75,10 @@ private:
     KeyboardPassword,
     SyncResult,
     SyncBusy,
+    AssistantBusy,
+    AssistantResult,
+    PhonePairing,
+    ExportBusy,
   };
 
   EPaperDisplay &epd_;
@@ -87,6 +94,8 @@ private:
   Rtc &rtc_;
   Shtc3 &shtc3_;
   SyncJob syncJob_;
+  AssistantJob assistantJob_;
+  NoteExportJob exportJob_;
   Menu menu_;
   Keyboard keyboard_;
 
@@ -94,6 +103,11 @@ private:
   SleepRequestFn onSleepRequested_ = nullptr;
   ConnectRequestFn onConnectRequested_ = nullptr;
   PortalRequestFn onPortalRequested_ = nullptr;
+  ConnectRequestFn onAssistantConnectRequested_ = nullptr;
+  uint32_t assistantLastDrawMs_ = 0;
+  AssistantJob::State assistantLastState_ = AssistantJob::State::Idle;
+  uint32_t phonePairingStarted_ = 0;
+  bool phonePairingReady_ = false;
 
   int noteCount_ = 0;
   uint32_t notesDriveGeneration_ = 0;
@@ -172,6 +186,13 @@ private:
   void finishRecording();
   void serviceRecordingSave();
   void playSelected(int index);
+  void startAssistant();
+  void serviceAssistant();
+  void startPhonePairing();
+  void stopPhonePairing();
+  void startNoteExport();
+  void serviceNoteExport();
+  void probeAssistantModels(bool configure);
 
   bool startSync(int index = -1, bool forNote = false, const char *wavPath = nullptr);
   void serviceSync();

@@ -112,6 +112,8 @@ bool AudioCodec::initI2s(uint32_t sampleRate) {
   i2sConfig.dma_buf_count = 8;
   i2sConfig.dma_buf_len = 512;
   i2sConfig.use_apll = true; // APLL da menos erro de clock, ES8311 e sensivel a isso
+  // Rede pode atrasar: underflow deve transmitir silencio, nao repetir o DMA antigo.
+  i2sConfig.tx_desc_auto_clear = true;
 
   if (i2s_driver_install(kPort, &i2sConfig, 0, nullptr) != ESP_OK) return false;
 

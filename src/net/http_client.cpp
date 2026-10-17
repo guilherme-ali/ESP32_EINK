@@ -2,7 +2,7 @@
 
 namespace {
 
-bool readLineUntil(WiFiClientSecure &client, String &line, uint32_t deadline) {
+bool readLineUntil(NetworkClient &client, String &line, uint32_t deadline) {
   line = "";
   bool cr = false;
   while ((int32_t)(deadline - millis()) > 0) {
@@ -21,7 +21,7 @@ bool readLineUntil(WiFiClientSecure &client, String &line, uint32_t deadline) {
   return false;
 }
 
-bool readBytesBounded(WiFiClientSecure &client, size_t count, String &body,
+bool readBytesBounded(NetworkClient &client, size_t count, String &body,
                       size_t maxBody, bool &truncated, uint32_t deadline) {
   size_t remaining = count;
   while (remaining > 0) {
@@ -99,13 +99,18 @@ bool connectionTokens(String value, bool &close, bool &keepAlive) {
 
 } // namespace
 
-bool HttpClient::writeAll(WiFiClientSecure &client, const uint8_t *data, size_t len,
+bool HttpClient::writeAll(NetworkClient &client, const uint8_t *data, size_t len,
                           uint32_t timeoutMs, WriteProgressFn progress, void *context,
                           bool stopOnResponse) {
   size_t sent = 0;
   uint32_t lastProgress = millis();
   while (sent < len) {
     if (stopOnResponse && client.available()) return false;
+    uint32_t elapsed = millis() - lastProgress;
+    if (elapsed >= timeoutMs) return false;
+#if defined(ARDUINO_ARCH_ESP32)
+    client.setWriteTimeoutMs(timeoutMs - elapsed);
+#endif
     size_t wanted = min(len - sent, static_cast<size_t>(4096));
     size_t written = client.write(data + sent, wanted);
     if (written > wanted) return false;
@@ -121,12 +126,12 @@ bool HttpClient::writeAll(WiFiClientSecure &client, const uint8_t *data, size_t 
   return true;
 }
 
-bool HttpClient::writeAll(WiFiClientSecure &client, const String &data,
+bool HttpClient::writeAll(NetworkClient &client, const String &data,
                           uint32_t timeoutMs) {
   return writeAll(client, (const uint8_t *)data.c_str(), data.length(), timeoutMs);
 }
 
-bool HttpClient::writeFileChunk(WiFiClientSecure &client, File &file, size_t offset,
+bool HttpClient::writeFileChunk(NetworkClient &client, File &file, size_t offset,
                                 size_t length, uint32_t timeoutMs,
                                 WriteProgressFn progress, void *context) {
   if (offset > file.size() || length > file.size() - offset || !file.seek(offset)) return false;
@@ -144,7 +149,7 @@ bool HttpClient::writeFileChunk(WiFiClientSecure &client, File &file, size_t off
   return true;
 }
 
-bool HttpClient::readResponse(WiFiClientSecure &client, HttpResponse &out,
+bool HttpClient::readResponse(NetworkClient &client, HttpResponse &out,
                               size_t maxBody, uint32_t timeoutMs) {
   out = HttpResponse();
   out.body.reserve(min(maxBody, (size_t)2048));

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">IdeiaRec Ponte TLS</string>
+    <string name="title">IdeiaRec — ponte TLS</string>
+    <string name="status_format">Associação: %1$s\nAutomático: %2$s\nServiço: %4$s\nÚltimo estado: %3$s</string>
+    <string name="service_active">ativo</string>
+    <string name="service_inactive">inativo (aguardando presença ou início manual)</string>
+    <string name="no_association">nenhuma</string>
+    <string name="enabled">ligado</string>
+    <string name="disabled">desligado</string>
+    <string name="pairing_help">Configure o PIN de 6 dígitos no portal ESP32. Conceda permissões, associe e digite o PIN somente no diálogo Android. A associação CDM e o bond Bluetooth são etapas diferentes.</string>
+    <string name="host_label">Hosts permitidos (domínios exatos, um por linha; apenas TLS 443)</string>
+</resources>

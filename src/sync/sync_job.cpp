@@ -2,7 +2,7 @@
 #include "../audio/wav.h"
 #include "../storage/note_files.h"
 #include <Preferences.h>
-#include <WiFi.h>
+#include "../connectivity/network_route.h"
 #include <esp_heap_caps.h>
 #include <cJSON.h>
 #include <algorithm>
@@ -342,8 +342,8 @@ bool SyncJob::boundary() {
   if (pauseRequested()) {
     work_.paused = true; copy(work_.detail, "pausa apos etapa"); publish(); return false;
   }
-  if (WiFi.status() != WL_CONNECTED) {
-    copy(work_.error, "Wi-Fi desconectado; sincronize novamente para retomar"); return false;
+  if (!NetworkRoute::online() && !NetworkRoute::recover()) {
+    copy(work_.error, "Rede desconectada; sincronize novamente para retomar"); return false;
   }
   return true;
 }
@@ -568,7 +568,7 @@ void SyncJob::run() {
     // Entrega pode estar em 100%; active permanece true ate fim da limpeza.
     SyncTelemetry::setObserver(nullptr); observerOwner_ = nullptr;
     copy(work_.detail, "limpeza final"); publish();
-    if (WiFi.status() == WL_CONNECTED) SttClient::cleanupPending(ctx->cfg);
+    if (NetworkRoute::online()) SttClient::cleanupPending(ctx->cfg);
     drive_.endSession(); SttClient::endSession();
   } // Preferences fecha no mesmo worker antes da entrega final ao main
   context_ = nullptr; ctx->~Context(); free(ctx);

@@ -1,7 +1,7 @@
 #pragma once
 
 #include <Arduino.h>
-#include <WiFiClientSecure.h>
+#include "network_client.h"
 #include <FS.h>
 
 // Resposta HTTP limitada e totalmente consumida. O corpo fica apenas para
@@ -33,7 +33,7 @@ public:
   // Um contexto por destino. O dono decide quando encerrar o lote; qualquer
   // falha de transporte/parser deve chamar stop(), nunca repetir uma mutacao.
   struct Connection {
-    WiFiClientSecure client;
+    NetworkClient client;
     String host;
     uint16_t port = 0;
     bool reusable = false;
@@ -42,19 +42,19 @@ public:
 
   // WiFiClientSecure::write() pode aceitar menos bytes que os pedidos.
   // Estas funções repetem até todo o buffer ser enviado ou o prazo acabar.
-  static bool writeAll(WiFiClientSecure &client, const uint8_t *data, size_t len,
+  static bool writeAll(NetworkClient &client, const uint8_t *data, size_t len,
                        uint32_t timeoutMs = kResponseTimeoutMs,
                        WriteProgressFn progress = nullptr, void *context = nullptr,
                        bool stopOnResponse = false);
-  static bool writeAll(WiFiClientSecure &client, const String &data,
+  static bool writeAll(NetworkClient &client, const String &data,
                        uint32_t timeoutMs = kResponseTimeoutMs);
-  static bool writeFileChunk(WiFiClientSecure &client, File &file, size_t offset,
+  static bool writeFileChunk(NetworkClient &client, File &file, size_t offset,
                               size_t length, uint32_t timeoutMs = kResponseTimeoutMs,
                               WriteProgressFn progress = nullptr, void *context = nullptr);
 
   // Le status, cabecalhos e corpo com prazo absoluto por chamada. Nunca
   // espera indefinidamente por um servidor que ficou conectado sem responder.
-  static bool readResponse(WiFiClientSecure &client, HttpResponse &out,
+  static bool readResponse(NetworkClient &client, HttpResponse &out,
                            size_t maxBody = kMaxResponseBody,
                            uint32_t timeoutMs = kResponseTimeoutMs);
 

@@ -8,11 +8,6 @@
 #include <string.h>
 #include <Preferences.h>
 #include <time.h>
-#if defined(ARDUINO_ARCH_ESP32)
-#include <atomic>
-#include <lwip/dns.h>
-#include <lwip/tcpip.h>
-#endif
 
 // Contratos REST usados nesta implementação:
 // https://ai.google.dev/gemini-api/docs/transcribe
@@ -24,74 +19,18 @@ namespace {
 uint32_t transportDeadline = 0;
 bool cleanupMayConnect = false;
 uint32_t remainingTimeout(uint32_t requested);
-#if defined(ARDUINO_ARCH_ESP32)
-// O callback DNS pode chegar depois do deadline: contexto estático, sem
-// referências à pilha nem credenciais. A raw API roda na thread TCP/IP.
-struct DnsLookup {
-  char host[256] = {};
-  uint32_t address = 0;
-  std::atomic<bool> done{false};
-  bool busy = false; // acessado somente pelo worker serializado
-} dnsLookup;
-void dnsFound(const char *, const ip_addr_t *address, void *arg) {
-  auto &lookup = *static_cast<DnsLookup *>(arg);
-  lookup.address = address && IP_IS_V4(address) ? ip4_addr_get_u32(ip_2_ip4(address)) : 0;
-  lookup.done.store(true, std::memory_order_release);
-}
-void dnsStart(void *arg) {
-  auto &lookup = *static_cast<DnsLookup *>(arg);
-  ip_addr_t address;
-  err_t result = dns_gethostbyname_addrtype(lookup.host, &address, dnsFound, arg, LWIP_DNS_ADDRTYPE_IPV4);
-  if (result == ERR_OK) dnsFound(nullptr, &address, arg);
-  else if (result != ERR_INPROGRESS) dnsFound(nullptr, nullptr, arg);
-}
-bool resolveWithin(const char *host, IPAddress &address, uint32_t timeoutMs) {
-  if (!timeoutMs || strlen(host) >= sizeof(dnsLookup.host)) return false;
-  // Não reutilizar o contexto enquanto um callback antigo ainda o possui.
-  if (dnsLookup.busy && strcmp(host, dnsLookup.host)) return false;
-  if (!dnsLookup.busy) {
-    strlcpy(dnsLookup.host, host, sizeof(dnsLookup.host));
-    dnsLookup.done.store(false, std::memory_order_relaxed);
-    dnsLookup.busy = true;
-    if (tcpip_try_callback(dnsStart, &dnsLookup) != ERR_OK) {
-      dnsLookup.busy = false; return false;
-    }
-  }
-  uint32_t start = millis();
-  while (!dnsLookup.done.load(std::memory_order_acquire)) {
-    if (millis() - start >= timeoutMs) return false;
-    delay(1);
-  }
-  address = dnsLookup.address;
-  dnsLookup.busy = false;
-  return static_cast<uint32_t>(address) != 0;
-}
-#endif
-class SessionSocket : public WiFiClientSecure {
+class SessionSocket : public NetworkClient {
 public:
   bool connectWithin(const char *host, uint16_t port, uint32_t timeoutMs) {
-#if defined(ARDUINO_ARCH_ESP32)
-    // hostByName do core tem espera própria de 15/16 s. DNS assíncrono +
-    // limites separados TCP/TLS impedem somar três timeouts de 15 s.
-    uint32_t start = millis();
-    IPAddress address;
-    if (!resolveWithin(host, address, timeoutMs / 3)) return false;
-    uint32_t elapsed = millis() - start;
-    if (elapsed >= timeoutMs) return false;
-    uint32_t left = remainingTimeout(timeoutMs - elapsed);
-    if (left < 750) return false;
-    _timeout = (left - 250) / 2; // TCP em ms; margem para setup/scheduling
-    sslclient->handshake_timeout = (left - 250) / 2; // TLS em ms, core 2.0.17
-    return WiFiClientSecure::connect(address, port, host, nullptr, nullptr, nullptr);
-#else
-    return WiFiClientSecure::connect(host, port, timeoutMs);
-#endif
+    // NetworkClient conserva DNS assíncrono/contextos duráveis e divide o
+    // prazo entre DNS/TCP/TLS/fallback. BLE selecionado não faz DNS local.
+    return NetworkClient::connect(host, port, remainingTimeout(timeoutMs));
   }
   void limitWrite(uint32_t milliseconds) {
 #if defined(ARDUINO_ARCH_ESP32)
     // Core 2.0.17: setTimeout(seconds) não atualiza o timeout usado pelo
     // loop send_ssl_data. Limitar o contexto também, inclusive em keep-alive.
-    if (sslclient) sslclient->socket_timeout = milliseconds;
+    setWriteTimeoutMs(milliseconds); // em BLE não acessa o contexto mbedTLS
 #else
     (void)milliseconds; // transporte host/mock não possui contexto mbedTLS
 #endif
@@ -124,7 +63,7 @@ private:
   bool previousConnect_;
 };
 }
-WiFiClientSecure &sharedClient() { return socket; }
+NetworkClient &sharedClient() { return socket; }
 void endSession() {
   socket.stop(); socketHost = ""; socketPort = 0;
   reusable = sendingBody = false;
@@ -227,7 +166,7 @@ bool safeJson(const char *s, size_t length) {
   return !inString && depth == 0;
 }
 
-bool lineUntil(WiFiClientSecure &client, String &line, uint32_t deadline) {
+bool lineUntil(NetworkClient &client, String &line, uint32_t deadline) {
   line = "";
   while (static_cast<int32_t>(deadline - millis()) > 0) {
     if (!client.available()) {
@@ -260,7 +199,7 @@ bool number(const String &value, int base, size_t &result) {
   return true;
 }
 
-bool readCount(WiFiClientSecure &client, Response &r, size_t count, uint32_t deadline) {
+bool readCount(NetworkClient &client, Response &r, size_t count, uint32_t deadline) {
   if (count > kMaxBody - r.length) { r.error = bodyLimitError("resposta HTTP"); return false; }
   uint8_t buffer[1024];
   while (count) {
@@ -280,7 +219,7 @@ bool readCount(WiFiClientSecure &client, Response &r, size_t count, uint32_t dea
   return true;
 }
 
-bool readInner(WiFiClientSecure &client, Response &r, uint32_t deadline) {
+bool readInner(NetworkClient &client, Response &r, uint32_t deadline) {
   String line;
   if (!lineUntil(client, line, deadline) ||
       !(line.startsWith("HTTP/1.1 ") || line.startsWith("HTTP/1.0 ")) ||
@@ -462,7 +401,7 @@ String bodyLimitError(const char *subject) {
   return String(subject) + " excede limite de corpo (" + String(kMaxBody / 1024) + " KiB)";
 }
 
-bool write(WiFiClientSecure &client, const uint8_t *data, size_t length, uint32_t timeoutMs) {
+bool write(NetworkClient &client, const uint8_t *data, size_t length, uint32_t timeoutMs) {
   timeoutMs = remainingTimeout(timeoutMs);
   uint32_t start = millis();
   size_t sent = 0;
@@ -475,6 +414,9 @@ bool write(WiFiClientSecure &client, const uint8_t *data, size_t length, uint32_
     // Não provocar outra escrita do SDK depois de uma resposta antecipada.
     if (sendingBody && client.available() > 0) { transferProblem = "resposta antecipada do servidor"; return false; }
     if (&client == &socket) socket.limitWrite(remainingTimeout(timeoutMs - elapsed));
+#if defined(ARDUINO_ARCH_ESP32)
+    else client.setWriteTimeoutMs(remainingTimeout(timeoutMs - elapsed));
+#endif
     size_t got = client.write(data + sent, n);
     if (got > n) return false;
     sent += got;
@@ -488,10 +430,10 @@ bool write(WiFiClientSecure &client, const uint8_t *data, size_t length, uint32_
   }
   return true;
 }
-bool write(WiFiClientSecure &client, const String &value) {
+bool write(NetworkClient &client, const String &value) {
   return write(client, reinterpret_cast<const uint8_t *>(value.c_str()), value.length());
 }
-bool writeFile(WiFiClientSecure &client, File &file, bool encoded) {
+bool writeFile(NetworkClient &client, File &file, bool encoded) {
   if (!file.seek(0)) { transferProblem = "falha ao posicionar WAV"; return false; }
   static const char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   uint8_t raw[4096];
@@ -532,7 +474,7 @@ bool writeFile(WiFiClientSecure &client, File &file, bool encoded) {
   return true;
 }
 
-bool beginRequest(WiFiClientSecure &client, const String &host, uint16_t port,
+bool beginRequest(NetworkClient &client, const String &host, uint16_t port,
                   const char *method, const String &path, const char *key,
                   bool google, const char *contentType, size_t length,
                   const String &extraHeaders, Response &r) {
@@ -581,7 +523,7 @@ bool beginRequest(WiFiClientSecure &client, const String &host, uint16_t port,
   sendingBody = true; sentBody = 0; totalBody = length;
   return true;
 }
-bool readResponse(WiFiClientSecure &client, Response &r, uint32_t timeoutMs) {
+bool readResponse(NetworkClient &client, Response &r, uint32_t timeoutMs) {
   sendingBody = false;
   timeoutMs = remainingTimeout(timeoutMs);
   bool ok = timeoutMs && readInner(client, r, millis() + timeoutMs);
@@ -591,7 +533,7 @@ bool readResponse(WiFiClientSecure &client, Response &r, uint32_t timeoutMs) {
   if (!ok && !r.error.length()) r.error = "resposta HTTP incompleta, inválida ou timeout";
   return ok;
 }
-bool finishRequest(WiFiClientSecure &client, Response &r, bool bodySent, uint32_t timeoutMs) {
+bool finishRequest(NetworkClient &client, Response &r, bool bodySent, uint32_t timeoutMs) {
   // Google pode rejeitar chave/cota antes de terminar de receber o audio.
   // Uma escrita interrompida nao deve descartar esse HTTP 4xx e repetir tudo.
   bool read = readResponse(client, r, bodySent ? timeoutMs : 5000);
@@ -610,7 +552,7 @@ bool requestJson(const String &host, uint16_t port, const char *method,
                  const String &body, Response &r, const String &extraHeaders, uint32_t timeoutMs,
                  SyncTelemetry::Phase afterBody) {
   if (body.length() > kMaxBody) { r.error = bodyLimitError("pedido JSON"); return false; }
-  WiFiClientSecure &client = sharedClient();
+  NetworkClient &client = sharedClient();
   bool ok = beginRequest(client, host, port, method, path, key, google,
                           "application/json", body.length(), extraHeaders, r);
   if (ok) {
@@ -1583,7 +1525,7 @@ public:
     Response finalized;
     // Não reenviar bytes após finalize incerto: primeiro consultar o nome
     // conhecido evita duplicar upload ou usar offsets incorretos.
-    WiFiClientSecure &client = sharedClient();
+    NetworkClient &client = sharedClient();
     String finalizeHeaders = "X-Goog-Upload-Offset: 0\r\nX-Goog-Upload-Command: upload, finalize\r\n";
     bool ok = beginRequest(client, kHost, 443, "POST", path, cfg_.sttApiKey, true,
                             "audio/wav", wav.size(), finalizeHeaders, finalized);
@@ -1797,7 +1739,7 @@ bool infer(const Settings &cfg, ModelState &state, Purpose purpose, const String
     if (inlineAudio) {
       size_t audioLength = 4 * ((wav->size() + 2) / 3);
       size_t length = body.length() + audioLength + suffix.length();
-      WiFiClientSecure &client = sharedClient();
+      NetworkClient &client = sharedClient();
       ok = beginRequest(client, kHost, 443, "POST", path, cfg.sttApiKey, true,
                           "application/json", length, "", r);
       if (ok) {

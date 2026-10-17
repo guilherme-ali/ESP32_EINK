@@ -26,6 +26,22 @@ A pinagem completa está em `src/config/pins.h`.
 
 ## Funcionalidades
 
+### Celular BLE e assistente de voz
+
+- **BOOT curto** continua gravando notas; **BOOT segurado**, na tela inicial,
+  captura uma pergunta para a IA e responde por voz quando soltar.
+- Wi-Fi direto tem prioridade. O aplicativo Android **IdeiaRec** fornece uma
+  ponte TLS por BLE usando a conexão do telefone, sem ativar hotspot.
+- Gateway Google Apps Script permite consultar/editar o vault Obsidian no
+  GitHub e criar eventos/lembretes no Google Agenda, inclusive em Wi-Fi sem celular.
+- **Enviar ao Obsidian**, no detalhe de uma nota, exporta seu Markdown/transcrição
+  já gerado para `00_Inbox/Gravador/`, com commits idempotentes por conteúdo.
+- Pesquisa web opcional com grounding e fontes, em provedor gratuito configurado.
+
+Configuração, limites e validação física: [docs/ASSISTENTE_CELULAR.md](docs/ASSISTENTE_CELULAR.md).
+Aplicativo: `companion-android/`; ferramentas: `gateway/`. As novas funções são
+habilitadas pela configuração; instalação, pareamento e autorizações são iniciais.
+
 - Gravação de voz em WAV PCM 16-bit mono, com taxa configurável entre 8 e 48 kHz, sem compressão
 - Lista de notas na tela com horário e duração, navegável e reproduzível
 - Transcrição automática (Gemini por padrão; qualquer API compatível
@@ -239,6 +255,7 @@ microSD e validacao de captura/compressao, que nao faz parte do teste em flash.
 
 ```powershell
 & "$env:USERPROFILE\.platformio\penv\Scripts\python.exe" "tools/check_project.py" --cppcheck
+& "$env:USERPROFILE\.platformio\penv\Scripts\python.exe" "tools/check_integrations.py" --android
 & "$env:USERPROFILE\.platformio\penv\Scripts\pio.exe" run -e esp32-s3-devkitc-1 -e battery
 ```
 

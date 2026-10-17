@@ -113,7 +113,7 @@ bool compatibleTranscribe(const Settings &cfg, const String &host, uint16_t port
     Response r;
     d.model = model;
     setPhase(SyncTelemetry::Phase::GeminiUpload, "áudio");
-    WiFiClientSecure &client = sharedClient();
+    NetworkClient &client = sharedClient();
     bool ok = beginRequest(client, host, port, "POST", transcriptionPath(path),
                             cfg.sttApiKey, false, contentType.c_str(), length, "", r);
     if (ok) {

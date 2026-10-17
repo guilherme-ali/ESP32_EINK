@@ -1,5 +1,8 @@
 #include "settings.h"
 #include <Preferences.h>
+#if defined(ARDUINO_ARCH_ESP32)
+#include <esp_system.h>
+#endif
 
 namespace {
 Preferences prefs;
@@ -53,6 +56,9 @@ void SettingsStore::load() {
   String model = prefs.getString("sttModel", settings_.sttModel);
   strncpy(settings_.sttModel, model.c_str(), sizeof(settings_.sttModel) - 1);
   prefs.getString("sttApiKey", settings_.sttApiKey, sizeof(settings_.sttApiKey));
+  String trimmedKey(settings_.sttApiKey);
+  trimmedKey.trim();
+  strlcpy(settings_.sttApiKey, trimmedKey.c_str(), sizeof(settings_.sttApiKey));
   String summary = prefs.getString("summaryModel", settings_.summaryModel);
   strlcpy(settings_.summaryModel, summary.c_str(), sizeof(settings_.summaryModel));
   settings_.sttAutoModel = prefs.getBool("aiAuto", true);
@@ -79,6 +85,22 @@ void SettingsStore::load() {
   settings_.speakerVolumeDb = prefs.getFloat("volume", 20.0f);
   settings_.wallpaperChoice = (int8_t)prefs.getChar("wallpaper", -1);
   settings_.showTempHumidity = prefs.getBool("showTempHum", true);
+  settings_.bleFallbackEnabled = prefs.getBool("bleFallback", false);
+  settings_.blePasskey = prefs.getUInt("blePin", 0);
+  if (!prefs.isKey("blePin")) {
+#if defined(ARDUINO_ARCH_ESP32)
+    settings_.blePasskey = 100000 + esp_random() % 900000;
+#else
+    settings_.blePasskey = 100000 + static_cast<uint32_t>(random(0, 900000));
+#endif
+    prefs.putUInt("blePin", settings_.blePasskey);
+  }
+  settings_.assistantEnabled = prefs.getBool("assistOn", false);
+  prefs.getString("assistModel", settings_.assistantModel, sizeof(settings_.assistantModel));
+  prefs.getString("assistUrl", settings_.assistantGatewayUrl, sizeof(settings_.assistantGatewayUrl));
+  prefs.getString("assistToken", settings_.assistantGatewayToken, sizeof(settings_.assistantGatewayToken));
+  String zone = prefs.getString("assistZone", settings_.assistantTimeZone);
+  strlcpy(settings_.assistantTimeZone, zone.c_str(), sizeof(settings_.assistantTimeZone));
 }
 
 bool SettingsStore::saveWifiNetwork(const char *ssid, const char *pass) {
@@ -277,5 +299,61 @@ bool SettingsStore::saveWallpaperChoice(int8_t choice) {
 bool SettingsStore::saveShowTempHumidity(bool enabled) {
   settings_.showTempHumidity = enabled;
   prefs.putBool("showTempHum", enabled);
+  return true;
+}
+
+bool SettingsStore::savePhone(bool enabled, uint32_t passkey) {
+  if (passkey > 999999) return false;
+  const bool oldEnabled = settings_.bleFallbackEnabled;
+  const uint32_t oldPin = settings_.blePasskey;
+  if (!persistBool("bleFallback", enabled) ||
+      prefs.putUInt("blePin", passkey) != sizeof(uint32_t) ||
+      prefs.getUInt("blePin", UINT32_MAX) != passkey) {
+    persistBool("bleFallback", oldEnabled);
+    prefs.putUInt("blePin", oldPin);
+    return false;
+  }
+  settings_.bleFallbackEnabled = enabled;
+  settings_.blePasskey = passkey;
+  return true;
+}
+
+bool SettingsStore::saveAssistant(bool enabled, const char *model, const char *url,
+                                  const char *token, const char *zone) {
+  if (!model || !url || !token || !zone ||
+      strlen(model) >= sizeof(settings_.assistantModel) ||
+      strlen(url) >= sizeof(settings_.assistantGatewayUrl) ||
+      strlen(token) >= sizeof(settings_.assistantGatewayToken) ||
+      !zone[0] || strlen(zone) >= sizeof(settings_.assistantTimeZone)) return false;
+  const char *normalized = !strncmp(model, "models/", 7) ? model + 7 : model;
+  if (model[0] && strcmp(normalized, "gemini-3.8-live") &&
+      strcmp(normalized, "gemini-3.1-flash-live-preview")) return false;
+  if (enabled && !model[0]) return false;
+  for (const char *p = zone; *p; ++p)
+    if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+          (*p >= '0' && *p <= '9') || strchr("/_+-", *p))) return false;
+  if (url[0]) {
+    const String endpoint(url);
+    if (!endpoint.startsWith("https://script.google.com/macros/s/") ||
+        !endpoint.endsWith("/exec") || endpoint.indexOf('?') >= 0 ||
+        endpoint.indexOf('#') >= 0 || endpoint.indexOf('\r') >= 0 || endpoint.indexOf('\n') >= 0 ||
+        strlen(token) < 32) return false;
+  } else if (token[0]) return false;
+  const Settings old = settings_;
+  if (!persistBool("assistOn", enabled) || !persistString("assistModel", model) ||
+      !persistString("assistUrl", url) || !persistString("assistToken", token) ||
+      !persistString("assistZone", zone)) {
+    persistBool("assistOn", old.assistantEnabled);
+    persistString("assistModel", old.assistantModel);
+    persistString("assistUrl", old.assistantGatewayUrl);
+    persistString("assistToken", old.assistantGatewayToken);
+    persistString("assistZone", old.assistantTimeZone);
+    return false;
+  }
+  settings_.assistantEnabled = enabled;
+  strlcpy(settings_.assistantModel, model, sizeof(settings_.assistantModel));
+  strlcpy(settings_.assistantGatewayUrl, url, sizeof(settings_.assistantGatewayUrl));
+  strlcpy(settings_.assistantGatewayToken, token, sizeof(settings_.assistantGatewayToken));
+  strlcpy(settings_.assistantTimeZone, zone, sizeof(settings_.assistantTimeZone));
   return true;
 }

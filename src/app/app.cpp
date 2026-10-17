@@ -5,6 +5,10 @@
 #include <LittleFS.h>
 #include "../storage/note_files.h"
 #include <esp_heap_caps.h>
+#include "../connectivity/network_route.h"
+#include "../connectivity/ble_relay.h"
+#include "../net/gemini_client.h"
+#include "../assistant/live_protocol.h"
 
 // Contrato do widget fornecido pela integracao principal em ui/screens.*.
 namespace Screens {
@@ -55,13 +59,14 @@ constexpr int kScreensaverTimeoutCount = sizeof(kScreensaverTimeouts) / sizeof(k
 
 const char *const kWallpaperNames[] = {"Montanhas", "Topo", "Estrelas", "Ondas", "Pontos"};
 
-enum RootIdx { kRootRecord = 0, kRootNotes, kRootSync, kRootWifi, kRootSettings, kRootAbout, kRootCount };
+enum RootIdx { kRootRecord = 0, kRootNotes, kRootSync, kRootPhone, kRootWifi, kRootSettings, kRootAbout, kRootCount };
 
 enum NoteDetailIdx {
   kNdSummary = 0,
   kNdTranscript,
   kNdPlay,
   kNdSync,
+  kNdObsidian,
   kNdDelete,
   kNdBack,
   kNoteDetailCount
@@ -91,10 +96,11 @@ App::App(EPaperDisplay &epd, Canvas &canvas, NotesStore &notes, SettingsStore &s
       menu_(canvas, epd), keyboard_(canvas, epd) {}
 
 void App::begin(SleepRequestFn onSleepRequested, ConnectRequestFn onConnectRequested,
-                 PortalRequestFn onPortalRequested) {
+                 PortalRequestFn onPortalRequested, ConnectRequestFn onAssistantConnectRequested) {
   onSleepRequested_ = onSleepRequested;
   onConnectRequested_ = onConnectRequested;
   onPortalRequested_ = onPortalRequested;
+  onAssistantConnectRequested_ = onAssistantConnectRequested;
   refreshNotes();
   screen_ = Screen::Home;
   drawHome();
@@ -169,9 +175,9 @@ void App::goWifiMenu() {
 // Liga o radio e conecta sob demanda, se ainda nao estiver conectado.
 // Bloqueante - desenha sua propria tela de espera.
 bool App::ensureOnline() {
-  if (wifiMgr_.isConnected()) return true;
+  if (NetworkRoute::online() && (!settingsStore_.hasDriveApp() || settingsStore_.hasDriveAuth())) return true;
   Screens::drawState(canvas_, epd_, Screens::StateIcon::Wifi, "conectando",
-                      "procurando redes salvas por perto");
+                      "Wi-Fi primeiro; celular BLE como alternativa");
   return onConnectRequested_ ? onConnectRequested_() : false;
 }
 
@@ -180,8 +186,8 @@ bool App::ensureOnline() {
 // que nao vai a lugar nenhum sem Wi-Fi).
 void App::reportNoNetworkAndGoHome() {
   Screens::drawText(canvas_, epd_, "Sincronizar",
-                     "Nenhuma rede salva por perto. Aproxime de uma rede conhecida ou "
-                     "cadastre uma nova no menu Wi-Fi.");
+                     "Sem acesso a internet. Confira o Wi-Fi ou o celular pareado com Bluetooth e dados ativos. "
+                     "A nota continua salva.");
   delay(2500);
   goHome();
 }
@@ -221,6 +227,7 @@ void App::drawRootMenu() {
     strncpy(items[kRootSync].value, "bloq", sizeof(items[kRootSync].value) - 1);
   }
   setItem(items[kRootWifi], "Wi-Fi");
+  setItem(items[kRootPhone], "Parear celular (BLE)");
   setItem(items[kRootSettings], "Configuracoes");
   setItem(items[kRootAbout], "Sobre");
 
@@ -273,6 +280,7 @@ void App::drawNoteDetail() {
   setVal(items[kNdTranscript].value, sizeof(items[kNdTranscript].value), e.hasTxt ? "ok" : "sem");
   setItem(items[kNdPlay], "Reproduzir");
   setItem(items[kNdSync], "Sincronizar esta");
+  setItem(items[kNdObsidian], "Enviar ao Obsidian");
   setVal(items[kNdSync].value, sizeof(items[kNdSync].value), e.hasSnc ? "enviada" : "pendente");
   setItem(items[kNdDelete], "Apagar");
   setItem(items[kNdBack], "Voltar");
@@ -497,12 +505,134 @@ void App::playSelected(int index) {
   codec_.enable(false);
 }
 
+void App::startAssistant() {
+  if (recording_ || isSyncActive() || isExportActive() || assistantJob_.active()) return;
+  free(textViewerBuf_); textViewerBuf_ = nullptr;
+  NetworkRoute::configure(settingsStore_.get());
+  assistantJob_.start(settingsStore_.get(), codec_, onAssistantConnectRequested_);
+  screen_ = Screen::AssistantBusy;
+  assistantLastDrawMs_ = millis() - 2000;
+  assistantLastState_ = AssistantJob::State::Idle;
+  markActivity();
+  serviceAssistant();
+}
+
+void App::serviceAssistant() {
+  AssistantJob::Snapshot view;
+  assistantJob_.snapshot(view);
+  if (view.finished) {
+    String message = view.error[0] ? String(view.error) : String(view.text);
+    if (!message.length()) message = view.detail;
+    if (view.error[0] && view.text[0]) message += "\n\n" + String(view.text);
+    if (!assistantJob_.acknowledgeFinished()) return;
+    Serial.printf("[AssistantDone] state=%d captured_ms=%lu audio_rx_ms=%lu audio_tx_ms=%lu rebuffer=%lu buffered=%d erro=%s texto=%s\n",
+                  static_cast<int>(view.state), static_cast<unsigned long>(view.capturedMs),
+                  static_cast<unsigned long>(view.receivedAudioMs), static_cast<unsigned long>(view.playedAudioMs),
+                  static_cast<unsigned long>(view.rebufferCount), view.bufferedAudio,
+                  view.error, view.text);
+    NetworkRoute::finish();
+    wifiMgr_.disconnect();
+    screen_ = Screen::AssistantResult;
+    Screens::drawText(canvas_, epd_, view.error[0] ? "Assistente: aviso" : "Assistente",
+                      message.c_str(), "Segure BOOT: falar | PWR: sair");
+    markActivity();
+    return;
+  }
+  const uint32_t now = millis();
+  if (view.state != assistantLastState_ || now - assistantLastDrawMs_ >= 2000) {
+    String body = view.detail;
+    body += "\n" + String(view.capturedMs / 1000) + " s | " + NetworkRoute::label();
+    if (view.text[0]) body += "\n\n" + String(view.text);
+    Screens::drawText(canvas_, epd_, "Assistente", body.c_str(),
+                      view.released ? "PWR: cancelar" : "Solte BOOT para responder");
+    assistantLastDrawMs_ = now;
+    assistantLastState_ = view.state;
+  }
+}
+
+void App::startPhonePairing() {
+  if (isSyncActive() || isExportActive() || isAudioActive()) return;
+  Settings &cfg = settingsStore_.get();
+  if (!settingsStore_.savePhone(true, cfg.blePasskey)) {
+    showSyncResult("Falha ao salvar configuracao do celular."); return;
+  }
+  NetworkRoute::configure(cfg);
+  if (!PhoneRelay::begin(cfg.blePasskey)) {
+    showSyncResult("Nao foi possivel iniciar o pareamento BLE."); return;
+  }
+  screen_ = Screen::PhonePairing;
+  phonePairingStarted_ = millis();
+  phonePairingReady_ = false;
+  char message[200];
+  snprintf(message, sizeof(message), "Abra o app IdeiaRec no celular e escolha Parear.\n\nPIN: %06lu\n\nJanela de 2 minutos.",
+           static_cast<unsigned long>(cfg.blePasskey));
+  Screens::drawText(canvas_, epd_, "Parear celular", message, "PWR/BOOT: voltar");
+  markActivity();
+}
+
+void App::stopPhonePairing() { NetworkRoute::finish(); }
+
+void App::probeAssistantModels(bool configure) {
+  if (isSyncActive() || isAudioActive() || isExportActive()) return;
+  const Settings &cfg = settingsStore_.get();
+  if (!cfg.sttApiKey[0] || !cfg.geminiFreeConfirmed) {
+    Serial.println("[Assistant] Configure a chave e confirme o projeto gratuito no portal."); return;
+  }
+  NetworkRoute::configure(cfg);
+  if (!onAssistantConnectRequested_ || !onAssistantConnectRequested_()) {
+    Serial.println("[Assistant] Sem internet para consultar modelos Live."); NetworkRoute::finish(); return;
+  }
+  const char *selected = nullptr;
+  for (const char *candidate : {"gemini-3.8-live", "gemini-3.1-flash-live-preview"}) {
+    SttNet::Response response;
+    const String path = String("/v1beta/models/") + candidate;
+    const bool ok = SttNet::requestJson("generativelanguage.googleapis.com", 443, "GET", path,
+                                       cfg.sttApiKey, true, "", response);
+    SttNet::JsonDocument doc(response);
+    bool live = false;
+    const cJSON *methods = doc.root ? cJSON_GetObjectItemCaseSensitive(doc.root, "supportedGenerationMethods") : nullptr;
+    for (const cJSON *method = methods ? methods->child : nullptr; method; method = method->next)
+      if (cJSON_IsString(method) && method->valuestring && strstr(method->valuestring, "bidiGenerateContent")) live = true;
+    const bool available = ok && response.status == 200 && live;
+    Serial.printf("[AssistantModel] %s HTTP=%d live=%d disponivel=%d\n", candidate, response.status, live, available);
+    if (available && !selected) selected = candidate;
+  }
+  SttNet::endSession();
+  if (configure && selected) {
+    const bool saved = settingsStore_.saveAssistant(true, selected, cfg.assistantGatewayUrl,
+                                                   cfg.assistantGatewayToken, cfg.assistantTimeZone);
+    Serial.printf("[Assistant] modelo=%s configurado=%d\n", selected, saved);
+  } else if (configure) Serial.println("[Assistant] Nenhum candidato Live disponivel; configuracao preservada.");
+  NetworkRoute::finish();
+  markActivity();
+}
+
+void App::startNoteExport() {
+  if (isAudioActive() || isSyncActive() || isExportActive()) return;
+  NoteEntry entry;
+  if (!notes_.getAt(notesSel_, entry)) return;
+  NetworkRoute::configure(settingsStore_.get());
+  exportJob_.start(settingsStore_.get(), entry.path, onAssistantConnectRequested_);
+  screen_ = Screen::ExportBusy;
+  Screens::drawText(canvas_, epd_, "Obsidian", "Exportando a transcricao/Markdown para o GitHub...", "PWR: cancelar");
+  markActivity();
+}
+
+void App::serviceNoteExport() {
+  NoteExportJob::Snapshot view;
+  exportJob_.snapshot(view);
+  if (!view.finished || !exportJob_.acknowledgeFinished()) return;
+  NetworkRoute::finish();
+  wifiMgr_.disconnect();
+  showSyncResult(view.message, true);
+}
+
 // ---------------------------------------------------------------------
 // Transcricao e sincronizacao
 // ---------------------------------------------------------------------
 
 bool App::startSync(int index, bool forNote, const char *wavPath) {
-  if (isSyncActive() || recording_) return false;
+  if (isSyncActive() || isExportActive() || isAudioActive()) return false;
   if (!settingsStore_.hasDriveApp() && !settingsStore_.hasDriveAuth() &&
       !settingsStore_.get().sttEndpoint[0]) {
     showSyncResult("Nenhum servico configurado. Configure STT ou Drive no menu.", forNote);
@@ -520,10 +650,12 @@ bool App::startSync(int index, bool forNote, const char *wavPath) {
   // Conexao/NTP/pareamento continuam no main, antes de capturar a configuracao
   // e escolher pendencias (um novo pareamento pode mudar a geracao do Drive).
   if (!ensureOnline()) {
+    NetworkRoute::finish();
     if (wasOff) wifiMgr_.disconnect();
     reportNoNetworkAndGoHome(); return false;
   }
   if (settingsStore_.hasDriveApp() && !settingsStore_.hasDriveAuth()) {
+    NetworkRoute::finish();
     if (wasOff) wifiMgr_.disconnect();
     showSyncResult("Drive nao autorizado. Conecte novamente e conclua o pareamento.", forNote);
     return false;
@@ -532,6 +664,7 @@ bool App::startSync(int index, bool forNote, const char *wavPath) {
   free(textViewerBuf_); textViewerBuf_ = nullptr;
   SyncJob::StartResult result = syncJob_.start(notes_, index, wavPath);
   if (result != SyncJob::StartResult::Started) {
+    NetworkRoute::finish();
     if (wasOff) wifiMgr_.disconnect();
     const char *message = "Nao foi possivel criar o worker de sincronizacao.";
     if (result == SyncJob::StartResult::NothingPending) message = "Nenhuma nota pendente. Arquivos locais ja sincronizados.";
@@ -556,6 +689,7 @@ void App::serviceSync() {
   if (snapshot.finished) {
     if (!syncJob_.acknowledgeFinished()) return;
     notes_.markDirty(); // exclusivamente main, apos worker fechar FS/TLS/NVS
+    NetworkRoute::finish();
     if (syncDisconnectAfter_) wifiMgr_.disconnect();
     syncDisconnectAfter_ = false;
     String report = "IA:" + String(snapshot.ai) + " | Drive:" + String(snapshot.uploaded) +
@@ -650,12 +784,36 @@ void App::deleteAllNotes() {
 // ---------------------------------------------------------------------
 
 void App::onButton(BtnId id, BtnAction action) {
+  // A soltura longa só pertence ao PTT. Não deve virar uma segunda ação nas
+  // telas que já tratam pressão longa (descartar gravação, voltar, cancelar).
+  if (action == BtnAction::LongPressRelease) {
+    if (id == BtnId::Boot && assistantJob_.active()) assistantJob_.release();
+    return;
+  }
   markActivity();
+  if (exportJob_.active()) {
+    if (id == BtnId::Pwr) exportJob_.cancel();
+    return;
+  }
+  if (assistantJob_.active()) {
+    if (id == BtnId::Pwr) assistantJob_.cancel();
+    return;
+  }
   if (isSyncActive()) {
     if (id == BtnId::Pwr && action == BtnAction::LongPress) syncJob_.requestPause();
     return;
   }
   switch (screen_) {
+    case Screen::AssistantBusy: break;
+    case Screen::ExportBusy: break;
+    case Screen::AssistantResult:
+      if (id == BtnId::Boot && action == BtnAction::LongPress) startAssistant();
+      else goHome();
+      break;
+    case Screen::PhonePairing:
+      stopPhonePairing();
+      goRootMenu();
+      break;
     case Screen::Saving: break;
     case Screen::SyncBusy: break;
     case Screen::SyncResult:
@@ -682,6 +840,8 @@ void App::onButton(BtnId id, BtnAction action) {
 void App::onButtonHome(BtnId id, BtnAction action) {
   if (id == BtnId::Boot && action == BtnAction::ShortClick) {
     startRecording();
+  } else if (id == BtnId::Boot && action == BtnAction::LongPress) {
+    startAssistant();
   } else if (id == BtnId::Pwr) {
     if (action == BtnAction::ShortClick) {
       goRootMenu();
@@ -724,6 +884,9 @@ void App::onButtonRootMenu(BtnId id, BtnAction action) {
       break;
     case kRootWifi:
       goWifiMenu();
+      break;
+    case kRootPhone:
+      startPhonePairing();
       break;
     case kRootSettings:
       goSettings();
@@ -813,6 +976,9 @@ void App::onButtonNoteDetail(BtnId id, BtnAction action) {
       break;
     case kNdSync:
       syncOneNote(notesSel_);
+      break;
+    case kNdObsidian:
+      startNoteExport();
       break;
     case kNdDelete: {
       NoteEntry e;
@@ -1085,6 +1251,18 @@ void App::onButtonKeyboardPassword(BtnId id, BtnAction action) {
 // ---------------------------------------------------------------------
 
 void App::loop() {
+  if (exportJob_.active() || screen_ == Screen::ExportBusy) { serviceNoteExport(); return; }
+  if (assistantJob_.active() || screen_ == Screen::AssistantBusy) { serviceAssistant(); return; }
+  if (screen_ == Screen::PhonePairing) {
+    const bool ready = PhoneRelay::ready();
+    if (ready && !phonePairingReady_) {
+      phonePairingReady_ = true;
+      Screens::drawText(canvas_, epd_, "Celular conectado", "Pareamento pronto. O app pode trabalhar em segundo plano."
+                        "\n\nAperte um botao para voltar.", "PWR/BOOT: voltar");
+    }
+    if (millis() - phonePairingStarted_ >= 120000) { stopPhonePairing(); goHome(); }
+    return;
+  }
   if (isSyncActive()) { serviceSync(); return; }
   if (screen_ == Screen::Saving) { serviceRecordingSave(); return; }
   if (screen_ == Screen::Recording) {
@@ -1120,6 +1298,25 @@ void App::loop() {
 void App::diagnosticCommand(const String &command) {
   DiagnosticDone done{command};
   markActivity();
+  if (exportJob_.active()) {
+    Serial.println("[Diag] exportacao ao Obsidian em andamento"); return;
+  }
+  if (command == "assistant-models" || command == "assistant-enable") {
+    probeAssistantModels(command == "assistant-enable"); return;
+  }
+  if (command == "phone-pair" && !isSyncActive() && !isAudioActive()) { startPhonePairing(); return; }
+  if (command == "phone-stop" && screen_ == Screen::PhonePairing) { stopPhonePairing(); goHome(); return; }
+  if (command == "assistant-start" && !isSyncActive() && !isAudioActive()) { startAssistant(); return; }
+  if (command == "assistant-release") { assistantJob_.release(); return; }
+  if (command == "assistant-cancel") { assistantJob_.cancel(); return; }
+  if (assistantJob_.active()) {
+    AssistantJob::Snapshot snapshot;
+    assistantJob_.snapshot(snapshot);
+    Serial.printf("[Assistant] state=%d captured_ms=%lu released=%d finished=%d route=%s\n",
+                  static_cast<int>(snapshot.state), static_cast<unsigned long>(snapshot.capturedMs),
+                  snapshot.released, snapshot.finished, NetworkRoute::label());
+    return;
+  }
   if (recording_) {
     Serial.printf("[Record] busy=1 saving=%d bytes=%lu checkpoint=%lu overflow=%lu full=%d failed=%d\n",
                   screen_ == Screen::Saving, (unsigned long)recorder_.bytesWritten(),
@@ -1157,6 +1354,14 @@ void App::diagnosticCommand(const String &command) {
     Serial.printf("[Status] IA auto=%d gratuito_confirmado=%d STT=%s MD=%s Drive_config=%d autorizado=%d\n",
                   cfg.sttAutoModel, cfg.geminiFreeConfirmed, cfg.sttModel, cfg.summaryModel,
                   settingsStore_.hasDriveApp(), settingsStore_.hasDriveAuth());
+    Serial.printf("[Status] rota=%s BLE_config=%d BLE_ativo=%d BLE_pronto=%d assistente=%d live=%s gateway=%d heap=%u\n",
+                  NetworkRoute::label(), cfg.bleFallbackEnabled, PhoneRelay::active(), PhoneRelay::ready(),
+                  cfg.assistantEnabled, cfg.assistantModel, cfg.assistantGatewayUrl[0] != '\0', ESP.getFreeHeap());
+    Serial.printf("[Status] BLE_erro=%s\n", PhoneRelay::lastError());
+    const PhoneRelay::Diagnostics ble = PhoneRelay::diagnostics();
+    Serial.printf("[BLE] ligado=%d autenticado=%d subscribed=%d mtu=%u security_rc=%d bond_rc=%d disconnect_reason=%d auth_flags=%d pin_requests=%lu\n",
+                  ble.linked, ble.authenticated, ble.subscribed, ble.mtu, ble.securityResult, ble.bondResult,
+                  ble.disconnectReason, ble.authenticationFlags, static_cast<unsigned long>(ble.passkeyRequests));
     for (int i = 0; i < notes_.count(); ++i) {
       NoteEntry note; if (!notes_.getAt(i, note)) continue;
       NoteSyncState state; GDriveClient::getNoteSyncState(note.path, state);
@@ -1186,6 +1391,7 @@ void App::diagnosticCommand(const String &command) {
       Serial.println("[Diag] Falha ao invalidar autorizacao do Drive"); return;
     }
     notes_.markDirty();
+    NetworkRoute::finish();
     wifiMgr_.disconnect();
     bool connected = ensureOnline();
     markActivity();

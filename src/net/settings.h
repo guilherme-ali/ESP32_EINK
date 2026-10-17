@@ -39,6 +39,14 @@ struct Settings {
   float micGainDb = 24.0f; // 0-42dB, ver es8311_mic_gain_t
   float speakerVolumeDb = 20.0f;
 
+  bool bleFallbackEnabled = false;
+  uint32_t blePasskey = 0; // gerado uma vez no NVS; exibido como seis digitos
+  bool assistantEnabled = false;
+  char assistantModel[96] = ""; // modelo Live gratuito explicitamente configurado
+  char assistantGatewayUrl[256] = "";
+  char assistantGatewayToken[129] = "";
+  char assistantTimeZone[64] = "America/Sao_Paulo";
+
   int8_t wallpaperChoice = -1;   // -1 = sorteia a cada vez que dorme; N = fixo
   bool showTempHumidity = true;
 };
@@ -65,6 +73,9 @@ public:
   bool saveAutoSync(bool enabled);
   bool saveWallpaperChoice(int8_t choice);
   bool saveShowTempHumidity(bool enabled);
+  bool savePhone(bool enabled, uint32_t passkey);
+  bool saveAssistant(bool enabled, const char *model, const char *gatewayUrl,
+                     const char *gatewayToken, const char *timeZone);
   bool hasWifi() const { return settings_.wifiNetworkCount > 0; }
   bool hasDriveApp() const { return settings_.driveClientId[0] != '\0'; }
   bool hasDriveAuth() const { return settings_.driveRefreshToken[0] != '\0'; }

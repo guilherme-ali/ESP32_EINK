@@ -11,6 +11,7 @@ enum class BtnAction : uint8_t {
   None,
   ShortClick,
   LongPress,
+  LongPressRelease,
 };
 
 using ButtonEventFn = void (*)(BtnId id, BtnAction action);

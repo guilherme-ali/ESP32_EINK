@@ -34,8 +34,18 @@ SHA256 = {
 }
 
 
+def rel(path: str | Path) -> str:
+    try:
+        return str(Path(path).resolve().relative_to(ROOT))
+    except Exception:
+        return str(path)
+
+
 def run(command: list[str], *, timeout: int = 120) -> None:
-    result = subprocess.run(command, cwd=ROOT, capture_output=True, timeout=timeout)
+    rendered = [rel(c) if str(ROOT) in str(c) and not str(c).startswith("-")
+                else (f"-I{rel(c[2:])}" if str(c).startswith("-I") and str(ROOT) in str(c) else str(c))
+                for c in command]
+    result = subprocess.run(rendered, cwd=ROOT, capture_output=True, timeout=timeout)
     for data in (result.stdout, result.stderr):
         try:
             text = data.decode("utf-8")

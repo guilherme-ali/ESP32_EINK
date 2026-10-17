@@ -2,7 +2,7 @@
 
 #include <Arduino.h>
 #include <FS.h>
-#include <WiFiClientSecure.h>
+#include "network_client.h"
 #include <cJSON.h>
 #include <initializer_list>
 #include "settings.h"
@@ -62,20 +62,20 @@ bool safeModel(const String &model);
 String normalizedModel(const char *value);
 bool safeHeader(const char *value);
 String bodyLimitError(const char *subject);
-WiFiClientSecure &sharedClient(); // um socket, chamadas serializadas por host/porta
+NetworkClient &sharedClient(); // um socket, chamadas serializadas por host/porta
 void endSession();
 void setPhase(SyncTelemetry::Phase phase, const char *detail = "");
-bool beginRequest(WiFiClientSecure &client, const String &host, uint16_t port,
+bool beginRequest(NetworkClient &client, const String &host, uint16_t port,
                   const char *method, const String &path, const char *key,
                   bool google, const char *contentType, size_t length,
                   const String &extraHeaders, Response &response);
-bool write(WiFiClientSecure &client, const uint8_t *data, size_t length,
+bool write(NetworkClient &client, const uint8_t *data, size_t length,
            uint32_t timeoutMs = 60000);
-bool write(WiFiClientSecure &client, const String &value);
-bool writeFile(WiFiClientSecure &client, File &file, bool base64 = false);
-bool readResponse(WiFiClientSecure &client, Response &response,
+bool write(NetworkClient &client, const String &value);
+bool writeFile(NetworkClient &client, File &file, bool base64 = false);
+bool readResponse(NetworkClient &client, Response &response,
                    uint32_t timeoutMs = kReadTimeoutMs);
-bool finishRequest(WiFiClientSecure &client, Response &response, bool bodySent,
+bool finishRequest(NetworkClient &client, Response &response, bool bodySent,
                    uint32_t timeoutMs = kReadTimeoutMs);
 bool requestJson(const String &host, uint16_t port, const char *method,
                  const String &path, const char *key, bool google,

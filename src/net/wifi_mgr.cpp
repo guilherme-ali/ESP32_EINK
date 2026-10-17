@@ -4,6 +4,12 @@
 #include <Preferences.h>
 
 namespace {
+String htmlValue(const char *text) {
+  String value(text);
+  value.replace("&", "&amp;"); value.replace("'", "&#39;");
+  value.replace("\"", "&quot;"); value.replace("<", "&lt;"); value.replace(">", "&gt;");
+  return value;
+}
 void rememberLink(const char *ssid) {
   const uint8_t *bssid = WiFi.BSSID();
   if (!bssid) return;
@@ -21,7 +27,18 @@ void rememberLink(const char *ssid) {
 bool WifiManager::connect(SettingsStore &settings, uint32_t timeoutMs) {
   settings_ = &settings;
   const Settings &cfg = settings.get();
-  if (cfg.wifiNetworkCount == 0) return false;
+  if (WiFi.status() == WL_CONNECTED) {
+    mode_ = Mode::Station; startServerOnce(); return true;
+  }
+  if (cfg.wifiNetworkCount == 0 || !timeoutMs) return false;
+  // Um orçamento TOTAL, incluindo cache, scan e todas as redes candidatas.
+  // scanNetworks é síncrono no SDK: max_ms_per_chan reduz seu custo, mas não
+  // garante retorno no deadline. Não iniciar novas tentativas se ele expirou.
+  const uint32_t connectionStarted = millis();
+  auto remaining = [&]() -> uint32_t {
+    uint32_t elapsed = millis() - connectionStarted;
+    return elapsed >= timeoutMs ? 0 : timeoutMs - elapsed;
+  };
 
   WiFi.mode(WIFI_STA);
   // Tenta favorita/ultima rede diretamente. O scan completo e o fallback,
@@ -34,7 +51,7 @@ bool WifiManager::connect(SettingsStore &settings, uint32_t timeoutMs) {
     lastChannel = prefs.getUInt("channel", 0); prefs.end();
   }
   const char *preferred = cfg.favoriteWifiSsid[0] ? cfg.favoriteWifiSsid : lastSsid.c_str();
-  for (int i = 0; preferred[0] && i < cfg.wifiNetworkCount; ++i) {
+  for (int i = 0; preferred[0] && i < cfg.wifiNetworkCount && remaining(); ++i) {
     if (strcmp(cfg.wifiSsid[i], preferred)) continue;
     uint8_t bssid[6]; bool pinned = lastSsid == preferred && lastBssid.length() == 12 && lastChannel >= 1 && lastChannel <= 14;
     if (pinned) {
@@ -46,8 +63,11 @@ bool WifiManager::connect(SettingsStore &settings, uint32_t timeoutMs) {
     }
     Serial.printf("[Wi-Fi] Tentativa direta: '%s'%s\n", preferred, pinned ? " (canal/BSSID em cache)" : "");
     WiFi.begin(cfg.wifiSsid[i], cfg.wifiPass[i], pinned ? lastChannel : 0, pinned ? bssid : nullptr);
-    uint32_t started = millis(), directTimeout = min(timeoutMs, static_cast<uint32_t>(6000));
-    while (WiFi.status() != WL_CONNECTED && millis() - started < directTimeout) delay(100);
+    // Reserva orçamento para scan e as outras redes, inclusive com favorita.
+    uint32_t started = millis();
+    uint32_t directTimeout = min(remaining() / (cfg.wifiNetworkCount + 1), uint32_t(6000));
+    while (WiFi.status() != WL_CONNECTED && millis() - started < directTimeout && remaining())
+      delay(min(uint32_t(50), min(remaining(), uint32_t(directTimeout - (millis() - started)))));
     if (WiFi.status() == WL_CONNECTED) {
       mode_ = Mode::Station; rememberLink(cfg.wifiSsid[i]); startServerOnce();
       Serial.printf("[Wi-Fi] Conexao direta pronta: %s\n", WiFi.localIP().toString().c_str());
@@ -55,7 +75,8 @@ bool WifiManager::connect(SettingsStore &settings, uint32_t timeoutMs) {
     }
     WiFi.disconnect(false); break;
   }
-  int found = WiFi.scanNetworks();
+  if (!remaining()) return false;
+  int found = WiFi.scanNetworks(false, false, false, 100);
 
   // Encontra todas as redes salvas visiveis e seus melhores sinais.
   struct VisibleSaved {
@@ -85,7 +106,7 @@ bool WifiManager::connect(SettingsStore &settings, uint32_t timeoutMs) {
 
   if (candidateCount == 0) {
     Serial.println("[Wi-Fi] Nenhuma rede salva por perto.");
-    WiFi.mode(WIFI_OFF);
+    // Não desligar a interface global: pode haver sockets de outro cliente.
     mode_ = Mode::Off;
     return false;
   }
@@ -109,7 +130,7 @@ bool WifiManager::connect(SettingsStore &settings, uint32_t timeoutMs) {
   }
 
   // Tenta cada rede visivel em ordem de preferencia.
-  for (int c = 0; c < candidateCount; c++) {
+  for (int c = 0; c < candidateCount && remaining(); c++) {
     int idx = candidates[c].configIdx;
     Serial.printf("[Wi-Fi] Conectando a '%s'%s (RSSI %d)...\n",
                   cfg.wifiSsid[idx], candidates[c].isFavorite ? " (favorita)" : "",
@@ -119,8 +140,9 @@ bool WifiManager::connect(SettingsStore &settings, uint32_t timeoutMs) {
     WiFi.begin(cfg.wifiSsid[idx], cfg.wifiPass[idx]);
 
     uint32_t start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
-      delay(250);
+    uint32_t attemptBudget = remaining() / static_cast<uint32_t>(candidateCount - c);
+    while (WiFi.status() != WL_CONNECTED && millis() - start < attemptBudget && remaining()) {
+      delay(min(uint32_t(50), min(remaining(), uint32_t(attemptBudget - (millis() - start)))));
     }
 
     if (WiFi.status() == WL_CONNECTED) {
@@ -135,7 +157,7 @@ bool WifiManager::connect(SettingsStore &settings, uint32_t timeoutMs) {
   }
 
   Serial.println("[Wi-Fi] Nenhuma rede conectou.");
-  WiFi.mode(WIFI_OFF);
+  WiFi.disconnect(false); // STA permanece ligada; nenhuma mudança global de rádio
   mode_ = Mode::Off;
   return false;
 }
@@ -291,7 +313,29 @@ void WifiManager::handleRoot() {
               "<input name='drive_secret' type='password'>"
               "<label><input style='width:auto' type='checkbox' name='drive_repair' value='1'> Refazer autorizacao do Drive ao conectar</label>");
 
-  html += F("<button type='submit'>Salvar</button></form></body></html>");
+  html += F("<input type='hidden' name='connectivity_form' value='1'><h3>Celular por Bluetooth LE</h3>"
+            "<label><input style='width:auto' type='checkbox' name='ble_fallback' value='1'");
+  if (cfg.bleFallbackEnabled) html += F(" checked");
+  html += F("> Usar celular como alternativa ao Wi-Fi</label>"
+            "<p>Instale o app Android IdeiaRec e use Menu &gt; Parear celular no dispositivo.</p>"
+            "<label>PIN de pareamento (6 digitos; vazio mantem)</label>"
+            "<input name='ble_pin' inputmode='numeric' minlength='6' maxlength='6' type='password'>"
+            "<h3>Assistente por voz</h3><label><input style='width:auto' type='checkbox' name='assistant_on' value='1'");
+  if (cfg.assistantEnabled) html += F(" checked");
+  html += F("> Habilitar BOOT segurado para falar</label><label>Modelo Live gratuito</label>"
+            "<input name='assistant_model' placeholder='gemini-3.1-flash-live-preview' value='");
+  html += htmlValue(cfg.assistantModel);
+  html += F("'><p>Permitidos: gemini-3.1-flash-live-preview e gemini-3.8-live. "
+            "Usa a chave STT e a confirmacao de projeto gratuito acima. Sem fallback pago.</p>"
+            "<label>Gateway Apps Script (/exec, opcional)</label><input name='assistant_gateway' value='");
+  html += htmlValue(cfg.assistantGatewayUrl);
+  html += F("'><label>Token do gateway (32-128 caracteres; vazio mantem)</label>"
+            "<input name='assistant_token' type='password'><label>Fuso IANA</label>"
+            "<input name='assistant_zone' value='");
+  html += htmlValue(cfg.assistantTimeZone);
+  html += F("'><p>Gateway habilita consulta/edicao de Markdown no GitHub e Google Agenda. "
+            "O app Android nao precisa estar perto quando houver Wi-Fi.</p>"
+            "<button type='submit'>Salvar</button></form></body></html>");
 
   server_.send(200, "text/html", html);
 }
@@ -327,6 +371,23 @@ void WifiManager::handleSave() {
   ok = settings_->saveDriveApp(driveId.c_str(),
                             driveSecret.length() > 0 ? driveSecret.c_str() : cfg.driveClientSecret) && ok;
   if (server_.hasArg("drive_repair")) ok = settings_->saveDriveRefreshToken("") && ok;
+  if (server_.hasArg("connectivity_form")) {
+    String pin = server_.arg("ble_pin");
+    uint32_t number = cfg.blePasskey;
+    if (pin.length()) {
+      if (pin.length() != 6) { server_.send(400, "text/plain", "PIN precisa ter 6 digitos."); return; }
+      for (size_t i = 0; i < pin.length(); ++i)
+        if (pin[i] < '0' || pin[i] > '9') { server_.send(400, "text/plain", "PIN invalido."); return; }
+      number = static_cast<uint32_t>(pin.toInt());
+    }
+    ok = settings_->savePhone(server_.hasArg("ble_fallback"), number) && ok;
+    const String gateway = server_.arg("assistant_gateway");
+    String token = server_.arg("assistant_token");
+    if (!gateway.length()) token = "";
+    else if (!token.length()) token = cfg.assistantGatewayToken;
+    ok = settings_->saveAssistant(server_.hasArg("assistant_on"), server_.arg("assistant_model").c_str(),
+                                  gateway.c_str(), token.c_str(), server_.arg("assistant_zone").c_str()) && ok;
+  }
   if (!ok) { server_.send(400, "text/plain", "Configuracao invalida ou nao foi possivel salvar."); return; }
 
   server_.send(200, "text/html",

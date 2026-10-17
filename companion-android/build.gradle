@@ -1,0 +1,8 @@
+plugins {
+    id 'com.android.application' version '8.13.2' apply false
+}
+def externalBuild = providers.gradleProperty('externalBuildDir').getOrElse(
+        new File(System.getProperty('java.io.tmpdir'), 'opencode/ideiarec-android-build').absolutePath)
+allprojects {
+    layout.buildDirectory = new File(externalBuild, project == rootProject ? 'root' : project.name)
+}

@@ -4,6 +4,8 @@
 #include <esp_sleep.h>
 #include <esp_heap_caps.h>
 #include <esp_system.h>
+#include <sys/time.h>
+#include <time.h>
 
 #include "config/pins.h"
 #include "board/power.h"
@@ -24,6 +26,7 @@
 #include "net/stt.h"
 #include "net/gdrive.h"
 #include "app/app.h"
+#include "connectivity/network_route.h"
 
 static BoardPower power(PIN_EPD_PWR, PIN_AUDIO_PWR, PIN_VBAT_PWR);
 static Rtc rtc;
@@ -143,7 +146,7 @@ static void drawDrivePairingScreen(const char *userCode, const char *verificatio
 // mas ainda nao autorizou (sem refresh_token salvo) - mostra o codigo
 // de pareamento e espera o usuario aprovar em outro aparelho.
 static void runDrivePairingIfNeeded() {
-  if (!wifiMgr.isConnected()) return;
+  if (!NetworkRoute::online()) return;
   if (!settingsStore.hasDriveApp() || settingsStore.hasDriveAuth()) return;
 
   g_cancelDrivePairing = false;
@@ -167,12 +170,18 @@ static void runDrivePairingIfNeeded() {
 // perto. Aproveita a conexao pra tambem acertar o relogio via NTP e
 // checar o pareamento do Drive, do jeito que era feito so no boot antes.
 static bool onConnectRequested() {
-  bool ok = wifiMgr.connect(settingsStore);
+  NetworkRoute::configure(settingsStore.get());
+  bool ok = NetworkRoute::connect(wifiMgr, settingsStore);
   if (ok) {
-    syncRtcFromNtp();
+    if (wifiMgr.isConnected()) syncRtcFromNtp();
     runDrivePairingIfNeeded();
   }
   return ok;
+}
+
+// Callback do worker: não manipula tela/botões nem inicia OAuth interativo.
+static bool onAssistantConnectRequested() {
+  return NetworkRoute::connect(wifiMgr, settingsStore, 15000);
 }
 
 // Callback que o App chama a partir do menu Wi-Fi ("Portal") pra
@@ -254,6 +263,8 @@ static void holdPowerRailsAndSleep() {
 // acordar: os botoes (ext1) - sem wake por timer, o aparelho so liga
 // quando voce mexe nele.
 static void enterScreensaver() {
+  NetworkRoute::finish();
+  wifiMgr.disconnect();
   Serial.println("Entrando em modo de descanso (deep sleep)...");
 
   if (rtcWallpaperIndex < 0) {
@@ -287,8 +298,8 @@ void setup() {
   gpio_deep_sleep_hold_dis();
 
   Serial.begin(115200);
-  // Alocacoes grandes de Strings/cJSON usam PSRAM, liberando heap para TLS.
-  if (psramFound()) heap_caps_malloc_extmem_enable(8192);
+  // Alocacoes de Strings/cJSON/mbedTLS >= 512B usam PSRAM, preservando SRAM DMA para esp-sha/I2S/BLE.
+  if (psramFound()) heap_caps_malloc_extmem_enable(512);
   delay(2000);
   Serial.println("=================================");
   Serial.printf("[Boot] reset_reason=%d wakeup=%d\n", (int)esp_reset_reason(), (int)esp_sleep_get_wakeup_cause());
@@ -321,17 +332,34 @@ void setup() {
   buttons.begin(PIN_BTN_BOOT, PIN_BTN_PWR, onButtonEvent);
 
   settingsStore.begin();
+  NetworkRoute::configure(settingsStore.get());
+  // O relógio de sistema também precisa existir quando só houver internet BLE.
+  // O PCF85063 usa UTC-3 neste firmware; a conversão não muda TZ global.
+  RtcDateTime bootTime;
+  if (rtc.getDateTime(bootTime) && bootTime.year >= 2024) {
+    struct tm value = {};
+    value.tm_year = bootTime.year - 1900; value.tm_mon = bootTime.month - 1;
+    value.tm_mday = bootTime.day; value.tm_hour = bootTime.hour;
+    value.tm_min = bootTime.minute; value.tm_sec = bootTime.second;
+    setenv("TZ", "BRT3", 1);
+    tzset();
+    const time_t epoch = mktime(&value);
+    if (epoch > 0) {
+      struct timeval tv = {epoch, 0};
+      settimeofday(&tv, nullptr);
+    }
+  }
   runWifiSetup();
   runDrivePairingIfNeeded();
   buttons.setCallback(onButtonEvent);
 
-  app.begin(enterScreensaver, onConnectRequested, onPortalRequested);
+  app.begin(enterScreensaver, onConnectRequested, onPortalRequested, onAssistantConnectRequested);
   Serial.printf("%d nota(s) encontradas. Pronto.\n", notes.count());
 }
 
 void loop() {
   buttons.poll();
-  if (!app.isSyncActive() && !app.isAudioActive()) wifiMgr.loop();
+  if (!app.isSyncActive() && !app.isAudioActive() && !app.isExportActive()) wifiMgr.loop();
   serviceNtpRtc();
   app.loop();
 #if ARDUINO_USB_CDC_ON_BOOT

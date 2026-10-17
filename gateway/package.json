@@ -1,0 +1,12 @@
+{
+  "name": "esp32-assistant-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Gateway Apps Script com núcleo testável, sem dependências de execução.",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node --test test/*.test.cjs",
+    "lint": "node scripts/lint.cjs",
+    "build": "node scripts/build.cjs"
+  }
+}

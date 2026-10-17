@@ -404,7 +404,7 @@ bool transportOn(HttpClient::Connection &connection, bool keepAlive,
                 HttpResponse &response, File *file, size_t offset, size_t length,
                 const String &suffix, HttpClient::WriteProgressFn progress, void *context) {
   response = HttpResponse();
-  WiFiClientSecure &client = connection.client;
+  NetworkClient &client = connection.client;
   if (!connection.reusable || connection.host != host || connection.port != port ||
       !client.connected() || client.available()) {
     connection.stop();

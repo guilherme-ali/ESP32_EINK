@@ -28,6 +28,8 @@ void onLongPressStart(Button *btn) {
 void onPressUp(Button *btn) {
   if (!longFired_[btn->button_id] && onEvent_) {
     onEvent_((BtnId)btn->button_id, BtnAction::ShortClick);
+  } else if (longFired_[btn->button_id] && onEvent_) {
+    onEvent_((BtnId)btn->button_id, BtnAction::LongPressRelease);
   }
 }
 } // namespace

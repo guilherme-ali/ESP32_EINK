@@ -23,9 +23,19 @@ CJSON_TAG = "v1.7.17"  # Same version as the installed Arduino ESP32 SDK header.
 CJSON_ORIGIN = f"https://raw.githubusercontent.com/DaveGamble/cJSON/{CJSON_TAG}/"
 
 
+def rel(path: str | Path, cwd: Path = ROOT) -> str:
+    try:
+        return str(Path(path).resolve().relative_to(cwd))
+    except Exception:
+        return str(path)
+
+
 def run(command: list[str], *, timeout: int = 120, diagnostics: bool = False,
         cwd: Path = ROOT) -> bool:
-    result = subprocess.run(command, cwd=cwd, capture_output=True, timeout=timeout)
+    rendered = [rel(c, cwd) if cwd == ROOT and (isinstance(c, Path) or (isinstance(c, str) and str(ROOT) in c and not c.startswith("-")))
+                else (f"-I{rel(c[2:], cwd)}" if cwd == ROOT and isinstance(c, str) and c.startswith("-I") and str(ROOT) in c else str(c))
+                for c in command]
+    result = subprocess.run(rendered, cwd=cwd, capture_output=True, timeout=timeout)
     def decode(data: bytes) -> str:
         try:
             text = data.decode("utf-8")

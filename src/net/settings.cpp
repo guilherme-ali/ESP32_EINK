@@ -1,5 +1,6 @@
 #include "settings.h"
 #include <Preferences.h>
+#include <cmath>
 #if defined(ARDUINO_ARCH_ESP32)
 #include <esp_system.h>
 #endif
@@ -82,7 +83,10 @@ void SettingsStore::load() {
   settings_.screensaverTimeoutSec = prefs.getUShort("ssTimeout", 120);
   settings_.audioSampleRateHz = prefs.getUInt("sampleRate", 16000);
   settings_.micGainDb = prefs.getFloat("micGain", 24.0f);
-  settings_.speakerVolumeDb = prefs.getFloat("volume", 20.0f);
+  // A interface ja persistia percentuais nesta chave, sem conversao de dB.
+  const float volume = prefs.getFloat("volume", 20.0f);
+  settings_.speakerVolumePercent = !std::isfinite(volume) ? 20.0f :
+                                  volume < 0.0f ? 0.0f : volume > 100.0f ? 100.0f : volume;
   settings_.wallpaperChoice = (int8_t)prefs.getChar("wallpaper", -1);
   settings_.showTempHumidity = prefs.getBool("showTempHum", true);
   settings_.bleFallbackEnabled = prefs.getBool("bleFallback", false);
@@ -272,9 +276,10 @@ bool SettingsStore::saveAudio(uint32_t sampleRateHz, float micGainDb) {
   return true;
 }
 
-bool SettingsStore::saveVolume(float volumeDb) {
-  settings_.speakerVolumeDb = volumeDb;
-  prefs.putFloat("volume", volumeDb);
+bool SettingsStore::saveVolume(float percent) {
+  if (!std::isfinite(percent) || percent < 0.0f || percent > 100.0f) return false;
+  if (prefs.putFloat("volume", percent) != sizeof(float)) return false;
+  settings_.speakerVolumePercent = percent;
   return true;
 }
 

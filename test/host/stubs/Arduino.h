@@ -14,6 +14,13 @@
 
 constexpr int HEX = 16;
 constexpr int DEC = 10;
+constexpr int INPUT = 0;
+constexpr int OUTPUT = 1;
+constexpr int LOW = 0;
+constexpr int HIGH = 1;
+inline void pinMode(int, int) {}
+inline void digitalWrite(int, int) {}
+inline int digitalRead(int) { return HIGH; }
 using std::min;
 using std::max;
 

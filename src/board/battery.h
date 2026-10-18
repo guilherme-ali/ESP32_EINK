@@ -11,7 +11,7 @@ public:
   static float readVoltage();
 
   // Estimativa grosseira 0-100% pra uma LiPo 1S generica (curva nao
-  // linear real; 3.30V=0%, 4.20V=100%, com uma curva mais suave no
+  // linear real; 3.30V=0%, leitura de 4.086V=100%, com uma curva mais suave no
   // meio - o objetivo e "cheio/ok/baixo", nao precisao de fuel gauge).
   static int readPercent();
 };

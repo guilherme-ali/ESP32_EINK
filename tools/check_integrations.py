@@ -53,6 +53,8 @@ def main():
           "-fdata-sections", "-Itest/host/network_route_tests_stubs", "-Itest/host/stubs", "-Wl,--gc-sections"])
     suite("connectivity_settings_tests", [ROOT / "src/net/settings.cpp", HOST / "connectivity_settings_tests.cpp"],
           ["-Itest/host/stubs"])
+    suite("audio_codec_volume_tests", [ROOT / "src/audio/codec.cpp", HOST / "audio_codec_volume_tests.cpp", HOST / "fakes.cpp"],
+          ["-Ilib/es8311", "-Itest/host/stubs", "-Isrc/audio"])
     suite("button_tests", [ROOT / "src/board/buttons.cpp", ROOT / "src/board/multi_button.c", HOST / "button_tests.cpp"],
           ["-Itest/host/button_tests_stubs"])
     run([sys.executable, HOST / "assistant_check.py"])

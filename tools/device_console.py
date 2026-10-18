@@ -10,7 +10,7 @@ import serial
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", nargs="?", default="status",
-                        choices=["listen", "status", "sync", "sync-one", "wifi", "repair-drive", "stayawake 0", "stayawake 1",
+                        choices=["listen", "status", "battery", "sync", "sync-one", "wifi", "repair-drive", "stayawake 0", "stayawake 1",
                                  "phone-pair", "phone-stop", "assistant-start", "assistant-release", "assistant-cancel",
                                   "assistant-ptt", "assistant-models", "assistant-enable",
                                   "benchmark-route auto", "benchmark-route wifi", "benchmark-route phone",

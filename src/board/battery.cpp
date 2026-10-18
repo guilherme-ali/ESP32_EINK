@@ -5,22 +5,31 @@ float Battery::readVoltage() {
   // Media de algumas leituras - ADC do ESP32 e ruidoso, sobretudo com
   // WiFi/BT ativos.
   uint32_t sumMv = 0;
+  uint32_t minMv = UINT32_MAX;
+  uint32_t maxMv = 0;
   const int kSamples = 8;
   for (int i = 0; i < kSamples; i++) {
-    sumMv += analogReadMilliVolts(PIN_VBAT_ADC);
+    const uint32_t sampleMv = analogReadMilliVolts(PIN_VBAT_ADC);
+    sumMv += sampleMv;
+    if (sampleMv < minMv) minMv = sampleMv;
+    if (sampleMv > maxMv) maxMv = sampleMv;
   }
   float mv = sumMv / (float)kSamples;
+#if ARDUINO_USB_CDC_ON_BOOT
+  Serial.printf("[Battery] adc_avg_mv=%.2f adc_min_mv=%lu adc_max_mv=%lu divider=2 battery_v=%.4f samples=%d\n",
+                mv, (unsigned long)minMv, (unsigned long)maxMv, mv * 0.002f, kSamples);
+#endif
   return (mv * 2.0f) / 1000.0f; // divisor resistivo x2, mV -> V
 }
 
 int Battery::readPercent() {
   float v = readVoltage();
 
-  // Curva de descarga tipica de LiPo 1S, interpolada por trechos.
+  // Curva LiPo 1S por trechos; 100% assume a leitura medida de 4.086 V.
   struct Point { float volts; int percent; };
   static const Point kCurve[] = {
       {3.30f, 0}, {3.40f, 10}, {3.55f, 25}, {3.70f, 50},
-      {3.85f, 70}, {4.00f, 85}, {4.20f, 100},
+      {3.85f, 70}, {4.00f, 85}, {4.086f, 100},
   };
   constexpr int kN = sizeof(kCurve) / sizeof(kCurve[0]);
 

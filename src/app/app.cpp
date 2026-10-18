@@ -313,7 +313,7 @@ void App::drawSettings() {
   snprintf(items[kSetMicGain].value, sizeof(items[kSetMicGain].value), "%ddB", (int)cfg.micGainDb);
 
   setItem(items[kSetVolume], "Volume");
-  snprintf(items[kSetVolume].value, sizeof(items[kSetVolume].value), "%d", (int)cfg.speakerVolumeDb);
+  snprintf(items[kSetVolume].value, sizeof(items[kSetVolume].value), "%d%%", (int)cfg.speakerVolumePercent);
 
   setItem(items[kSetScreensaver], "Tempo p/ dormir");
   snprintf(items[kSetScreensaver].value, sizeof(items[kSetScreensaver].value), "%us",
@@ -500,7 +500,10 @@ void App::playSelected(int index) {
   NoteEntry e;
   if (!notes_.getAt(index, e)) return;
   Serial.printf("Reproduzindo %s\n", e.path);
-  codec_.setVolume(settingsStore_.get().speakerVolumeDb);
+  if (!codec_.setVolume(settingsStore_.get().speakerVolumePercent)) {
+    Serial.println("[Audio] Falha ao ajustar volume; reproducao cancelada.");
+    return;
+  }
   player_.play(codec_, e.path);
   codec_.enable(false);
 }
@@ -1063,7 +1066,7 @@ void App::onButtonSettings(BtnId id, BtnAction action) {
       break;
     }
     case kSetVolume: {
-      int idx = cycleIndex(kVolumes, kVolumeCount, cfg.speakerVolumeDb);
+      int idx = cycleIndex(kVolumes, kVolumeCount, cfg.speakerVolumePercent);
       settingsStore_.saveVolume(kVolumes[idx]);
       break;
     }
@@ -1431,6 +1434,8 @@ void App::diagnosticCommand(const String &command) {
                     state.wavUploaded, state.txtUploaded, state.mdUploaded,
                     state.lastStatusCode, state.lastError);
     }
+  } else if (!recording_ && command == "battery") {
+    Serial.printf("[Battery] percent=%d\n", Battery::readPercent());
   } else if (command == "stayawake 1") {
     diagnosticAwake_ = true; Serial.println("[Diag] descanso suspenso durante testes USB");
   } else if (command == "stayawake 0") {
@@ -1458,6 +1463,6 @@ void App::diagnosticCommand(const String &command) {
     markActivity();
     Serial.printf("[Diag] Pareamento Drive: %s\n", connected && settingsStore_.hasDriveAuth() ? "autorizado" : "pendente");
   } else {
-    Serial.println("[Diag] comandos: status | stayawake 1/0 | wifi | sync | sync-one | repair-drive | benchmark-route auto/wifi/phone | benchmark-playback full/ready");
+    Serial.println("[Diag] comandos: status | battery | stayawake 1/0 | wifi | sync | sync-one | repair-drive | benchmark-route auto/wifi/phone | benchmark-playback full/ready");
   }
 }

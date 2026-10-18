@@ -21,7 +21,7 @@ struct Settings {
   char assistantGatewayToken[129] = "";
   char assistantTimeZone[64] = "America/Sao_Paulo";
   char sttApiKey[128] = "test_API_key";
-  float micGainDb = 24, speakerVolumeDb = 20;
+  float micGainDb = 24, speakerVolumePercent = 20;
 };
 using portMUX_TYPE = std::recursive_mutex;
 #define portMUX_INITIALIZER_UNLOCKED {}

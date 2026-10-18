@@ -28,7 +28,10 @@ bool Player::play(AudioCodec &codec, const char *path) {
     file.close();
     return false;
   }
-  codec.enable(true);
+  if (!codec.enable(true)) {
+    file.close();
+    return false;
+  }
 
   while (file.available()) {
     int monoRead = file.read((uint8_t *)monoBuf, sizeof(monoBuf)) / sizeof(int16_t);

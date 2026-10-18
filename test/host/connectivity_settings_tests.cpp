@@ -1,8 +1,10 @@
 #include "../../src/net/settings.h"
 #include <Preferences.h>
 #include <cassert>
+#include <cmath>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <string>
 
 int main() {
@@ -55,5 +57,76 @@ int main() {
   assert(stored.saveAssistant(false, "", "", "", "America/Sao_Paulo"));
   assert(!stored.get().assistantEnabled && !stored.get().assistantGatewayToken[0]);
   ++passed;
-  std::cout << "Connectivity settings: " << passed << "/7 grupos OK\n";
+
+  Host::resetNvs();
+  SettingsStore defaults;
+  assert(defaults.get().speakerVolumePercent == 20.0f);
+  assert(defaults.begin());
+  assert(defaults.get().speakerVolumePercent == 20.0f);
+  assert(Host::nvs["cfg"].count("volume") == 0);
+  ++passed;
+
+  for (float percent : {20.0f, 40.0f, 100.0f, 0.0f}) {
+    assert(defaults.saveVolume(percent));
+    assert(defaults.get().speakerVolumePercent == percent);
+    assert(std::get<float>(Host::nvs["cfg"]["volume"]) == percent);
+    Host::rebootNvs();
+    SettingsStore rebooted;
+    assert(rebooted.begin());
+    assert(rebooted.get().speakerVolumePercent == percent);
+  }
+  ++passed;
+
+  Host::resetNvs();
+  Host::seedNvs("volume", 40.0f);
+  SettingsStore legacy;
+  assert(legacy.begin());
+  assert(legacy.get().speakerVolumePercent == 40.0f);
+  assert(std::get<float>(Host::nvs["cfg"]["volume"]) == 40.0f);
+  ++passed;
+
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  const float infinity = std::numeric_limits<float>::infinity();
+  const auto persisted = Host::nvs;
+  for (float invalid : {-1.0f, 100.01f, nan, infinity, -infinity}) {
+    assert(!legacy.saveVolume(invalid));
+    assert(legacy.get().speakerVolumePercent == 40.0f);
+    assert(Host::nvs == persisted);
+  }
+  Host::rebootNvs();
+  SettingsStore afterInvalid;
+  assert(afterInvalid.begin());
+  assert(afterInvalid.get().speakerVolumePercent == 40.0f);
+  ++passed;
+
+  Host::failPuts.insert("cfg/volume");
+  assert(!afterInvalid.saveVolume(20.0f));
+  assert(afterInvalid.get().speakerVolumePercent == 40.0f);
+  assert(Host::nvs == persisted);
+  Host::failPuts.clear();
+  Host::rebootNvs();
+  SettingsStore afterFailure;
+  assert(afterFailure.begin());
+  assert(afterFailure.get().speakerVolumePercent == 40.0f);
+  assert(afterFailure.saveVolume(20.0f));
+  assert(afterFailure.get().speakerVolumePercent == 20.0f);
+  assert(std::get<float>(Host::nvs["cfg"]["volume"]) == 20.0f);
+  ++passed;
+
+  const struct { float raw; float expected; } corrupt[] = {
+    {nan, 20.0f}, {infinity, 20.0f}, {-infinity, 20.0f},
+    {101.0f, 100.0f}, {-1.0f, 0.0f}
+  };
+  for (const auto &test : corrupt) {
+    Host::resetNvs();
+    Host::seedNvs("volume", test.raw);
+    SettingsStore sanitized;
+    assert(sanitized.begin());
+    assert(std::isfinite(sanitized.get().speakerVolumePercent));
+    assert(sanitized.get().speakerVolumePercent == test.expected);
+    const float raw = std::get<float>(Host::nvs["cfg"]["volume"]);
+    assert(std::isnan(test.raw) ? std::isnan(raw) : raw == test.raw);
+  }
+  ++passed;
+  std::cout << "Connectivity settings: " << passed << "/13 grupos OK\n";
 }

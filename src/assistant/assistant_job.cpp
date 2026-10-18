@@ -270,7 +270,7 @@ bool AssistantJob::start(const Settings &s, AudioCodec &codec, ConnectFn connect
   impl_ = p;
   p->key = s.sttApiKey; p->model = s.assistantModel; p->gateway = s.assistantGatewayUrl;
   p->token = s.assistantGatewayToken; p->zone = s.assistantTimeZone;
-  p->playbackVolume = s.speakerVolumeDb;
+  p->playbackVolume = s.speakerVolumePercent;
   p->startedUs = assistantMonotonicUs();
   p->telemetry.turnId = nextTurnId.fetch_add(1, std::memory_order_relaxed);
   std::string path;

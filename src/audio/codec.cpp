@@ -1,6 +1,7 @@
 #include "codec.h"
 #include "../config/pins.h"
 #include <Wire.h>
+#include <cmath>
 
 extern "C" {
 #include "es8311_codec.h"
@@ -88,8 +89,8 @@ bool AudioCodec::begin() {
   // O driver vendor nunca escreve ES8311_ADC_REG18 (ALC enable) - o
   // default de fabrica pode deixar o AGC/automute ligado, o que corta
   // ou abafa trechos baixos da fala. Desabilita explicitamente.
-  codec->set_reg(codec, 0x18, 0x00);
-  return true;
+  return codec->set_reg(codec, 0x18, 0x00) == ESP_CODEC_DEV_OK &&
+         codec->mute(codec, true) == ESP_CODEC_DEV_OK;
 }
 
 bool AudioCodec::initI2s(uint32_t sampleRate) {
@@ -145,14 +146,30 @@ bool AudioCodec::setSampleRate(uint32_t sampleRate) {
 bool AudioCodec::enable(bool on) {
   if (!codec_) return false;
   auto *codec = (const audio_codec_if_t *)codec_;
+  if (codec->enable(codec, on) != ESP_CODEC_DEV_OK) return false;
   codecOpen_ = on;
-  return codec->enable(codec, on) == ESP_CODEC_DEV_OK;
+  // Suspend clears DAC volume; restore it for notes as well as Live playback.
+  return !on || applyVolume();
 }
 
-bool AudioCodec::setVolume(float db) {
+bool AudioCodec::setVolume(float percent) {
+  if (!codec_ || !std::isfinite(percent) || percent < 0 || percent > 100) return false;
+  const float previous = volumePercent_;
+  volumePercent_ = percent;
+  if (applyVolume()) return true;
+  volumePercent_ = previous;
+  return false;
+}
+
+bool AudioCodec::applyVolume() {
   if (!codec_) return false;
   auto *codec = (const audio_codec_if_t *)codec_;
-  return codec->set_vol(codec, db) == ESP_CODEC_DEV_OK;
+  // Change gain while muted; never unmute after a failed register write.
+  if (codec->mute(codec, true) != ESP_CODEC_DEV_OK) return false;
+  if (volumePercent_ == 0) return true;
+  const float db = 40.0f * std::log10(volumePercent_ / 100.0f);
+  if (codec->set_vol(codec, db) != ESP_CODEC_DEV_OK) return false;
+  return codec->mute(codec, false) == ESP_CODEC_DEV_OK;
 }
 
 bool AudioCodec::setMicGain(float db) {

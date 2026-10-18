@@ -21,7 +21,8 @@ public:
   bool setSampleRate(uint32_t sampleRate);
 
   bool enable(bool on);
-  bool setVolume(float db);
+  // UI percent, not positive dB gain: 0 mutes, 100 is nominal full scale.
+  bool setVolume(float percent);
   bool setMicGain(float db);
 
   // len em bytes; buffers sao PCM 16-bit estereo intercalado (LRLR...).
@@ -33,7 +34,9 @@ private:
 
   bool i2sInited_ = false;
   bool codecOpen_ = false;
+  float volumePercent_ = 0;
   const void *codec_ = nullptr; // audio_codec_if_t* (tipo C, evita expor o header aqui)
 
   bool initI2s(uint32_t sampleRate);
+  bool applyVolume();
 };

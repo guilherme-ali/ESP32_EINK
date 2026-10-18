@@ -16,6 +16,8 @@ import wave
 
 
 MEDIA_PROFILES = ("legacy", "pcm", "opus64", "opus48", "opus32")
+TIMING_SANITY_TOLERANCE_SECONDS = 0.75
+TIMING_SANITY_EARLY_TOLERANCE_SECONDS = 0.1
 
 
 def open_serial(serial_module, device, timeout):
@@ -138,7 +140,7 @@ def onset_metrics(recording, begin, end, sample_rate, prompt, np, prompt_output_
     competitors[max(0, best - exclusion):best + exclusion + 1] = 0
     second = float(np.max(competitors))
     result.update(alignment_score=score, alignment_competing_score=second)
-    if score < 0.05 or (len(competitors) > 0 and second >= score * 0.90):
+    if score < 0.35 or (len(competitors) > 0 and second >= score * 0.90):
         result.update(detection_status="ambiguous", detection_reason="prompt_alignment")
         return result
     start, finish = low + best, low + best + length
@@ -151,8 +153,8 @@ def onset_metrics(recording, begin, end, sample_rate, prompt, np, prompt_output_
     baseline = signal[:noise_end]
     dc = float(np.mean(baseline))
     noise_rms = float(np.sqrt(np.mean((baseline - dc) ** 2)))
-    # Less than one PCM16 LSB quantization floor allows detecting quiet air acoustics.
-    threshold = max(0.8 / 32768.0, 3.0 * noise_rms)
+    # Require multiple PCM16 steps; sub-LSB capture artifacts are not evidence of sound.
+    threshold = max(3.0 / 32768.0, 3.0 * noise_rms)
     result.update(noise_rms=noise_rms, onset_threshold=threshold)
     window, hop = max(1, round(0.010 * sample_rate)), max(1, round(0.005 * sample_rate))
     required = math.ceil(0.030 * sample_rate / hop)
@@ -207,6 +209,66 @@ def onset_metrics(recording, begin, end, sample_rate, prompt, np, prompt_output_
     else:
         result.update(detection_status="no_response", detection_reason="no_sustained_energy")
     return result
+
+
+def timing_sanity(onset, firmware, capture, release_lateness_seconds):
+    """Veto only: compare elapsed times relative to release, never align ESP/PC clocks."""
+    result = {"timing_sanity_valid": False, "timing_sanity_reason": "timing_reference_missing",
+               "timing_sanity_tolerance_ms": 1000 * TIMING_SANITY_TOLERANCE_SECONDS,
+              "timing_sanity_early_tolerance_ms": 1000 * TIMING_SANITY_EARLY_TOLERANCE_SECONDS,
+              "acoustic_onset_after_release_ms_diagnostic": None,
+              "firmware_first_i2s_after_release_ms_diagnostic": None,
+              "acoustic_firmware_delta_ms_diagnostic": None}
+    if onset.get("detection_status") != "ok":
+        result["timing_sanity_reason"] = "acoustic_onset_unavailable"
+        return result
+    try:
+        release_us, first_us = int(firmware["release_us"]), int(firmware["first_i2s_us"])
+        if release_us <= 0 or first_us < release_us:
+            raise ValueError("invalid_firmware_timestamps")
+        frame = onset["response_onset_frame"]
+        adc_onset = None
+        for i in range(capture.blocks):
+            offset, size = int(capture.adc_offsets[i]), int(capture.adc_sizes[i])
+            adc = float(capture.adc_times[i])
+            if offset <= frame < offset + size and math.isfinite(adc):
+                adc_onset = adc + (frame - offset) / capture.sample_rate
+                break
+        if adc_onset is None or capture.prompt_end_dac is None or release_lateness_seconds is None:
+            return result
+        if not all(math.isfinite(value) for value in
+                   (adc_onset, capture.prompt_end_dac, release_lateness_seconds)) or release_lateness_seconds < 0:
+            return result
+        # ADC and DAC share PortAudio's clock. Only elapsed ESP times are used.
+        acoustic = adc_onset - capture.prompt_end_dac - release_lateness_seconds
+        first = (first_us - release_us) / 1e6
+        delta = acoustic - first
+        result.update(acoustic_onset_after_release_ms_diagnostic=1000 * acoustic,
+                      firmware_first_i2s_after_release_ms_diagnostic=1000 * first,
+                      acoustic_firmware_delta_ms_diagnostic=1000 * delta)
+        reason = ""
+        # DMA and leading silence can delay sound, not make it precede I2S.
+        if delta < -TIMING_SANITY_EARLY_TOLERANCE_SECONDS:
+            reason = "acoustic_onset_before_firmware_playback"
+        elif delta > TIMING_SANITY_TOLERANCE_SECONDS:
+            reason = "acoustic_onset_late_vs_firmware_playback"
+        result.update(timing_sanity_valid=not reason, timing_sanity_reason=reason)
+    except (KeyError, TypeError, ValueError, OverflowError):
+        pass
+    return result
+
+
+def wasapi_extra_settings(sd, devices, enabled):
+    if not enabled:
+        return None
+    settings = []
+    for device, kind in zip(devices, ("input", "output")):
+        info = sd.query_devices(device, kind)
+        hostapi = sd.query_hostapis(info["hostapi"])["name"]
+        settings.append(sd.WasapiSettings(exclusive=True) if hostapi == "Windows WASAPI" else None)
+    if not all(settings):
+        raise ValueError("--wasapi-exclusive exige dispositivos de entrada e saida WASAPI")
+    return tuple(settings)
 
 
 class AudioCapture:
@@ -273,7 +335,11 @@ class AudioCapture:
 SUMMARY_FIELDS = ["run_id", "trial_id", "trial", "repeat", "route_requested", "route_actual", "playback_policy", "media_requested",
                   "media_expected", "media_actual", "media_valid", "media_failure_reason", "media_tx_wire_bytes", "media_rx_wire_bytes",
                   "wav", "turn_id", "boot_id", "status", "failure_reason", "timed_out", "detection_status", "detection_reason",
-                  "latency_ms", "timing_uncertainty_ms", "input_overflow_callbacks", "output_underflow_callbacks",
+                  "latency_ms", "candidate_latency_ms_diagnostic", "timing_uncertainty_ms",
+                  "timing_sanity_valid", "timing_sanity_reason", "timing_sanity_tolerance_ms", "timing_sanity_early_tolerance_ms",
+                  "acoustic_onset_after_release_ms_diagnostic", "firmware_first_i2s_after_release_ms_diagnostic",
+                  "acoustic_firmware_delta_ms_diagnostic", "release_lateness_seconds",
+                  "wasapi_exclusive", "input_overflow_callbacks", "output_underflow_callbacks",
                   "valid", "recording", "backlog_release_bytes", "backlog_max_bytes", "input_bytes", "network_connect_us",
                   "ws_upgrade_us", "setup_complete_us", "activity_end_us", "first_audio_us", "first_pcm_us",
                   "turn_complete_us", "response_ready_us", "first_i2s_us", "network_done_us",
@@ -474,7 +540,7 @@ class TurnTracker:
             self.done = fields
 
     def media_result(self, route, requested):
-        expected = "legacy" if route == "wifi" else requested
+        expected = "legacy" if route == "wifi" else "opus48" if requested == "default" else requested
         actual = self.media.get("media")
         reason = ""
         if not self.media:
@@ -509,7 +575,7 @@ def restore_defaults(session):
     # Cancel ACK is not worker completion: require actual fresh override ACKs.
     for command, expected in (("benchmark-route auto", ("BenchmarkRoute", "auto")),
                               ("benchmark-playback ready", ("BenchmarkPlayback", "ready")),
-                              ("benchmark-media legacy", ("BenchmarkMedia", "legacy"))):
+                              ("benchmark-media default", ("BenchmarkMedia", "default"))):
         last_error = f"restore_timeout: {command}"
         deadline = time.monotonic() + 10
         for _ in range(50):
@@ -543,15 +609,18 @@ def run_trial(args, session, log, np, sd, devices, prompt_info, route, trial, re
         session.command(f"benchmark-route {route}", ("BenchmarkRoute", route), timeout=8)
         session.command(f"benchmark-playback {args.playback}", ("BenchmarkPlayback", args.playback))
         session.command(f"benchmark-media {args.media}", ("BenchmarkMedia", args.media))
-        idle = session.command("status", timeout=10)
+        idle = session.command("status", timeout=15)
         if any(event["tag"] == "Assistant" and "state" in event["fields"] for event in idle):
             raise RuntimeError("assistant_not_idle_before_start")
         blocksize = round(args.samplerate * 0.01)
         capture = AudioCapture(prompt, args.samplerate, math.ceil((args.timeout + args.tail_seconds + 20) * args.samplerate),
                                blocksize, np)
+        extra_settings = wasapi_extra_settings(sd, devices, getattr(args, "wasapi_exclusive", False))
+        stream_options = {} if extra_settings is None else {"extra_settings": extra_settings}
         stream = sd.Stream(device=devices, samplerate=args.samplerate, channels=(1, 1), dtype="float32",
-                           blocksize=blocksize, latency="low", callback=capture.callback)
+                           blocksize=blocksize, latency="low", callback=capture.callback, **stream_options)
         result.update(input_device=str(stream.device[0]), output_device=str(stream.device[1]),
+                      wasapi_exclusive=getattr(args, "wasapi_exclusive", False),
                       stream_latency_seconds=stream.latency, stream_blocksize=stream.blocksize,
                       stream_sample_rate=stream.samplerate)
         stream.start()
@@ -579,7 +648,13 @@ def run_trial(args, session, log, np, sd, devices, prompt_info, route, trial, re
         while time.monotonic() < deadline:
             # Poll serial in short bounded reads, never wait for status ACK during playback.
             if capture.prompt_end_dac is not None and not released and stream.time >= capture.prompt_end_dac:
+                before_ns = time.perf_counter_ns()
+                release_stream_time = stream.time
+                after_ns = time.perf_counter_ns()
                 result["release_host_perf_ns"] = session.send("assistant-release")
+                result["release_clock_query_duration_ms"] = (after_ns - before_ns) / 1e6
+                result["release_lateness_seconds"] = (release_stream_time - capture.prompt_end_dac +
+                    (result["release_host_perf_ns"] - after_ns) / 1e9)
                 released = True
             for event in session.read():
                 tracker.observe(event)
@@ -597,7 +672,7 @@ def run_trial(args, session, log, np, sd, devices, prompt_info, route, trial, re
             for event in session.read():
                 tracker.observe(event)
         if tracker.done:
-            events = session.command("status", timeout=10, observer=tracker.observe)
+            events = session.command("status", timeout=15, observer=tracker.observe)
             for event in events:
                 if event["tag"] == "BLE":
                     result["ble_link"] = event["fields"]
@@ -650,6 +725,10 @@ def run_trial(args, session, log, np, sd, devices, prompt_info, route, trial, re
                 onset = onset_metrics(saved_samples, 0, len(saved_samples), args.samplerate, prompt, np,
                                       prompt_output_frame=capture.prompt_output_frame)
                 result.update(onset)
+                sanity = timing_sanity(onset, tracker.metrics, capture, result.get("release_lateness_seconds"))
+                if result.get("release_clock_query_duration_ms", math.inf) > 10:
+                    sanity.update(timing_sanity_valid=False, timing_sanity_reason="release_clock_query_too_slow")
+                result.update(sanity)
                 if result["status"] == "completed":
                     failures = []
                     if result["timed_out"]:
@@ -667,11 +746,16 @@ def run_trial(args, session, log, np, sd, devices, prompt_info, route, trial, re
                         failures.append("stimulus_not_completed")
                     if onset["detection_status"] != "ok":
                         failures.append(onset["detection_reason"])
+                    elif not sanity["timing_sanity_valid"]:
+                        failures.append(sanity["timing_sanity_reason"])
                     result.update(valid=not failures, status="valid" if not failures else "invalid",
-                                  failure_reason=",".join(failures))
+                                   failure_reason=",".join(failures))
         except Exception as error:
             result.update(status="error", valid=False,
                           failure_reason=result["failure_reason"] + f"; recording_analysis_failed: {error}"[:240])
+        if not result["valid"] and result.get("latency_ms") is not None:
+            result["candidate_latency_ms_diagnostic"] = result["latency_ms"]
+            result["latency_ms"] = None
         log.save_trial(result)
         print(f"[Trial {trial}] status={result['status']} latency_ms={result.get('latency_ms')} reason={result['failure_reason']}", flush=True)
     if interrupted:
@@ -690,12 +774,13 @@ def main():
     parser.add_argument("--wav", action="append", type=Path, help="WAV PCM16 fixo, ate 30 s; repetir para corpus")
     parser.add_argument("--routes", default="wifi,phone", help="Rotas exclusivas; ordem invertida a cada repeticao")
     parser.add_argument("--playback", choices=("full", "ready"), default="ready")
-    parser.add_argument("--media", choices=MEDIA_PROFILES, default="legacy",
-                        help="Perfil BLE experimental; default legacy, Wi-Fi ignora compressao")
+    parser.add_argument("--media", choices=("default", *MEDIA_PROFILES), default="default",
+                         help="default usa o perfil normal do BOOT (opus48); Wi-Fi ignora compressao")
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--port", default="COM7")
     parser.add_argument("--input-device", help="ID ou substring do microfone local")
     parser.add_argument("--output-device", help="ID ou substring da saida local, preferencialmente cabeada")
+    parser.add_argument("--wasapi-exclusive", action="store_true", help="Exige entrada/saida WASAPI em modo exclusivo")
     parser.add_argument("--samplerate", type=int, default=48000)
     parser.add_argument("--prompt-distance-m", type=float, default=1.0, help="Somente metadado; nao corrige o alinhamento")
     parser.add_argument("--prompt-distance-uncertainty-m", type=float, default=0.3, help="Somente metadado")
@@ -716,6 +801,8 @@ def main():
     routes = [part.strip().lower() for part in args.routes.split(",")]
     if any(route not in ("wifi", "phone") for route in routes):
         parser.error("--routes aceita apenas wifi,phone")
+    if "phone" in routes and args.playback == "full" and args.media not in ("legacy", "pcm"):
+        parser.error("--playback full no BLE exige --media legacy ou pcm; Opus usa reproducao progressiva")
     try:
         import numpy as np
         import serial
@@ -741,8 +828,11 @@ def main():
             return int(value) if value is not None and value.isdecimal() else value
 
         devices = (select_device(args.input_device), select_device(args.output_device))
-        sd.check_input_settings(device=devices[0], channels=1, dtype="float32", samplerate=args.samplerate)
-        sd.check_output_settings(device=devices[1], channels=1, dtype="float32", samplerate=args.samplerate)
+        extra_settings = wasapi_extra_settings(sd, devices, args.wasapi_exclusive)
+        input_options = {} if extra_settings is None else {"extra_settings": extra_settings[0]}
+        output_options = {} if extra_settings is None else {"extra_settings": extra_settings[1]}
+        sd.check_input_settings(device=devices[0], channels=1, dtype="float32", samplerate=args.samplerate, **input_options)
+        sd.check_output_settings(device=devices[1], channels=1, dtype="float32", samplerate=args.samplerate, **output_options)
         log.event("audio_configuration", portaudio=sd.get_portaudio_version(),
                   input=sd.query_devices(devices[0], "input"), output=sd.query_devices(devices[1], "output"))
         prompts = [(path, *load_prompt(path, np, args.samplerate)) for path in args.wav]

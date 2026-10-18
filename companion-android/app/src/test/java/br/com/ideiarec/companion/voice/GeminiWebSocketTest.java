@@ -1,21 +1,119 @@
 package br.com.ideiarec.companion.voice;
 
 import static org.junit.Assert.*;
+import java.io.BufferedOutputStream;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.Test;
 
 public class GeminiWebSocketTest {
+    private static final class Writes extends OutputStream {
+        final ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        int single, bulk, flushes;
+        @Override public void write(int b) { single++; bytes.write(b); }
+        @Override public void write(byte[] b, int off, int len) { bulk++; bytes.write(b, off, len); }
+        @Override public void flush() { flushes++; }
+    }
+    private static GeminiWebSocket writer(OutputStream out) throws Exception {
+        GeminiWebSocket socket = new GeminiWebSocket();
+        java.lang.reflect.Field output = GeminiWebSocket.class.getDeclaredField("output"); output.setAccessible(true);
+        output.set(socket, new BufferedOutputStream(out, 4096));
+        return socket;
+    }
+    private static void assertClientFrame(byte[] encoded, byte[] expected) throws IOException {
+        ByteArrayInputStream in = new ByteArrayInputStream(encoded);
+        assertEquals(0x81, in.read());
+        int second = in.read(); assertEquals(128, second & 128);
+        int marker = second & 127;
+        assertEquals(expected.length < 126 ? expected.length : expected.length <= 65535 ? 126 : 127, marker);
+        long length = marker;
+        if (marker == 126 || marker == 127) {
+            length = 0;
+            for (int i = 0; i < (marker == 126 ? 2 : 8); i++) {
+                int b = in.read(); assertTrue(b >= 0); length = (length << 8) | b;
+            }
+        }
+        assertEquals(expected.length, length);
+        byte[] mask = in.readNBytes(4); assertEquals(4, mask.length);
+        byte[] decoded = in.readNBytes(expected.length); assertEquals(expected.length, decoded.length);
+        for (int i = 0; i < decoded.length; i++) decoded[i] ^= mask[i & 3];
+        assertArrayEquals(expected, decoded); assertEquals(-1, in.read());
+    }
+    @Test public void eachSmallFrameIsFlushedOnceAsOneTlsWriteWithoutBatchingFrames() throws Exception {
+        Writes writes = new Writes(); GeminiWebSocket socket = writer(writes);
+        try {
+            int offset = 0, count = 0;
+            for (String message : List.of("", "{}", "x".repeat(125), "x".repeat(126), "x".repeat(1000))) {
+                socket.send(message); count++;
+                assertEquals(count, writes.bulk); assertEquals(0, writes.single); assertEquals(count, writes.flushes);
+                byte[] all = writes.bytes.toByteArray();
+                assertClientFrame(Arrays.copyOfRange(all, offset, all.length), message.getBytes(StandardCharsets.UTF_8));
+                offset = all.length;
+            }
+            socket.close(); assertEquals(count, writes.flushes);
+            assertThrows(IOException.class, () -> socket.send("not sent"));
+            assertEquals(count, writes.bulk);
+        } finally { socket.close(); }
+    }
+    @Test public void bufferingPreservesMaskLengthsAndBytesAcrossBufferAndExtendedLengthBoundaries() throws Exception {
+        for (int size : new int[]{4088, 4095, 4096, 4097, 65535, 65536, VoicePacket.MAX_PAYLOAD}) {
+            Writes writes = new Writes(); GeminiWebSocket socket = writer(writes);
+            try {
+                String message = "0123456789abcdef".repeat((size + 15) / 16).substring(0, size);
+                socket.send(message);
+                assertEquals(1, writes.flushes); assertEquals(0, writes.single);
+                assertClientFrame(writes.bytes.toByteArray(), message.getBytes(StandardCharsets.UTF_8));
+            } finally { socket.close(); }
+        }
+    }
+    @Test public void failedBufferedFlushAbortsWithoutRetryingOrFlushingOnClose() throws Exception {
+        AtomicInteger writes = new AtomicInteger(), flushes = new AtomicInteger();
+        GeminiWebSocket socket = writer(new OutputStream() {
+            @Override public void write(int b) { fail("Buffered frame must use bulk writes"); }
+            @Override public void write(byte[] b, int off, int len) throws IOException { writes.incrementAndGet(); throw new IOException("private failure"); }
+            @Override public void flush() { flushes.incrementAndGet(); }
+        });
+        IOException failure = assertThrows(IOException.class, () -> socket.send("test-key secret"));
+        assertFalse(failure.toString().contains("test-key")); assertFalse(failure.toString().contains("private"));
+        socket.close(); assertThrows(IOException.class, () -> socket.send("retry"));
+        assertEquals(1, writes.get()); assertEquals(0, flushes.get());
+    }
+    @Test public void cancelInterruptsBufferedFlushWithoutWaitingForTheWriterLock() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1), interrupted = new CountDownLatch(1);
+        GeminiWebSocket socket = writer(new OutputStream() {
+            @Override public void write(int b) { fail("Buffered frame must use bulk writes"); }
+            @Override public void write(byte[] b, int off, int len) throws IOException {
+                entered.countDown();
+                try { if (!interrupted.await(3, TimeUnit.SECONDS)) throw new IOException("cancel did not interrupt write"); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new IOException(e); }
+                throw new IOException("socket closed");
+            }
+        });
+        java.lang.reflect.Field tcp = GeminiWebSocket.class.getDeclaredField("tcp"); tcp.setAccessible(true);
+        tcp.set(socket, new Socket() { @Override public void close() { interrupted.countDown(); } });
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            Future<?> sending = pool.submit(() -> assertThrows(IOException.class, () -> socket.send("one frame")));
+            assertTrue(entered.await(2, TimeUnit.SECONDS)); socket.close(); sending.get(2, TimeUnit.SECONDS);
+            assertThrows(IOException.class, () -> socket.send("after cancel"));
+        } finally { socket.close(); pool.shutdownNow(); assertTrue(pool.awaitTermination(3, TimeUnit.SECONDS)); }
+    }
     private static byte[] frame(int opcode, boolean fin, byte[] payload) throws IOException {
         ByteArrayOutputStream out = new ByteArrayOutputStream(); out.write((fin ? 128 : 0) | opcode);
         if (payload.length < 126) out.write(payload.length);

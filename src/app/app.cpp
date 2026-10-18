@@ -1347,12 +1347,13 @@ void App::diagnosticCommand(const String &command) {
     }
     const String name = command.substring(16);
     DiagnosticMedia profile;
-    if (name == "legacy") profile = DiagnosticMedia::Legacy;
+    if (name == "default") profile = NetworkRoute::kDefaultPhoneMedia;
+    else if (name == "legacy") profile = DiagnosticMedia::Legacy;
     else if (name == "pcm") profile = DiagnosticMedia::Pcm;
     else if (name == "opus64") profile = DiagnosticMedia::Opus64;
     else if (name == "opus48") profile = DiagnosticMedia::Opus48;
     else if (name == "opus32") profile = DiagnosticMedia::Opus32;
-    else { Serial.println("[Diag] midia invalida; use legacy/pcm/opus64/opus48/opus32"); return; }
+    else { Serial.println("[Diag] midia invalida; use default/legacy/pcm/opus64/opus48/opus32"); return; }
     NetworkRoute::setDiagnosticMedia(profile);
     Serial.printf("[BenchmarkMedia] %s\n", name.c_str());
     return;

@@ -11,10 +11,30 @@ PhoneVoice::PhoneVoice(uint8_t *p, size_t cap, Stop stop, void *ctx)
   : storage_(p), capacity_(cap), stop_(stop), context_(ctx) {}
 PhoneVoice::~PhoneVoice() { close(); memset(input_, 0, sizeof(input_)); }
 bool PhoneVoice::fail(const char *error) { error_ = error; close(); return false; }
+bool PhoneVoice::flushOpus() {
+  if (channel_ < 0 || stop_(context_)) { close(); return false; }
+  if (!opusBatchSize_) return true;
+  const size_t count = opusBatchSize_;
+  opusBatchSize_ = 0; // Never replay a batch after a partial transport write.
+  const size_t done = PhoneRelay::write(channel_, opusBatch_, count, 5000);
+  sentBytes_ += done;
+  if (done != count) return fail("Midia BLE interrompida durante envio; sem replay.");
+  return true;
+}
 bool PhoneVoice::record(Media::Type type, const uint8_t *p, size_t n, uint32_t position, uint8_t flags) {
-  if (channel_ < 0 || n > UINT32_MAX || stop_(context_)) return false;
-  uint8_t chunk[1384];
+  if (channel_ < 0 || n > UINT32_MAX || stop_(context_)) { close(); return false; }
   Media::Header h; h.type = type; h.flags = flags; h.length = static_cast<uint32_t>(n); h.position = position;
+  if (type == Media::Type::Opus) {
+    if (n > sizeof(opusBatch_) - Media::kHeaderSize) return fail("Pacote Opus acima do lote de midia.");
+    const size_t count = Media::kHeaderSize + n;
+    if (count > sizeof(opusBatch_) - opusBatchSize_ && !flushOpus()) return false;
+    Media::encodeHeader(h, opusBatch_ + opusBatchSize_);
+    if (n) memcpy(opusBatch_ + opusBatchSize_ + Media::kHeaderSize, p, n);
+    opusBatchSize_ += count;
+    return opusBatchSize_ != sizeof(opusBatch_) || flushOpus();
+  }
+  if (opusBatchSize_ && !flushOpus()) return false;
+  uint8_t chunk[1384];
   Media::encodeHeader(h, chunk);
   const size_t first = std::min(n, sizeof(chunk) - Media::kHeaderSize);
   if (first) memcpy(chunk + Media::kHeaderSize, p, first);
@@ -22,9 +42,9 @@ bool PhoneVoice::record(Media::Type type, const uint8_t *p, size_t n, uint32_t p
   size_t at = 0, count = Media::kHeaderSize + first;
   while (!stop_(context_)) {
       if (uint32_t(millis() - start) >= 10000) return fail("Timeout ao enviar midia BLE.");
-      const size_t done = PhoneRelay::write(channel_, chunk, count, 5000);
-      if (done != count) return fail("Midia BLE interrompida durante envio; sem replay.");
-      sentBytes_ += done;
+       const size_t done = PhoneRelay::write(channel_, chunk, count, 5000);
+       sentBytes_ += done;
+       if (done != count) return fail("Midia BLE interrompida durante envio; sem replay.");
       at += at ? count : first;
       if (at == n) return true;
       count = std::min(n - at, sizeof(chunk));
@@ -91,7 +111,7 @@ bool PhoneVoice::sendAudio(const uint8_t *pcm, size_t n) {
     staged_ += take / 2; original_ += take / 2; at += take;
     if (staged_ == 320) { if (!encodeFrame()) return false; staged_ = 0; }
   }
-  return true;
+  return flushOpus();
 }
 bool PhoneVoice::endInput() {
   if (!hello_ || ended_ || !original_) return fail("Fim de captura de midia invalido.");
@@ -185,6 +205,9 @@ WsParser::Event PhoneVoice::poll() {
   return E::None;
 }
 bool PhoneVoice::pending() { return headerAt_ || (channel_ >= 0 && PhoneRelay::available(channel_) > 0); }
-void PhoneVoice::close() { if (channel_ >= 0) { PhoneRelay::close(channel_); channel_ = -1; } }
+void PhoneVoice::close() {
+  opusBatchSize_ = 0;
+  if (channel_ >= 0) { PhoneRelay::close(channel_); channel_ = -1; }
+}
 }
 #endif

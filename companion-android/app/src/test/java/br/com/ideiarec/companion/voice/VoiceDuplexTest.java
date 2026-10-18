@@ -186,6 +186,56 @@ public class VoiceDuplexTest {
             h.socket.response(control); assertEquals(control, VoicePacket.utf8(h.read().payload));
         }
     }
+    @Test public void packedReadsCrossQueuedRecordsAndPreserveOffsetsBoundariesAndNormalEof() throws Exception {
+        String first = "{\"a\":\"" + "x".repeat(116) + "\"}", second = first.replace("\"a\"", "\"b\"");
+        String complete = "{\"serverContent\":{\"turnComplete\":true}}";
+        ByteArrayOutputStream expected = new ByteArrayOutputStream();
+        for (String json : List.of(first, second, complete)) {
+            expected.write(new VoicePacket(VoicePacket.JSON, 0, 0, json.getBytes(StandardCharsets.UTF_8)).encode());
+        }
+        assertEquals(136, new VoicePacket(VoicePacket.JSON, 0, 0, first.getBytes(StandardCharsets.UTF_8)).encode().length);
+        for (int size : new int[]{1, 11, 12, 13, 135, 136, 137, Frame.MAX_PAYLOAD, 1024}) {
+            try (Harness h = new Harness()) {
+                h.hello("pcm"); h.read(); InputStream in = h.duplex.input();
+                h.socket.response(first); h.socket.response(second); h.socket.response(complete); h.socket.listener.ended(true);
+                byte[] all = expected.toByteArray(), buffer = new byte[size + 6]; int at = 0;
+                while (at < all.length) {
+                    Arrays.fill(buffer, (byte) 0x55);
+                    int count = in.read(buffer, 3, size);
+                    assertEquals(Math.min(size, all.length - at), count);
+                    assertArrayEquals(Arrays.copyOfRange(all, at, at + count), Arrays.copyOfRange(buffer, 3, 3 + count));
+                    for (int i = 0; i < 3; i++) assertEquals(0x55, buffer[i]);
+                    for (int i = 3 + count; i < buffer.length; i++) assertEquals(0x55, buffer[i]);
+                    at += count;
+                }
+                assertEquals(-1, in.read(buffer)); assertEquals(-1, in.read()); assertEquals(0, in.read(buffer, 3, 0));
+                assertThrows(IndexOutOfBoundsException.class, () -> in.read(buffer, -1, 1));
+                assertThrows(IndexOutOfBoundsException.class, () -> in.read(buffer, 3, buffer.length));
+            }
+        }
+    }
+    @Test public void packedReadReturnsAvailableBytesWithoutWaitingForAnotherRecord() throws Exception {
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try (Harness h = new Harness()) {
+            h.hello("pcm"); h.read(); InputStream in = h.duplex.input();
+            h.socket.response("{}"); byte[] bytes = new byte[Frame.MAX_PAYLOAD];
+            Future<Integer> read = pool.submit(() -> in.read(bytes));
+            assertEquals(Integer.valueOf(14), read.get(2, TimeUnit.SECONDS));
+            assertArrayEquals(new VoicePacket(VoicePacket.JSON, 0, 0, "{}".getBytes(StandardCharsets.UTF_8)).encode(), Arrays.copyOf(bytes, 14));
+            Future<?> waiting = pool.submit(() -> assertThrows(IOException.class, () -> in.read(bytes)));
+            h.duplex.close(); waiting.get(2, TimeUnit.SECONDS);
+        } finally { pool.shutdownNow(); assertTrue(pool.awaitTermination(3, TimeUnit.SECONDS)); }
+    }
+    @Test public void cancelAfterPackedReadDiscardsTheQueuedRemainderInsteadOfReturningIt() throws Exception {
+        try (Harness h = new Harness()) {
+            h.hello("pcm"); h.read(); InputStream in = h.duplex.input();
+            String json = "{\"a\":\"" + "x".repeat(116) + "\"}";
+            h.socket.response(json); h.socket.response(json);
+            assertEquals(Frame.MAX_PAYLOAD, in.read(new byte[Frame.MAX_PAYLOAD]));
+            h.duplex.close();
+            assertThrows(IOException.class, () -> in.read(new byte[Frame.MAX_PAYLOAD]));
+        }
+    }
     @Test public void providerErrorIsGenericAndCloseUnblocksReaderAndQueueProducer() throws Exception {
         try (Harness h = new Harness()) {
             h.hello("opus");

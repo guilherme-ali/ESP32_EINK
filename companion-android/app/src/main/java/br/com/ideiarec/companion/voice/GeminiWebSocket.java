@@ -3,6 +3,7 @@ package br.com.ideiarec.companion.voice;
 import android.net.DnsResolver;
 import android.os.CancellationSignal;
 import br.com.ideiarec.companion.protocol.HostPolicy;
+import java.io.BufferedOutputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.EOFException;
 import java.io.IOException;
@@ -48,7 +49,7 @@ final class GeminiWebSocket implements VoiceDuplex.LiveSocket {
     private SSLSocket tls;
     private CancellationSignal dnsCancellation;
     private final CompletableFuture<List<InetAddress>> addresses = new CompletableFuture<>();
-    private volatile OutputStream output;
+    private volatile BufferedOutputStream output;
     private volatile boolean closed;
     private boolean started;
     @FunctionalInterface interface TcpFactory { Socket create() throws IOException; }
@@ -85,7 +86,8 @@ final class GeminiWebSocket implements VoiceDuplex.LiveSocket {
             finally { java.util.Arrays.fill(request, (byte) 0); }
             verifyUpgrade(readHeaders(in), challenge);
             secure.setSoTimeout(90000);
-            synchronized (lifecycle) { if (closed) throw failure(); output = out; }
+            // Buffer only WebSocket frames, never the handshake containing the API key.
+            synchronized (lifecycle) { if (closed) throw failure(); output = new BufferedOutputStream(out, 4096); }
             Thread reader = new Thread(() -> {
                 boolean normal = false;
                 try { normal = readMessages(in, listener); }

@@ -9,6 +9,8 @@ enum class DiagnosticRoute : uint8_t { Auto, WifiOnly, PhoneOnly };
 enum class DiagnosticMedia : uint8_t { Legacy, Pcm, Opus64, Opus48, Opus32 };
 
 namespace NetworkRoute {
+// Normal BOOT/PTT sessions use compressed phone audio, not the legacy benchmark.
+constexpr DiagnosticMedia kDefaultPhoneMedia = DiagnosticMedia::Opus48;
 #if defined(ARDUINO_ARCH_ESP32)
 // Lifecycle configure/connect/finish no coordenador, fora de callbacks.
 // configure: apenas sem sessão/clientes/tasks concorrentes. Copia só BLE/PIN.
@@ -26,7 +28,7 @@ void finish();
 bool recover(uint32_t timeoutMs = 8000);
 // Extra para reservar orçamento nativo antes de fallback; leitura thread-safe.
 bool fallbackEnabled();
-// Volatile benchmark override. Reset by finish(); never persisted.
+// Volatile benchmark overrides. finish() restores Auto and kDefaultPhoneMedia.
 void setDiagnosticRoute(DiagnosticRoute route);
 DiagnosticRoute diagnosticRoute();
 // Diagnostic-only A/B for the old BLE full-response buffer versus responseReady playback.
@@ -55,7 +57,7 @@ inline DiagnosticRoute diagnosticRoute() { return DiagnosticRoute::Auto; }
 inline void setDiagnosticEarlyPlayback(bool) {}
 inline bool diagnosticEarlyPlayback() { return true; }
 inline void setDiagnosticMedia(DiagnosticMedia) {}
-inline DiagnosticMedia diagnosticMedia() { return DiagnosticMedia::Legacy; }
+inline DiagnosticMedia diagnosticMedia() { return kDefaultPhoneMedia; }
 inline void finishRetainingPhone(uint32_t = 30000) { finish(); }
 inline void service() {}
 #endif

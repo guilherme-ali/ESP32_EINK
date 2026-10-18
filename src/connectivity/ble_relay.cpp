@@ -318,7 +318,7 @@ class ServerCallbacks final : public NimBLEServerCallbacks {
         }
         if (trusted) {
             // Negociar desempenho depois de concluir SMP, fora do stateMux.
-            server->updateConnParams(info.getConnHandle(), 6, 12, 0, 400);
+            server->updateConnParams(info.getConnHandle(), 6, 6, 0, 400);
             server->setDataLen(info.getConnHandle(), 251);
             server->updatePhy(info.getConnHandle(), BLE_GAP_LE_PHY_2M_MASK, BLE_GAP_LE_PHY_2M_MASK, 0);
         }

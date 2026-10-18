@@ -1,5 +1,6 @@
 import csv
 import importlib.util
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -34,6 +35,17 @@ def event(tag, **fields):
 
 class AcousticMetricsTest(unittest.TestCase):
     rate = 8000
+
+    def test_full_playback_cannot_label_progressive_opus_as_buffered(self):
+        for media in ("default", "opus64", "opus48", "opus32"):
+            arguments = ["benchmark_voice.py", "--wav", "unused.wav", "--routes", "phone",
+                         "--media", media, "--playback", "full"]
+            with self.subTest(media=media), patch.object(benchmark.sys, "argv", arguments), \
+                    patch.object(benchmark.sys, "stderr", io.StringIO()) as errors:
+                with self.assertRaises(SystemExit) as stopped:
+                    benchmark.main()
+                self.assertEqual(stopped.exception.code, 2)
+                self.assertIn("Opus usa reproducao progressiva", errors.getvalue())
 
     def fixture(self, amplitude=0.03):
         prompt = voice(self.rate, 0.4)
@@ -118,6 +130,19 @@ class AcousticMetricsTest(unittest.TestCase):
         self.assertEqual(result["detection_status"], "ambiguous")
         self.assertIsNone(result["latency_ms"])
 
+    def test_sub_lsb_energy_is_not_response(self):
+        recording, prompt, _, finish, _ = self.fixture(amplitude=0.8 / 32768)
+        result = self.measure(recording, prompt)
+        self.assertEqual(result["detection_status"], "no_response")
+        self.assertGreaterEqual(result["onset_threshold"], 3 / 32768)
+
+    def test_low_correlation_capture_is_not_physical_evidence(self):
+        recording, prompt, start, finish, _ = self.fixture()
+        recording[start:finish, 0] = (0.06 * prompt + voice(self.rate, 0.4, seed=72))
+        result = self.measure(recording, prompt)
+        self.assertEqual(result["detection_reason"], "prompt_alignment")
+        self.assertIsNone(result["latency_ms"])
+
     def test_repeated_prompt_has_ambiguous_alignment(self):
         recording, prompt, start, _, _ = self.fixture()
         recording[start + 7000:start + 7000 + len(prompt), 0] = prompt * 0.7
@@ -150,6 +175,85 @@ class AcousticMetricsTest(unittest.TestCase):
                                   (np.full((16000, 1), np.nan), np.ones(800))):
             with self.subTest(shape=recording.shape):
                 self.assertIsNone(self.measure(recording, prompt)["latency_ms"])
+
+
+class TimingSanityTest(unittest.TestCase):
+    def check_timing(self, latency_ms, first_ms, lateness=0.0, prompt_adc_delay=0.0):
+        rate = 8000
+        onset = {"detection_status": "ok", "prompt_end_frame": 7200,
+                 "response_onset_frame": 7200 + round(latency_ms * rate / 1000), "latency_ms": latency_ms}
+        capture = benchmark.AudioCapture(np.zeros((3200, 1)), rate, 100000, 80, np)
+        capture.frames, capture.blocks = 100000, 1
+        capture.adc_times[0], capture.adc_offsets[0], capture.adc_sizes[0] = 100 + prompt_adc_delay, 0, 100000
+        capture.prompt_end_dac = 100.9
+        firmware = {"release_us": "5000000", "first_i2s_us": str(5000000 + round(first_ms * 1000))}
+        return benchmark.timing_sanity(onset, firmware, capture, lateness), onset, capture, firmware
+
+    def test_40ms_vs_8795ms_is_rejected_without_replacing_acoustic_onset(self):
+        result, onset, _, _ = self.check_timing(40, 8795.403)
+        self.assertFalse(result["timing_sanity_valid"])
+        self.assertEqual(result["timing_sanity_reason"], "acoustic_onset_before_firmware_playback")
+        self.assertEqual(onset["latency_ms"], 40)
+        self.assertAlmostEqual(result["acoustic_firmware_delta_ms_diagnostic"], -8755.403)
+
+    def test_delayed_onset_vs_firmware_runtime_is_rejected(self):
+        result, _, _, _ = self.check_timing(6120, 1681.638)
+        self.assertFalse(result["timing_sanity_valid"])
+        self.assertEqual(result["timing_sanity_reason"], "acoustic_onset_late_vs_firmware_playback")
+
+    def test_sound_cannot_precede_i2s_by_half_a_second(self):
+        result, _, _, _ = self.check_timing(925, 1639.337)
+        self.assertFalse(result["timing_sanity_valid"])
+        self.assertEqual(result["timing_sanity_reason"], "acoustic_onset_before_firmware_playback")
+        self.assertEqual(result["timing_sanity_early_tolerance_ms"], 100)
+
+    def test_normal_timing_preserves_measured_latency(self):
+        result, onset, _, _ = self.check_timing(1900, 1681.638)
+        self.assertTrue(result["timing_sanity_valid"])
+        self.assertEqual(onset["latency_ms"], 1900)
+        self.assertEqual(result["timing_sanity_tolerance_ms"], 750)
+
+    def test_known_release_lateness_is_not_assumed_zero(self):
+        result, _, _, _ = self.check_timing(2100, 100, lateness=2.0)
+        self.assertTrue(result["timing_sanity_valid"])
+        self.assertAlmostEqual(result["acoustic_onset_after_release_ms_diagnostic"], 100)
+
+    def test_adc_dac_prompt_delay_is_not_arbitrarily_removed(self):
+        result, _, _, _ = self.check_timing(100, 100, prompt_adc_delay=2.0)
+        self.assertFalse(result["timing_sanity_valid"])
+        self.assertAlmostEqual(result["acoustic_onset_after_release_ms_diagnostic"], 2100)
+
+    def test_missing_references_fail_closed(self):
+        _, onset, capture, firmware = self.check_timing(100, 100)
+        for missing in ("adc", "dac", "release", "firmware"):
+            with self.subTest(missing=missing):
+                capture.adc_times[0] = np.nan if missing == "adc" else 100
+                capture.prompt_end_dac = None if missing == "dac" else 100.9
+                result = benchmark.timing_sanity(onset, {} if missing == "firmware" else firmware,
+                                                 capture, None if missing == "release" else 0)
+                self.assertFalse(result["timing_sanity_valid"])
+                self.assertEqual(result["timing_sanity_reason"], "timing_reference_missing")
+
+
+class WasapiSettingsTest(unittest.TestCase):
+    def test_default_preserves_fake_without_querying_hardware(self):
+        sd = SimpleNamespace()
+        self.assertIsNone(benchmark.wasapi_extra_settings(sd, (0, 1), False))
+
+    def test_exclusive_applies_only_to_wasapi(self):
+        settings = [object(), object()]
+        sd = SimpleNamespace(query_devices=Mock(side_effect=[{"hostapi": 2}, {"hostapi": 2}]),
+                             query_hostapis=Mock(return_value={"name": "Windows WASAPI"}),
+                             WasapiSettings=Mock(side_effect=settings))
+        self.assertEqual(benchmark.wasapi_extra_settings(sd, (15, 12), True), tuple(settings))
+        self.assertEqual(sd.WasapiSettings.call_count, 2)
+        sd.WasapiSettings.assert_called_with(exclusive=True)
+        sd.query_hostapis.return_value = {"name": "Windows DirectSound"}
+        sd.query_devices.side_effect = [{"hostapi": 1}, {"hostapi": 1}]
+        sd.WasapiSettings.reset_mock()
+        with self.assertRaisesRegex(ValueError, "WASAPI"):
+            benchmark.wasapi_extra_settings(sd, (0, 1), True)
+        sd.WasapiSettings.assert_not_called()
 
 
 class PromptAndParsingTest(unittest.TestCase):
@@ -237,14 +341,14 @@ class TurnTrackerTest(unittest.TestCase):
 
     def test_phone_requires_exact_selected_profile_and_wifi_requires_legacy(self):
         for route in ("wifi", "phone"):
-            for requested in benchmark.MEDIA_PROFILES:
+            for requested in ("default", *benchmark.MEDIA_PROFILES):
                 for actual in benchmark.MEDIA_PROFILES:
                     with self.subTest(route=route, requested=requested, actual=actual):
                         tracker = benchmark.TurnTracker()
                         tracker.ready([self.ready_event()])
                         tracker.observe(event("AssistantMedia", turn=42, media=actual, tx_bytes=123, rx_bytes=456))
                         result = tracker.media_result(route, requested)
-                        expected = "legacy" if route == "wifi" else requested
+                        expected = "legacy" if route == "wifi" else "opus48" if requested == "default" else requested
                         self.assertEqual(result["media_expected"], expected)
                         self.assertEqual(result["media_actual"], actual)
                         self.assertEqual(result["media_valid"], actual == expected)
@@ -483,7 +587,7 @@ class PersistenceAndFailureTest(unittest.TestCase):
             self.assertEqual(benchmark.restore_defaults(session), [])
         commands = [call.args[0] for call in session.command.call_args_list]
         self.assertEqual(commands.count("benchmark-route auto"), 2)
-        self.assertEqual(commands[-1], "benchmark-media legacy")
+        self.assertEqual(commands[-1], "benchmark-media default")
         session = Mock()
         session.command.side_effect = TimeoutError("disconnected")
         with patch.object(benchmark.time, "sleep"):
@@ -563,8 +667,9 @@ class PersistenceAndFailureTest(unittest.TestCase):
         class Session:
             started = released = delivered = False
 
-            def __init__(self, route, actual, media_turn):
+            def __init__(self, route, actual, media_turn, first_ms=100):
                 self.route, self.actual, self.media_turn = route, actual, media_turn
+                self.first_ms = first_ms
 
             def command(self, command, *args, **kwargs):
                 if command == "assistant-start":
@@ -575,12 +680,13 @@ class PersistenceAndFailureTest(unittest.TestCase):
 
             def send(self, command):
                 self.released = True
-                return 123
+                return benchmark.time.perf_counter_ns()
 
             def read(self):
                 if self.released and not self.delivered:
                     self.delivered = True
-                    events = [event("AssistantMetrics", turn=7, route="wifi" if self.route == "wifi" else "ble")]
+                    events = [event("AssistantMetrics", turn=7, route="wifi" if self.route == "wifi" else "ble",
+                                    release_us=5000000, first_i2s_us=5000000 + round(self.first_ms * 1000))]
                     if self.actual is not None:
                         events.append(event("AssistantMedia", turn=self.media_turn, media=self.actual,
                                             tx_bytes=0 if self.actual == "legacy" else 123,
@@ -589,16 +695,25 @@ class PersistenceAndFailureTest(unittest.TestCase):
                 return []
 
         class Stream:
-            device, latency, blocksize, samplerate, time = (0, 1), (0.01, 0.01), 80, 8000, 2
+            device, latency, blocksize, samplerate, time = (0, 1), (0.01, 0.01), 80, 8000, 0.9
 
             def __init__(self, **kwargs):
                 self.capture = kwargs["callback"].__self__
+                if args.wasapi_exclusive:
+                    self_settings = kwargs["extra_settings"]
+                    assert len(self_settings) == 2 and all(item.exclusive for item in self_settings)
+                else:
+                    assert "extra_settings" not in kwargs
 
             def start(self):
                 self.capture.recording[:len(recording)] = recording
                 self.capture.frames = len(recording)
                 self.capture.prompt_output_frame = 4000
                 self.capture.prompt_end_dac = 0.9
+                self.capture.blocks = 1
+                self.capture.adc_times[0] = 0
+                self.capture.adc_offsets[0] = 0
+                self.capture.adc_sizes[0] = len(recording)
 
             def stop(self):
                 pass
@@ -611,28 +726,38 @@ class PersistenceAndFailureTest(unittest.TestCase):
         cases = (("wifi", "legacy", "legacy", 7, False, ""),
                  ("wifi", "opus64", "legacy", 7, False, ""),
                  ("phone", "opus64", "opus64", 7, False, ""),
+                 ("phone", "default", "opus48", 7, False, ""),
+                 ("phone", "default", "legacy", 7, False, "media_profile_mismatch"),
                  ("phone", "opus64", "pcm", 7, False, "media_profile_mismatch"),
                  ("wifi", "opus64", "opus64", 7, False, "media_profile_mismatch"),
                  ("wifi", "legacy", None, 7, False, "media_telemetry_missing"),
                  ("phone", "opus64", None, 7, False, "media_telemetry_missing"),
                  ("phone", "opus64", "opus64", 6, False, "media_telemetry_missing"),
+                 ("wifi", "legacy", "legacy", 7, False, "acoustic_onset_before_firmware_playback"),
                  ("wifi", "legacy", "legacy", 7, True, "synthetic_analysis_failure"))
         for route, requested, actual, media_turn, failure, reason in cases:
             with self.subTest(route=route, requested=requested, actual=actual, media_turn=media_turn, analysis_error=failure), tempfile.TemporaryDirectory(dir=TEMP_ROOT) as folder:
                 args.media = requested
+                args.wasapi_exclusive = route == "phone"
+                sd = SimpleNamespace(Stream=Stream, query_devices=Mock(return_value={"hostapi": 2}),
+                                     query_hostapis=Mock(return_value={"name": "Windows WASAPI"}),
+                                     WasapiSettings=lambda **kwargs: SimpleNamespace(**kwargs))
                 log = benchmark.RunLog(Path(folder), {})
                 log.trial_id = "trial-0001"
                 try:
                     with patch.object(benchmark, "onset_metrics", wraps=analyze,
                                       side_effect=RuntimeError("synthetic_analysis_failure") if failure else None) as detector:
-                        result = benchmark.run_trial(args, Session(route, actual, media_turn), log, np, SimpleNamespace(Stream=Stream), (0, 1),
+                        result = benchmark.run_trial(args, Session(route, actual, media_turn,
+                                                     8795.403 if reason == "acoustic_onset_before_firmware_playback" else 100), log, np, sd, (0, 1),
                                                      (Path("fixture.wav"), prompt, "digest", 8000), route, 1, 1, None)
                     if failure:
                         self.assertEqual(result["status"], "error")
                     else:
                         self.assertEqual(result["status"], "invalid" if reason else "valid")
-                        self.assertAlmostEqual(result["latency_ms"], 100, delta=10)
-                        self.assertIsNone(result["prompt_dac_end_adc_frame_diagnostic"])
+                        self.assertAlmostEqual(result["candidate_latency_ms_diagnostic"] if reason else result["latency_ms"], 100, delta=10)
+                        if reason:
+                            self.assertIsNone(result["latency_ms"])
+                        self.assertEqual(result["prompt_dac_end_adc_frame_diagnostic"], 7200)
                         with wave.open(result["recording"], "rb") as wav:
                             saved = np.frombuffer(wav.readframes(wav.getnframes()), dtype="<i2").astype(np.float32) / 32768
                         np.testing.assert_array_equal(detector.call_args.args[0].reshape(-1), saved)
@@ -641,7 +766,7 @@ class PersistenceAndFailureTest(unittest.TestCase):
                     if reason:
                         self.assertIn(reason, result["failure_reason"])
                     saved_result = json.loads((log.directory / "trial-0001.json").read_text(encoding="utf-8"))
-                    self.assertEqual(saved_result["media_expected"], "legacy" if route == "wifi" else requested)
+                    self.assertEqual(saved_result["media_expected"], "legacy" if route == "wifi" else "opus48" if requested == "default" else requested)
                     self.assertEqual(saved_result["media_actual"], actual if media_turn == 7 else None)
                     if actual is not None and media_turn == 7:
                         self.assertEqual(saved_result["assistant_media"]["turn"], "7")

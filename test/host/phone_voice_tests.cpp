@@ -14,6 +14,12 @@ static std::deque<uint8_t> incoming;
 static std::vector<uint8_t> outgoing;
 static std::vector<Media::Header> sent;
 static std::vector<std::vector<uint8_t>> sentBodies;
+static std::vector<uint8_t> written;
+static std::vector<size_t> writeSizes;
+static size_t packetBytes = 4, shortWriteAt, shortBytes;
+static unsigned encodeCalls, cancelAfterEncode, closeAfterEncode;
+static bool canceled;
+static PhoneVoice *encodingVoice;
 #define CHECK(x) do { ++checks; if (!(x)) { std::cerr << __LINE__ << ": " #x "\n"; std::exit(1); } } while (0)
 uint32_t millis() { return clockMs; }
 uint64_t assistantMonotonicUs() { return uint64_t(clockMs) * 1000; }
@@ -23,7 +29,12 @@ bool VoiceOpus::begin(int) { lookahead_ = 104; return true; }
 int VoiceOpus::encoderLookahead() const { return lookahead_; }
 void VoiceOpus::resetDecoder() { ++resets; }
 int VoiceOpus::encode(const int16_t *, size_t n, uint8_t *out, size_t cap) {
-  CHECK(n == 320 && cap >= 4); memset(out, 17, 4); return 4;
+  CHECK(n == 320 && cap >= packetBytes);
+  ++encodeCalls;
+  for (size_t i = 0; i < packetBytes; ++i) out[i] = uint8_t(17 + encodeCalls + i);
+  if (encodeCalls == cancelAfterEncode) canceled = true;
+  if (encodeCalls == closeAfterEncode && encodingVoice) encodingVoice->close();
+  return static_cast<int>(packetBytes);
 }
 int VoiceOpus::decode(const uint8_t *, size_t, int16_t *out, size_t n) {
   CHECK(n == 480); for (size_t i = 0; i < n; ++i) out[i] = static_cast<int16_t>(i); return 480;
@@ -50,7 +61,10 @@ int read(int, uint8_t *bytes, size_t n) {
   return static_cast<int>(take);
 }
 size_t write(int, const uint8_t *p, size_t n, uint32_t) {
-  outgoing.insert(outgoing.end(), p, p + n);
+  writeSizes.push_back(n);
+  const size_t done = writeSizes.size() == shortWriteAt ? std::min(n, shortBytes) : n;
+  written.insert(written.end(), p, p + done);
+  outgoing.insert(outgoing.end(), p, p + done);
   while (outgoing.size() >= Media::kHeaderSize) {
     Media::Header h; CHECK(Media::decodeHeader(outgoing.data(), h));
     if (outgoing.size() < Media::kHeaderSize + h.length) break;
@@ -66,7 +80,7 @@ size_t write(int, const uint8_t *p, size_t n, uint32_t) {
     }
     outgoing.erase(outgoing.begin(), outgoing.begin() + Media::kHeaderSize + h.length);
   }
-  return n;
+  return done;
 }
 }
 static WsParser::Event wait(PhoneVoice &voice) {
@@ -75,8 +89,36 @@ static WsParser::Event wait(PhoneVoice &voice) {
   }
   CHECK(false); return WsParser::Event::Error;
 }
-static bool stop(void *) { return false; }
-static void reset() { incoming.clear(); outgoing.clear(); sent.clear(); sentBodies.clear(); readCount = clockMs = resets = 0; }
+static bool stop(void *) { return canceled; }
+static void reset() {
+  incoming.clear(); outgoing.clear(); sent.clear(); sentBodies.clear(); written.clear(); writeSizes.clear();
+  readCount = clockMs = resets = encodeCalls = cancelAfterEncode = closeAfterEncode = 0;
+  packetBytes = 4; shortWriteAt = shortBytes = 0; canceled = false; encodingVoice = nullptr;
+}
+static std::vector<uint8_t> upload(std::vector<uint8_t> &arena, size_t packet, size_t block, unsigned total) {
+  reset(); packetBytes = packet;
+  PhoneVoice voice(arena.data() + 1, Media::kJsonLimit + 1, stop, nullptr);
+  CHECK(voice.connect("not-a-secret-test-key", 48000));
+  CHECK(voice.sendJson("{\"before\":true}"));
+  std::vector<uint8_t> pcm(total * 2, 123);
+  for (size_t at = 0; at < pcm.size();) {
+    const size_t n = std::min(block, pcm.size() - at);
+    const unsigned before = encodeCalls, time = clockMs;
+    const size_t records = sent.size();
+    CHECK(voice.sendAudio(pcm.data() + at, n));
+    CHECK(clockMs == time); // No timer/delay and no complete record retained across calls.
+    CHECK(sent.size() - records == encodeCalls - before);
+    CHECK(outgoing.empty());
+    at += n;
+  }
+  CHECK(voice.sendJson("{\"after\":true}"));
+  CHECK(sent.back().type == Media::Type::Json);
+  CHECK(voice.endInput());
+  CHECK(outgoing.empty() && sent.back().type == Media::Type::EndInput);
+  CHECK(sent.back().position == total && voice.sentBytes() == written.size());
+  CHECK(arena.front() == 0xA5 && arena.back() == 0xA5);
+  return written;
+}
 int main() {
   // Canary surrounds the receive arena to expose sign/offset errors.
   std::vector<uint8_t> arena(Media::kJsonLimit + 3, 0xA5);
@@ -121,5 +163,70 @@ int main() {
     linked = false; CHECK(wait(voice) == WsParser::Event::Error);
     CHECK(arena.front() == 0xA5 && arena.back() == 0xA5);
   }
-  std::cout << "PhoneVoice: " << checks << " checks (partial reads, -1, profiles, samples, segments, canaries) OK\n";
+  // A frame-per-call reference preserves the original write granularity and wire bytes.
+  for (size_t packet : {size_t(4), size_t(120), size_t(160), size_t(173), size_t(676), Media::kPacketLimit}) {
+    for (unsigned total : {1u, 319u, 320u, 321u, 5120u, 5121u, 16001u}) {
+      const auto reference = upload(arena, packet, 640, total);
+      for (size_t block : {size_t(638), size_t(2048), size_t(8192), size_t(10240)}) {
+        CHECK(upload(arena, packet, block, total) == reference);
+        for (size_t n : writeSizes) CHECK(n <= 1384);
+      }
+    }
+  }
+  for (size_t packet : {size_t(120), size_t(160), size_t(676)}) {
+    const auto reference = upload(arena, packet, 640, 5120);
+    const size_t separate = writeSizes.size();
+    CHECK(upload(arena, packet, 16 * 640, 5120) == reference);
+    CHECK(writeSizes.size() < separate);
+    if (packet == 676) CHECK(std::count(writeSizes.begin(), writeSizes.end(), size_t(1384)) == 8);
+  }
+  // Closing/canceling with one staged record must never flush it, even in the destructor.
+  for (bool cancel : {false, true}) {
+    reset(); packetBytes = 120;
+    {
+      PhoneVoice voice(arena.data() + 1, Media::kJsonLimit + 1, stop, nullptr);
+      CHECK(voice.connect("not-a-secret-test-key", 48000));
+      encodingVoice = &voice;
+      if (cancel) cancelAfterEncode = 2; else closeAfterEncode = 2;
+      const auto prefix = written;
+      const size_t calls = writeSizes.size();
+      std::vector<uint8_t> pcm(16 * 640, 123);
+      CHECK(!voice.sendAudio(pcm.data(), pcm.size()));
+      CHECK(!linked && written == prefix && writeSizes.size() == calls);
+      canceled = false;
+      CHECK(!voice.sendJson("{}"));
+      voice.close();
+      CHECK(written == prefix && writeSizes.size() == calls);
+    }
+    CHECK(writeSizes.size() == 1); // HELLO only; destructor did not send pending audio/tail.
+  }
+  // A short batch write accepts only a prefix and closes without retrying any bytes.
+  for (size_t accepted : {size_t(0), size_t(1), size_t(175), size_t(1231)}) {
+    reset(); packetBytes = 160;
+    PhoneVoice voice(arena.data() + 1, Media::kJsonLimit + 1, stop, nullptr);
+    CHECK(voice.connect("not-a-secret-test-key", 48000));
+    shortWriteAt = writeSizes.size() + 1; shortBytes = accepted;
+    const size_t prefix = written.size();
+    std::vector<uint8_t> pcm(16 * 640, 123);
+    CHECK(!voice.sendAudio(pcm.data(), pcm.size()));
+    CHECK(!linked && writeSizes.back() == 1232 && written.size() == prefix + accepted);
+    CHECK(voice.sentBytes() == prefix + accepted);
+    CHECK(strstr(voice.error(), "sem replay") != nullptr);
+    const auto failed = written;
+    const size_t calls = writeSizes.size();
+    CHECK(!voice.endInput()); CHECK(!voice.sendJson("{}")); voice.close();
+    CHECK(written == failed && writeSizes.size() == calls);
+  }
+  // Failure while flushing the padded endInput tail must not emit END_INPUT.
+  reset();
+  {
+    PhoneVoice voice(arena.data() + 1, Media::kJsonLimit + 1, stop, nullptr);
+    CHECK(voice.connect("not-a-secret-test-key", 48000));
+    const uint8_t sample[] = {1, 2};
+    CHECK(voice.sendAudio(sample, sizeof(sample)) && encodeCalls == 0);
+    shortWriteAt = writeSizes.size() + 1; shortBytes = 1;
+    CHECK(!voice.endInput() && !linked);
+    CHECK(sent.back().type == Media::Type::Hello && writeSizes.size() == 2);
+  }
+  std::cout << "PhoneVoice: " << checks << " checks (stream bytes, batching, tails, cancel, short writes, profiles, canaries) OK\n";
 }

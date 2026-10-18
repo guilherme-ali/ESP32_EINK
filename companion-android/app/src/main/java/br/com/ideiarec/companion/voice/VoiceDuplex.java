@@ -79,11 +79,15 @@ public final class VoiceDuplex implements RelayEngine.Duplex {
                     }
                     if (closed) throw invalid();
                     if (queue.isEmpty() && eof) return -1;
-                    byte[] head = queue.element(); int n = Math.min(len, head.length - queueOffset);
-                    System.arraycopy(head, queueOffset, b, off, n);
-                    queueOffset += n; queuedBytes -= n;
-                    if (queueOffset == head.length) { queue.remove(); queueOffset = 0; }
-                    queueLock.notifyAll(); return n;
+                    int total = 0;
+                    // Pack only bytes already queued; never wait to fill a relay DATA frame.
+                    while (total < len && !queue.isEmpty()) {
+                        byte[] head = queue.element(); int n = Math.min(len - total, head.length - queueOffset);
+                        System.arraycopy(head, queueOffset, b, off + total, n);
+                        queueOffset += n; queuedBytes -= n; total += n;
+                        if (queueOffset == head.length) { queue.remove(); queueOffset = 0; }
+                    }
+                    queueLock.notifyAll(); return total;
                 }
             }
             @Override public void close() { VoiceDuplex.this.close(); }

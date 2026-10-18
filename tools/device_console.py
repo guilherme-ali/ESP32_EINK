@@ -15,7 +15,7 @@ def main():
                                   "assistant-ptt", "assistant-models", "assistant-enable",
                                   "benchmark-route auto", "benchmark-route wifi", "benchmark-route phone",
                                   "benchmark-playback full", "benchmark-playback ready",
-                                  "benchmark-media legacy", "benchmark-media pcm", "benchmark-media opus64",
+                                   "benchmark-media default", "benchmark-media legacy", "benchmark-media pcm", "benchmark-media opus64",
                                   "benchmark-media opus48", "benchmark-media opus32"])
     parser.add_argument("--port", default="COM7")
     parser.add_argument("--timeout", type=float, default=30)

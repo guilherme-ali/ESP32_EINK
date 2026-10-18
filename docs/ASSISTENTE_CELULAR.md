@@ -136,7 +136,7 @@ Samsung. Validar no conjunto real:
 6. Mesmo teste por Wi-Fi com celular desligado.
 7. Retorno ao deep sleep e comparação de consumo.
 
-O caminho legado transporta PCM/base64 do Live pelo canal BLE. A velocidade
+O caminho legado, disponível para diagnóstico, transporta PCM/base64 do Live pelo canal BLE. A velocidade
 e a latência dependem do rádio, do Android e da rede; não há garantia de
 “resposta instantânea”. O link pode ser retido por até 30 s enquanto o aparelho
 já estiver acordado, sem prolongar o prazo de deep sleep. A sessão Gemini continua
@@ -146,9 +146,11 @@ independente por pergunta. O deep sleep desliga a conexão BLE.
 
 Instrumentação com relógios monotônicos de microssegundos no ESP32 (`[AssistantMetrics]` e `[AssistantMedia]`),
 rotas exclusivas sem fallback (`benchmark-route wifi` e `benchmark-route phone`), janela de 8 créditos com `WRITE_NR`
-e perfis comparativos de mídia (`benchmark-media legacy|pcm|opus64|opus48|opus32`).
+e perfis comparativos de mídia (`benchmark-media default|legacy|pcm|opus64|opus48|opus32`).
 
-Resultados medidos no conjunto real (ESP32-S3 + Galaxy S26 + Gemini Live):
+Registros históricos exploratórios (ESP32-S3 + Galaxy S26 + Gemini Live).
+Os turnos têm perguntas/respostas e condições diferentes; não são uma comparação
+pareada de latência nem demonstram qualidade perceptiva equivalente:
 
 | Perfil / Transporte | Dados TX | Dados RX | Tempo Upload | Tempo Download | Tempo Total do Turno | Início Reprodução I2S | Rebuffers | Estado |
 |---|---|---|---|---|---|---|---|---|
@@ -159,17 +161,61 @@ Resultados medidos no conjunto real (ESP32-S3 + Galaxy S26 + Gemini Live):
 | **BLE Mídia v1 `opus32` (32 kbit/s)** | 14,5 KB | 13,5 KB | 4,8 s (~3,0 KB/s) | 4,1 s (~3,3 KB/s) | **10,55 s** | **8,94 s** (progressivo) | 0 | OK |
 | **BLE Mídia v1 `opus48` (48 kbit/s)** | 19,8 KB | 12,7 KB | 4,7 s (~4,2 KB/s) | 3,1 s (~4,1 KB/s) | **9,33 s** | **8,74 s** (progressivo) | 0 | OK |
 
-**Principais conclusões comprovadas:**
-1. **Meta de latência atingida no perfil `opus48`:** o tempo total do turno caiu de **78,05 s** (BLE legado) para **9,33 s** no BLE com Opus 48 kbit/s, ficando a apenas **0,83 s do Wi-Fi direto** (8,5 s).
-2. **Redução maciça de tráfego:** o volume de dados de upload foi reduzido em **82%** (de 110,6 KB para 19,8 KB) e o de download em **94,7%** (de 240 KB para 12,7 KB).
-3. **Reprodução progressiva fluida:** com o prebuffer de 1,5 s (`kOpusPrebufferBytes = 72000`), a reprodução de voz iniciou sem nenhum rebuffer (`rebuffer = 0`) em todos os ensaios Opus.
-4. **Custo de CPU no ESP32-S3:** o encode a 16 kHz consumiu cerca de 32% de 1 núcleo e o decode a 24 kHz apenas 15% de 1 núcleo, mantendo folga de stack superior a 9,6 KB.
-5. **Necessidade comprovada do codec:** o ensaio com PCM binário descompactado (`pcm`) demonstrou que remover apenas o base64 ainda resulta em 44 s de espera, pois o PCM descompactado demanda 32–48 KB/s contra ~5,3 KB/s de vazão sustentada do GATT BLE. O codec é indispensável para operar dentro da banda do rádio.
+**Limites da interpretação:**
+1. A alegação anterior de meta atingida por uma diferença de 0,83 s estava incorreta: subtraía tempos totais de turnos distintos, não a espera após a pergunta. A meta BLE até Wi-Fi +1 s permanece não comprovada.
+2. Contadores de mídia não representam todo o tráfego no rádio. Comparar percentuais de bytes de respostas diferentes também não isola o ganho do codec.
+3. `rebuffer=0` indica ausência de esvaziamento detectado naquele turno, não aprovação de escuta, ausência universal de cortes ou latência acústica validada.
+4. A vazão observada nesses pilotos não é teto físico do BLE. Rádio, créditos, callbacks, framing, TLS e codec precisam ser separados na medição.
+5. No piloto legado `pilot-ble-ready/trial-001-phone-short.json`, os marcos do firmware indicam 74,631 s entre soltura e primeiro aceite I2S. O detector acústico marcou esse ensaio como inválido; o número não deve ser publicado como latência acústica.
 
-### Canal de mídia BLE v1 (experimental)
+### Correção do perfil normal (18/10/2026)
+
+O código usa `NetworkRoute::kDefaultPhoneMedia = Opus48` no boot e ao terminar
+uma operação, inclusive na retenção BLE. Antes, Opus só era escolhido no benchmark,
+e o BOOT normal voltava para `legacy`. `benchmark-media default` restaura a seleção
+normal; o harness também usa esse comando ao encerrar, para não deixar um override
+legado na próxima pergunta. O Wi-Fi continua enviando PCM sem compressão.
+
+O companion passa a agrupar as escritas de cada quadro WebSocket antes do flush
+TLS e a preencher DATA com registros de mídia já disponíveis, sem esperar por
+novos registros. O ESP32 solicita intervalo de conexão de 7,5 ms (mínimo e máximo
+de seis unidades de 1,25 ms); o Galaxy S26 confirmou esse intervalo nos pilotos,
+em vez dos 15 ms anteriores. Trata-se de negociação, não garantia para todo telefone.
+O prebuffer comprimido passa a 500 ms, sem alterar o prebuffer PCM do Wi-Fi.
+Na entrada, registros Opus já disponíveis são agrupados em lotes pré-alocados de
+1384 bytes. O worker pode consumir até 8192 bytes de PCM já capturado por rodada,
+sem esperar novas amostras. O fim de `sendAudio`, JSON e `END_INPUT` drenam o lote;
+cancelamento o descarta. O fluxo de bytes, posições, trimming e bitrate não mudam.
+Essas alterações têm testes de stream e lifecycle. A qualidade perceptiva de
+Opus48 foi aprovada pelo usuário como "Sem piora audível" nos testes desta sessão;
+isso não é ABX cego nem prova de transparência universal.
+
+Ensaio final curto: `test/results/voice-benchmark/ble-batched-final/20261018T035133Z-f9ea3d2729f4`.
+Foram feitos três pares, com ordem Wi-Fi/BLE alternada. Todas as seis respostas
+terminaram com `rebuffer=0`; três gravações acústicas foram inválidas por captar
+energia antes do início possível da reprodução. Elas permanecem nos registros.
+O único par completo acusticamente válido foi Wi-Fi 1,825 s e BLE 2,250 s,
+diferença de 0,425 s. Uma pergunta BLE consecutiva teve 1,655 s. Esses números
+são pilotos, não mediana pareada validada para todas as condições.
+
+Os tempos de soltura até primeiro aceite I2S foram 2,211 s no primeiro BLE,
+1,619 s e 1,613 s nos dois BLE seguintes. Houve também um turno Wi-Fi com
+11,015 s nesse marco, incluindo espera pelo servidor; ele não foi descartado.
+Não confundir esses tempos internos com latência acústica.
+
+Uma pergunta média gerou 7,020 s de áudio BLE completos, também sem rebuffer.
+O onset de 0,925 s inicialmente aceito nesse teste médio precedia o I2S em
+mais de 100 ms e não deve ser usado como resultado de latência: motivou o
+critério assimétrico mais conservador descrito abaixo. O relatório de origem
+preserva a versão e os critérios usados na captura, sem reescrita retroativa.
+
+A equivalência estatística Wi-Fi/BLE, ensaios com dados móveis fora de casa e
+vinte pares por condição continuam fora do que estes pilotos comprovam.
+
+### Canal de mídia BLE v1
 
 O Wi-Fi direto continua usando o PCM e o WebSocket existentes. HTTP, sincronização
-Drive e gateway permanecem no relay transparente. Somente a voz BLE opt-in usa um
+Drive e gateway permanecem no relay transparente. A voz BLE comprimida usa um
 canal lógico reservado, aberto como `voice-v1.ideiarec.invalid:443`: esse nome é um
 serviço local explícito, nunca uma consulta DNS nem uma exceção geral à allowlist.
 Companions antigos recusam esse serviço antes do envio da chave ou de áudio.
@@ -181,10 +227,11 @@ A chave permanece em memória durante a sessão e não é salva em logs/configur
 
 | Perfil volátil | Transporte BLE da voz | Uso |
 |---|---|---|
-| `legacy` | WebSocket/JSON/base64 originais | Padrão seguro, sem mudança de qualidade |
+| `default` | Seleção normal do firmware (`opus48`) | Restaura comportamento do BOOT |
+| `legacy` | WebSocket/JSON/base64 originais | Diagnóstico sem compressão, resposta acumulada e alta latência |
 | `pcm` | PCM16 binário, 16 kHz entrada / 24 kHz saída | Referência sem perdas, bitrate negociado zero |
 | `opus64` | Opus mono, 64 kbit/s, frames de 20 ms | Primeiro candidato de qualidade |
-| `opus48` / `opus32` | Opus mono, 48 / 32 kbit/s, frames de 20 ms | Comparações de vazão e escuta |
+| `opus48` / `opus32` | Opus mono, 48 / 32 kbit/s, frames de 20 ms | `opus48` no código normal; `opus32` para comparação |
 
 Cada registro usa cabeçalho de 12 bytes: magic `56 31`, tipo, flags, comprimento
 u32 LE e posição u32 LE em amostras PCM originais. Tipos: HELLO=1, JSON=2, OPUS=3,
@@ -196,11 +243,13 @@ O relay mantém epochs, sequências, ACK por consumo e limites de memória.
 
 Libopus oficial 1.5.2 tem fonte validada por SHA-256; a licença acompanha APK e pacote.
 No ESP32 são usados fixed-point, estados preferencialmente em PSRAM e nenhuma
-alocação no hot path. A task Opus reserva 64 KiB devido ao scratch C99; o watermark
-real é registrado em `AssistantMedia`. O caminho legado/Wi-Fi mantém sua stack.
+alocação no hot path. A task de rede reserva 32 KiB quando pode usar Opus, devido
+ao scratch C99; o watermark real é registrado em `AssistantMedia`. A seleção
+diagnóstica exclusiva Wi-Fi não precisa dessa stack adicional.
 
-Opus não é lossless. Os perfis são experimentais e não viram padrão sem comparação
-de escuta com o mesmo PCM e aprovação de qualidade. A taxa nominal não inclui
+Opus não é lossless. A seleção padrão no código não comprova transparência:
+comparação de escuta com o mesmo PCM e aprovação de qualidade continuam pendentes.
+A taxa nominal não inclui
 enquadramento, ACKs ou VBR; ficar abaixo da vazão média não garante ausência de cortes.
 PCM binário mantém a política acumulada BLE; Opus permite prebuffer progressivo,
 sem retirar o auto-clear do DMA e sem acelerar/descartar amostras para ocultar atrasos.
@@ -212,7 +261,7 @@ python -m venv tools/.venv-benchmark
 tools/.venv-benchmark/Scripts/python.exe -m pip install -r tools/requirements-benchmark.txt
 pwsh -File tools/create_benchmark_wavs.ps1
 tools/.venv-benchmark/Scripts/python.exe tools/benchmark_voice.py --list-devices
-tools/.venv-benchmark/Scripts/python.exe tools/benchmark_voice.py --wav test/results/voice-benchmark/corpus/short.wav --routes wifi,phone --media opus64 --repeats 3 --input-device 15 --output-device 12
+tools/.venv-benchmark/Scripts/python.exe tools/benchmark_voice.py --wav test/results/voice-benchmark/corpus/short.wav --routes wifi,phone --media default --repeats 3 --input-device 15 --output-device 12
 ```
 
 Os índices de áudio acima são exemplos: confirmar o microfone físico e a saída
@@ -224,6 +273,16 @@ de turno/perfil tornam o ensaio ambíguo/inválido, não uma latência favoráve
 
 `AssistantMetrics` informa estágios monotônicos do ESP32; `AssistantMedia` inclui
 perfil real, bytes de mídia, tempo do codec e watermark de stack. Aceite I2S não é
-som audível. O harness exige `turn` no status/resultado e restaura Auto/ready/legacy.
+som audível. O harness exige `turn` no status/resultado e restaura Auto/ready/default.
 Falhas devem aparecer nos resultados e no exit code. Um piloto não substitui as
 20 comparações pareadas, partida fria/quente e escuta cega previstos no plano.
+
+Em Windows, `--wasapi-exclusive` abre microfone e alto-falante WASAPI em modo
+exclusivo. Os ensaios compartilhados anteriores tiveram falsos onsets por supressão
+de áudio. A correlação mínima agora é 0,35, com piso de energia de três LSB PCM16.
+Uma checagem adicional compara durações relativas ao release e rejeita contradições
+com antecipação maior que 100 ms ou atraso maior que 750 ms em relação ao primeiro
+aceite I2S; nunca substitui onset acústico por
+timestamp do firmware. Um ensaio inválido salva latência nula e mantém a candidata
+somente como diagnóstico. `--playback full` com voz comprimida BLE é recusado:
+esse comparativo de buffer integral só se aplica a `legacy` e `pcm`.

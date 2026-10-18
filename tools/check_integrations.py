@@ -48,6 +48,9 @@ def main():
           "-Itest/host/network_route_tests_stubs", "-Itest/host/stubs", "-Wl,--gc-sections"])
     suite("network_route_tests_host", [HOST / "network_route_tests_host.cpp"],
           ["-Itest/host/network_route_tests_stubs", "-Itest/host/stubs"])
+    suite("network_route_policy_tests", [ROOT / "src/connectivity/network_route.cpp",
+          HOST / "network_route_policy_tests.cpp"], ["-DARDUINO_ARCH_ESP32", "-ffunction-sections",
+          "-fdata-sections", "-Itest/host/network_route_tests_stubs", "-Itest/host/stubs", "-Wl,--gc-sections"])
     suite("connectivity_settings_tests", [ROOT / "src/net/settings.cpp", HOST / "connectivity_settings_tests.cpp"],
           ["-Itest/host/stubs"])
     suite("button_tests", [ROOT / "src/board/buttons.cpp", ROOT / "src/board/multi_button.c", HOST / "button_tests.cpp"],

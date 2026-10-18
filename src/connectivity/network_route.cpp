@@ -13,7 +13,7 @@ std::atomic<bool> enabled{false}, phone{false};
 std::atomic<uint32_t> passkey{0};
 std::atomic<DiagnosticRoute> diagnostic{DiagnosticRoute::Auto};
 std::atomic<bool> earlyPlayback{true};
-std::atomic<DiagnosticMedia> media{DiagnosticMedia::Legacy};
+std::atomic<DiagnosticMedia> media{kDefaultPhoneMedia};
 std::atomic_flag selecting = ATOMIC_FLAG_INIT;
 // Abaixo, somente sob Selection; nunca há espera segurando portMUX.
 WifiManager *manager = nullptr;
@@ -170,7 +170,7 @@ void finishRetainingPhone(uint32_t timeoutMs) {
   manager = nullptr; store = nullptr;
   diagnostic.store(DiagnosticRoute::Auto, std::memory_order_release);
   earlyPlayback.store(true, std::memory_order_release);
-  media.store(DiagnosticMedia::Legacy, std::memory_order_release);
+  media.store(kDefaultPhoneMedia, std::memory_order_release);
   if (keep) {
     retainPhoneUntil.store(millis() + min(timeoutMs, uint32_t(30000)), std::memory_order_release);
     retainPhone.store(true, std::memory_order_release);
@@ -198,7 +198,7 @@ void finish() {
   phone.store(false, std::memory_order_release);
   diagnostic.store(DiagnosticRoute::Auto, std::memory_order_release);
   earlyPlayback.store(true, std::memory_order_release);
-  media.store(DiagnosticMedia::Legacy, std::memory_order_release);
+  media.store(kDefaultPhoneMedia, std::memory_order_release);
   retainPhone.store(false, std::memory_order_release);
   manager = nullptr; store = nullptr;
   selecting.clear(std::memory_order_release);

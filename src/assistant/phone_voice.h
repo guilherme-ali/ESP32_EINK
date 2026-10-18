@@ -29,6 +29,7 @@ public:
   uint32_t decodeUs() const { return decodeUs_; }
 private:
   bool record(Media::Type type, const uint8_t *p, size_t n, uint32_t position = 0, uint8_t flags = 0);
+  bool flushOpus();
   bool encodeFrame();
   bool fail(const char *error);
   VoiceOpus opus_;
@@ -38,6 +39,8 @@ private:
   void *context_;
   int channel_ = -1, bitrate_ = 0;
   uint8_t wire_[Media::kHeaderSize]{};
+  uint8_t opusBatch_[1384]{};
+  size_t opusBatchSize_ = 0;
   int16_t input_[320]{}, decoded_[480]{};
   Media::Header header_;
   uint32_t original_ = 0, encoded_ = 0, emitted_ = 0, receivedSamples_ = 0;

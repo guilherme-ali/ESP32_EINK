@@ -15,7 +15,7 @@ constexpr size_t kCaptureBytes = 16000 * 2 * 30; // immutable prefix, no overwri
 constexpr size_t kOutputBytes = 2 * 1024 * 1024;
 constexpr size_t kMaxAudioBytes = 192 * 1024;
 constexpr size_t kWifiPrebufferBytes = 24000; // 500 ms de PCM mono, 24 kHz/16 bits.
-constexpr size_t kOpusPrebufferBytes = 72000; // 1500 ms de PCM mono, 24 kHz/16 bits (evita starvation em jitter BLE).
+constexpr size_t kOpusPrebufferBytes = 24000; // 500 ms; BLE negotiates a 7.5 ms connection interval.
 constexpr uint32_t kTurnMs = 180000;
 std::atomic<uint32_t> nextTurnId{1};
 void copyText(char *to, size_t cap, const char *from) {
@@ -289,7 +289,7 @@ bool AssistantJob::start(const Settings &s, AudioCodec &codec, ConnectFn connect
   uint32_t networkStack = 16384;
 #if defined(ARDUINO_ARCH_ESP32)
   const auto media = NetworkRoute::diagnosticMedia();
-  if (media != DiagnosticMedia::Legacy && media != DiagnosticMedia::Pcm &&
+  if (NetworkRoute::fallbackEnabled() && media != DiagnosticMedia::Legacy && media != DiagnosticMedia::Pcm &&
       NetworkRoute::diagnosticRoute() != DiagnosticRoute::WifiOnly) networkStack = 32768;
 #endif
   // All tasks start behind a gate, so handles exist before any task can retire.
@@ -576,7 +576,10 @@ void AssistantJob::networkTask(void *ptr) {
       size_t available = p->captured.load(std::memory_order_acquire) - sent;
       p->updateMaxBacklog(available);
       if (available >= 2048 || (p->captureDone.load(std::memory_order_acquire) && available)) {
-        size_t n = std::min(available, size_t(2048)); // 64 ms; final tail may be shorter.
+        // Batch only audio already captured; compressed BLE packs the records
+        // into full relay payloads without waiting for future microphone data.
+        const size_t chunkBytes = p->compressedAudio.load() ? 8192 : 2048;
+        size_t n = std::min(available, chunkBytes);
         p->stamp(&AssistantJob::Telemetry::firstInputUs);
         if (!socket.sendAudio(p->capture + sent, n)) { p->fail(socket.error()); break; }
         sent += n;

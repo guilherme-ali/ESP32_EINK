@@ -4,6 +4,8 @@
 #include "codec.h"
 #include <atomic>
 
+class CaptureSession;
+
 // Grava PCM 16-bit mono a partir do ES8311 (que fala I2S estereo - so o
 // canal esquerdo e mantido) em PCM append-only e cabecalho WAV separado.
 //
@@ -19,13 +21,17 @@ class Recorder {
 public:
   // codec deve continuar valido (e com enable(true) + sampleRate
   // configurados pelo chamador) durante toda a gravacao.
+  // Erro I2S, frame LR invalido ou 2s sem amostras: writeFailed + dreno.
   bool start(const char *path, uint32_t sampleRate, AudioCodec *codec);
+  // Adota apenas o consumo; objeto externo deve viver ate finish(). Nenhuma
+  // segunda captura/ring e criado. Falha anterior a admissao nao adota sessao.
+  bool start(const char *path, uint32_t sampleRate, CaptureSession *session);
 
   // API bloqueante para chamadores sem UI. A UI usa requestStop/finish:
   // o dreno/finalizacao roda no worker, sem bloquear o loop/watchdog.
   uint32_t stop();
-  void requestStop() { stopRequested_.store(true); }
-  bool isFinished() const { return captureTaskDone_.load() && writeTaskDone_.load(); }
+  void requestStop();
+  bool isFinished() const;
   uint32_t finish(); // somente depois de isFinished(); libera ring e marca inativo
 
   bool isActive() const { return active_; }
@@ -43,6 +49,7 @@ private:
   File file_;
   char path_[64] = "";
   AudioCodec *codec_ = nullptr;
+  CaptureSession *session_ = nullptr;
   uint32_t sampleRate_ = 16000;
   std::atomic<uint32_t> dataBytes_{0};
   std::atomic<uint32_t> checkpointBytes_{0};
@@ -65,4 +72,5 @@ private:
 
   static void captureTaskFn(void *arg);
   static void writeTaskFn(void *arg);
+  bool startImpl(const char *path, uint32_t sampleRate, AudioCodec *codec, CaptureSession *session);
 };

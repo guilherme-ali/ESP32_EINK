@@ -2,6 +2,8 @@
 #include "platform.h"
 #include <atomic>
 
+class CaptureSession;
+
 // Owner: mainApp, with start/snapshot/active/acknowledgeFinished serialized on
 // the UI task. release/cancel are thread safe. Keep this object alive until ACK.
 class AssistantJob {
@@ -35,7 +37,11 @@ public:
   AssistantJob() = default;
   AssistantJob(const AssistantJob &) = delete;
   AssistantJob &operator=(const AssistantJob &) = delete;
-  bool start(const Settings &, AudioCodec &, ConnectFn);
+  // An adopted session is borrowed, never deleted. Except when already busy,
+  // start takes responsibility for end(), including failures; keep it alive
+  // and do not reuse it until finished. release stops ingress and drains the
+  // accepted prefix.
+  bool start(const Settings &, AudioCodec &, ConnectFn, CaptureSession *capture = nullptr);
   void release(bool physicalButton = false);
   void cancel();
   bool active() const;

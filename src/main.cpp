@@ -4,6 +4,7 @@
 #include <esp_sleep.h>
 #include <esp_heap_caps.h>
 #include <esp_system.h>
+#include <driver/rtc_io.h>
 #include <sys/time.h>
 #include <time.h>
 
@@ -13,6 +14,9 @@
 #include "board/rtc.h"
 #include "board/battery.h"
 #include "board/shtc3.h"
+#include "board/boot_trace.h"
+#include "board/sleep_gate.h"
+#include "board/wake_intent.h"
 #include "display/epaper.h"
 #include "ui/canvas.h"
 #include "ui/wallpapers.h"
@@ -56,6 +60,68 @@ static LockScreen lockScreen(epd, canvas);
 // esp_sleep e ficam fora do loop de botoes do App.
 static App app(epd, canvas, notes, settingsStore, codec, recorder, player, wifiMgr, sttClient,
                gdrive, rtc, shtc3);
+static bool sleepPending = false;
+static bool sleepDeferred = false;
+static bool uiStarted = false;
+static bool buttonQueueFailed = false;
+static SleepGate sleepGate;
+static TaskHandle_t buttonTask = nullptr;
+RTC_DATA_ATTR static uint32_t rtcSleepEntries = 0;
+
+static void printBootMetrics() {
+#if ARDUINO_USB_CDC_ON_BOOT
+  Serial.printf("[Boot] reset_reason=%d wakeup=%d ext1_mask=0x%llx sleep_entries=%lu\n",
+                (int)esp_reset_reason(), (int)esp_sleep_get_wakeup_cause(),
+                (unsigned long long)esp_sleep_get_ext1_wakeup_status(), (unsigned long)rtcSleepEntries);
+  const bool displayBusy = app.feedbackBusy();
+  Serial.printf("[PowerState] codec_quiescent=%d epd_ready=%d epd_healthy=%d can_sleep=%d display_busy=%d\n",
+                codec.quiescent(), displayBusy ? -1 : epd.ready(), displayBusy ? -1 : epd.healthy(),
+                app.canSleep(), displayBusy);
+  Serial.printf("[BootMetrics] entry_us=%lu button_observed_us=%lu settings_ready_us=%lu audio_ready_us=%lu first_block_us=%lu fs_ready_us=%lu intent_us=%lu checkpoint_us=%lu display_ready_us=%lu ui_ready_us=%lu valid_audio_us=unmeasured heap_internal=%u largest_internal=%u psram_free=%u\n",
+                (unsigned long)BootTrace::get(BootTrace::Entry),
+                (unsigned long)BootTrace::get(BootTrace::ButtonObserved),
+                (unsigned long)BootTrace::get(BootTrace::SettingsReady),
+                (unsigned long)BootTrace::get(BootTrace::AudioReady),
+                (unsigned long)BootTrace::get(BootTrace::FirstBlock),
+                (unsigned long)BootTrace::get(BootTrace::FilesystemReady),
+                (unsigned long)BootTrace::get(BootTrace::IntentResolved),
+                (unsigned long)BootTrace::get(BootTrace::FirstCheckpoint),
+                (unsigned long)BootTrace::get(BootTrace::DisplayReady),
+                (unsigned long)BootTrace::get(BootTrace::UiReady),
+                heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+#endif
+}
+
+static bool prepareUi() {
+  if (uiStarted) return epd.healthy();
+  uiStarted = true;
+  shtc3.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+  bool ok = epd.ready(); // The audio-view worker may already have initialized it.
+  if (!ok && epd.healthy()) {
+    power.epdOn();
+    delay(10);
+    ok = epd.init();
+    if (ok) { epd.clear(); ok = epd.displayPartBaseImage() && epd.initPartial(); }
+  }
+  if (ok) BootTrace::mark(BootTrace::DisplayReady);
+  else { power.epdOff(); epd.invalidatePower(); Serial.println("[Display] Painel indisponivel; audio continua independente."); }
+  return ok;
+}
+
+static void powerOnFeedbackDisplay() {
+  power.epdOn();
+  delay(10);
+}
+
+static void sampleButtons(void *) {
+  TickType_t last = xTaskGetTickCount();
+  for (;;) {
+    buttons.sample();
+    vTaskDelayUntil(&last, pdMS_TO_TICKS(5));
+  }
+}
 
 // Sobrevive ao deep sleep (RTC memory) - o wallpaper da tela de
 // descanso fica o mesmo durante todo um periodo de descanso, so muda
@@ -66,8 +132,21 @@ RTC_DATA_ATTR static int rtcWallpaperIndex = -1;
 static void markActivity() { rtcWallpaperIndex = -1; }
 
 static void onButtonEvent(BtnId id, BtnAction action) {
+  if (sleepPending || buttonQueueFailed) return;
+  if (action == BtnAction::PressDown) sleepDeferred = false;
   markActivity();
+  const uint32_t dispatchedMs = millis();
+  const uint32_t observedMs = buttons.lastEventObservedMs();
   app.onButton(id, action);
+#if ARDUINO_USB_CDC_ON_BOOT
+  Serial.printf("[Button] id=%u action=%u observed_ms=%lu dispatched_ms=%lu max_gap_ms=%lu gaps=%lu\n",
+                (unsigned)id, (unsigned)action, (unsigned long)observedMs,
+                (unsigned long)dispatchedMs, (unsigned long)buttons.maxSampleGapMs(),
+                (unsigned long)buttons.sampleGapCount());
+#else
+  (void)dispatchedMs;
+  (void)observedMs;
+#endif
 }
 
 static void drawWifiSetupScreen(const String &line1, const String &line2) {
@@ -170,6 +249,7 @@ static void runDrivePairingIfNeeded() {
 // perto. Aproveita a conexao pra tambem acertar o relogio via NTP e
 // checar o pareamento do Drive, do jeito que era feito so no boot antes.
 static bool onConnectRequested() {
+  app.prepareMainUi();
   NetworkRoute::configure(settingsStore.get());
   bool ok = NetworkRoute::connect(wifiMgr, settingsStore);
   if (ok) {
@@ -190,6 +270,7 @@ static bool onAssistantConnectRequested() {
 // de instrucoes e bloqueia ate BOOT longo (ou ate o portal salvar, que
 // reinicia o ESP sozinho).
 static void onPortalRequested() {
+  app.prepareMainUi();
   g_skipWifiSetup = false;
   buttons.setCallback(onWifiSetupButtonEvent);
   wifiMgr.startApPortal(settingsStore);
@@ -236,23 +317,25 @@ static void runWifiSetup() {
 // gpio_hold_dis() correspondente fica no inicio do setup(), antes de
 // qualquer power.XOn()/XOff() - sem ele a tela nunca mais ligaria.
 //
-// VDDSDIO desligado tambem: alimenta a flash E a PSRAM octal (board
-// inteira usa qio_opi). Sem os wakes por timer (nenhuma fonte de wake
-// alem dos botoes, ver enterScreensaver() abaixo), a documentacao da
-// Espressif indica isso como seguro - e era o maior consumo de standby
-// medido (uma noite parada custava 5% de bateria antes desta mudanca).
-static void holdPowerRailsAndSleep() {
-  gpio_hold_en((gpio_num_t)PIN_EPD_PWR);
-  gpio_hold_en((gpio_num_t)PIN_AUDIO_PWR);
-  gpio_hold_en((gpio_num_t)PIN_VBAT_PWR);
+// Deep sleep already powers flash down in IDF 4.4. This configuration is
+// specific to deep sleep, never reused for asynchronous light-sleep wake.
+static bool holdPowerRailsAndSleep() {
+  if (gpio_hold_en((gpio_num_t)PIN_EPD_PWR) != ESP_OK ||
+      gpio_hold_en((gpio_num_t)PIN_AUDIO_PWR) != ESP_OK ||
+      gpio_hold_en((gpio_num_t)PIN_VBAT_PWR) != ESP_OK) return false;
   gpio_deep_sleep_hold_en();
 
   // So os dominios que sabemos que nao precisamos - RTC_SLOW_MEM fica
   // ligado no default (guarda os RTC_DATA_ATTR, ex. rtcWallpaperIndex).
-  esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_FAST_MEM, ESP_PD_OPTION_OFF);
-  esp_sleep_pd_config(ESP_PD_DOMAIN_XTAL, ESP_PD_OPTION_OFF);
-  esp_sleep_pd_config(ESP_PD_DOMAIN_VDDSDIO, ESP_PD_OPTION_OFF);
+  if (esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_FAST_MEM, ESP_PD_OPTION_OFF) != ESP_OK ||
+      esp_sleep_pd_config(ESP_PD_DOMAIN_XTAL, ESP_PD_OPTION_OFF) != ESP_OK ||
+      esp_sleep_pd_config(ESP_PD_DOMAIN_VDDSDIO, ESP_PD_OPTION_OFF) != ESP_OK) return false;
 
+  // Park SPI only once every fallible sleep configuration has succeeded. A
+  // rejected sleep can then restore the panel without broken pin routing.
+  for (int pin : {PIN_EPD_CS, PIN_EPD_DC, PIN_EPD_RST, PIN_EPD_SCK, PIN_EPD_MOSI, PIN_EPD_BUSY})
+    pinMode(pin, INPUT);
+  ++rtcSleepEntries;
   esp_deep_sleep_start();
 }
 
@@ -263,9 +346,22 @@ static void holdPowerRailsAndSleep() {
 // acordar: os botoes (ext1) - sem wake por timer, o aparelho so liga
 // quando voce mexe nele.
 static void enterScreensaver() {
+  if (sleepPending) return;
+  if (!app.canSleep()) {
+    if (app.feedbackBusy() && !app.isAudioActive() && !app.isSyncActive() && !app.isExportActive())
+      sleepDeferred = true;
+    return;
+  }
+  sleepDeferred = false;
+  app.finishFeedback();
+  sleepPending = true;
+  sleepGate.reset();
+  buttons.suppressUntilRelease(BtnId::Boot);
+  buttons.suppressUntilRelease(BtnId::Pwr);
   NetworkRoute::finish();
   wifiMgr.disconnect();
-  Serial.println("Entrando em modo de descanso (deep sleep)...");
+  codec.end();
+  Serial.println("[Sleep] Preparando repouso; aguardando soltura dos botoes.");
 
   if (rtcWallpaperIndex < 0) {
     rtcWallpaperIndex = settingsStore.get().wallpaperChoice >= 0
@@ -273,65 +369,64 @@ static void enterScreensaver() {
                              : random(WALLPAPER_COUNT);
   }
 
-  epd.init(); // recarrega a LUT de refresh completo (o app roda em modo parcial)
-  lockScreen.draw(rtcWallpaperIndex);
+  if (epd.ready() && epd.init()) lockScreen.draw(rtcWallpaperIndex);
   power.epdOff();
-
-  codec.enable(false);
+  epd.invalidatePower();
   power.audioOff();
-
-  esp_sleep_enable_ext1_wakeup((1ULL << PIN_BTN_BOOT) | (1ULL << PIN_BTN_PWR),
-                                ESP_EXT1_WAKEUP_ANY_LOW);
-  holdPowerRailsAndSleep();
 }
 
 void setup() {
-  // Libera o hold dos rails de energia (ver holdPowerRailsAndSleep())
-  // do sono anterior, se houver - tem que ser ANTES de qualquer outra
-  // coisa, inclusive do desvio do wake por timer logo abaixo (que liga
-  // o e-paper na primeira linha). Sem isso os pinos continuam travados
-  // e power.epdOn()/audioOn() nao tem efeito nenhum. Seguro num boot a
-  // frio tambem - liberar um hold que nunca existiu e um no-op.
+  BootTrace::mark(BootTrace::Entry);
+  // Safe levels must be preloaded BEFORE releasing previous sleep holds.
+  power.begin();
   gpio_hold_dis((gpio_num_t)PIN_EPD_PWR);
   gpio_hold_dis((gpio_num_t)PIN_AUDIO_PWR);
   gpio_hold_dis((gpio_num_t)PIN_VBAT_PWR);
   gpio_deep_sleep_hold_dis();
-
+  const auto wake = esp_sleep_get_wakeup_cause();
+  const uint64_t wakePins = wake == ESP_SLEEP_WAKEUP_EXT1 ? esp_sleep_get_ext1_wakeup_status() : 0;
+  rtc_gpio_deinit((gpio_num_t)PIN_BTN_BOOT);
+  rtc_gpio_deinit((gpio_num_t)PIN_BTN_PWR);
+  buttons.begin(PIN_BTN_BOOT, PIN_BTN_PWR, onButtonEvent);
+  const bool pwrWake = (wakePins & (1ULL << PIN_BTN_PWR)) ||
+                       (wakePins && digitalRead(PIN_BTN_PWR) == LOW);
+  const bool captureWake = wakeIntent(wakePins & (1ULL << PIN_BTN_BOOT), pwrWake,
+                                      digitalRead(PIN_BTN_PWR) == LOW) == WakeIntent::Capture;
+  if (captureWake) buttons.latchWake(BtnId::Boot);
+  else if (pwrWake) {
+    buttons.suppressUntilRelease(BtnId::Boot);
+    buttons.suppressUntilRelease(BtnId::Pwr);
+  }
+  BootTrace::mark(BootTrace::ButtonObserved);
+  buttons.useExternalSampling(true);
+  if (xTaskCreatePinnedToCore(sampleButtons, "buttons", 2048, nullptr, 6, &buttonTask, 1) != pdPASS) {
+    buttons.useExternalSampling(false); // explicit degraded mode, never fake old ticks
+    Serial.println("[Buttons] Sem task de amostragem; usando polling limitado.");
+  }
+#if ARDUINO_USB_CDC_ON_BOOT
   Serial.begin(115200);
+#endif
   // Alocacoes de Strings/cJSON/mbedTLS >= 512B usam PSRAM, preservando SRAM DMA para esp-sha/I2S/BLE.
   if (psramFound()) heap_caps_malloc_extmem_enable(512);
-  delay(2000);
   Serial.println("=================================");
   Serial.printf("[Boot] reset_reason=%d wakeup=%d\n", (int)esp_reset_reason(), (int)esp_sleep_get_wakeup_cause());
   Serial.println("Gravador de Ideias - sincronizacao otimizada v3");
   Serial.println("=================================");
 
-  if (!LittleFS.begin(false)) {
-    Serial.println("!! ERRO: LittleFS.begin() falhou.");
-  }
-  notes.begin();
-
-  power.epdOn();
-  power.audioOn();
-  delay(10);
-
-  if (!rtc.begin(PIN_I2C_SDA, PIN_I2C_SCL)) {
-    Serial.println("!! AVISO: RTC PCF85063 nao respondeu no I2C.");
-  }
-  shtc3.begin(PIN_I2C_SDA, PIN_I2C_SCL);
-
-  epd.init();
-  epd.clear();
-  epd.displayPartBaseImage();
-  epd.initPartial();
-
-  if (!codec.begin()) {
-    Serial.println("!! ERRO: AudioCodec.begin() falhou.");
-  }
-
-  buttons.begin(PIN_BTN_BOOT, PIN_BTN_PWR, onButtonEvent);
-
   settingsStore.begin();
+  BootTrace::mark(BootTrace::SettingsReady);
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+  Wire.setTimeOut(50);
+  if (!app.beginFeedback(powerOnFeedbackDisplay))
+    Serial.println("[DisplayFeedback] Worker indisponivel; captura permanece prioritaria.");
+  if (captureWake) app.prepareWakeCapture();
+  const bool mounted = LittleFS.begin(false);
+  const bool storageReady = mounted && notes.begin();
+  app.setStorageReady(storageReady);
+  BootTrace::mark(BootTrace::FilesystemReady);
+  if (!storageReady) Serial.println("[Storage] Falha ao montar/preparar notas; sem formatacao automatica.");
+  if (!rtc.begin(PIN_I2C_SDA, PIN_I2C_SCL))
+    Serial.println("!! AVISO: RTC PCF85063 nao respondeu no I2C.");
   NetworkRoute::configure(settingsStore.get());
   // O relógio de sistema também precisa existir quando só houver internet BLE.
   // O PCF85063 usa UTC-3 neste firmware; a conversão não muda TZ global.
@@ -349,16 +444,60 @@ void setup() {
       settimeofday(&tv, nullptr);
     }
   }
-  runWifiSetup();
-  runDrivePairingIfNeeded();
-  buttons.setCallback(onButtonEvent);
-
-  app.begin(enterScreensaver, onConnectRequested, onPortalRequested, onAssistantConnectRequested);
-  Serial.printf("%d nota(s) encontradas. Pronto.\n", notes.count());
+  app.begin(enterScreensaver, onConnectRequested, onPortalRequested, onAssistantConnectRequested,
+            prepareUi, captureWake);
+  // Waking must never divert a local note or PWR->Home into onboarding.
+  // First-use portal remains available on cold boot and explicitly in menus.
+  if (wake != ESP_SLEEP_WAKEUP_EXT1) { runWifiSetup(); runDrivePairingIfNeeded(); }
 }
 
 void loop() {
+  if (buttons.eventsLost()) {
+    // Losing a release must not leave an unbounded PTT session. Do not
+    // dispatch stale commands after overflow; sleep is still explicit/guarded.
+    buttonQueueFailed = true;
+    app.handleButtonOverflow();
+    buttons.discardEvents();
+    buttons.suppressUntilRelease(BtnId::Boot);
+    buttons.suppressUntilRelease(BtnId::Pwr);
+    buttonQueueFailed = false;
+    Serial.println("[Buttons] Fila excedida; gesto cancelado explicitamente.");
+  }
   buttons.poll();
+  if (sleepDeferred && app.canSleep()) enterScreensaver();
+  if (sleepPending) {
+    const bool released = digitalRead(PIN_BTN_BOOT) == HIGH && digitalRead(PIN_BTN_PWR) == HIGH;
+    if (sleepGate.ready(millis(), released, app.canSleep())) {
+      bool ok = true;
+      for (int pin : {PIN_BTN_BOOT, PIN_BTN_PWR}) {
+        ok = (rtc_gpio_pullup_en((gpio_num_t)pin) == ESP_OK) && ok;
+        ok = (rtc_gpio_pulldown_dis((gpio_num_t)pin) == ESP_OK) && ok;
+      }
+      ok = ok && esp_sleep_enable_ext1_wakeup((1ULL << PIN_BTN_BOOT) | (1ULL << PIN_BTN_PWR),
+                                            ESP_EXT1_WAKEUP_ANY_LOW) == ESP_OK;
+      if (ok) ok = holdPowerRailsAndSleep();
+      // Only reached on a configuration error, never claim sleep succeeded.
+      gpio_deep_sleep_hold_dis();
+      gpio_hold_dis((gpio_num_t)PIN_EPD_PWR);
+      gpio_hold_dis((gpio_num_t)PIN_AUDIO_PWR);
+      gpio_hold_dis((gpio_num_t)PIN_VBAT_PWR);
+      rtc_gpio_deinit((gpio_num_t)PIN_BTN_BOOT);
+      rtc_gpio_deinit((gpio_num_t)PIN_BTN_PWR);
+      sleepPending = false; uiStarted = false;
+      // ready() describes the previous controller session, not retained RAM
+      // after epdOff(). Rebuild the powered controller on a rejected sleep.
+      power.epdOn();
+      delay(10);
+      if (epd.init()) {
+        epd.clear();
+        if (!epd.displayPartBaseImage() || !epd.initPartial()) power.epdOff();
+      } else power.epdOff();
+      prepareUi(); app.redrawHome();
+      Serial.printf("[Sleep] Falha na configuracao (%d); aparelho permaneceu acordado.\n", ok);
+    }
+    delay(5);
+    return;
+  }
   if (!app.isSyncActive() && !app.isAudioActive() && !app.isExportActive()) wifiMgr.loop();
   serviceNtpRtc();
   app.loop();
@@ -368,7 +507,24 @@ void loop() {
     char c = (char)Serial.read();
     if (c == '\n') {
       command.trim();
-      if (command.length()) app.diagnosticCommand(command);
+      if (command == "boot-metrics") { printBootMetrics(); Serial.println("[DiagDone] boot-metrics"); }
+      else if (command == "feedback-cold") {
+        const bool allowed = app.canSleep();
+        if (allowed) {
+          app.finishFeedback();
+          power.epdOff();
+          epd.invalidatePower();
+          delay(20);
+        }
+        Serial.printf("[FeedbackTest] cold_started=%d\n", allowed && app.prepareWakeCapture());
+        Serial.println("[DiagDone] feedback-cold");
+      }
+      else if (command == "sleep") {
+        const bool accepted = app.canSleep();
+        Serial.printf("[DiagDone] sleep requested=%d\n", accepted);
+        if (accepted) enterScreensaver();
+      }
+      else if (command.length()) app.diagnosticCommand(command);
       command = "";
     } else if (c != '\r' && command.length() < 64) {
       command += c;

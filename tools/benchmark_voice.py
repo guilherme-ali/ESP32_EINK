@@ -419,7 +419,7 @@ class SerialSession:
             if self.discard_line:
                 self.discard_line = False
                 continue
-            match = re.match(r"^\[(AssistantMetrics|AssistantMedia|AssistantDone|Assistant|BLE|BenchmarkRoute|BenchmarkPlayback|BenchmarkMedia|DiagDone)\] (.*)$", line)
+            match = re.match(r"^\[(AssistantMetrics|AssistantMedia|AssistantDone|Assistant|AssistantAudio|PlaybackSource|PlaybackProcessed|ListeningFeedback|BLE|BenchmarkRoute|BenchmarkPlayback|BenchmarkMedia|DiagDone)\] (.*)$", line)
             if not match:
                 continue
             tag, body = match.groups()
@@ -427,6 +427,15 @@ class SerialSession:
             if tag == "AssistantMedia":
                 allowed = ("turn", "boot_id", "media", "tx_bytes", "rx_bytes", "encode_us", "decode_us", "stack_free_min_bytes")
                 fields = {key: fields[key] for key in allowed if key in fields}
+            elif tag in ("PlaybackSource", "PlaybackProcessed", "ListeningFeedback", "AssistantAudio"):
+                allowed = {"samples", "rms_dbfs", "max100ms_dbfs", "peak_dbfs", "fullscale", "volume_requested",
+                           "volume_cached", "reg32", "reg32_valid", "stack_min_bytes", "state", "request_us",
+                           "refresh_begin_us", "refresh_done_us", "ok", "error", "latency_samples", "guards"}
+                fields = {key: value for key, value in fields.items()
+                          if (key in allowed and re.fullmatch(r"-?\d+(?:\.\d+)?", value)) or
+                          (key == "kind" and value in ("assistant", "wav")) or
+                          (key == "scope" and value == "offered") or
+                          (key == "stage" and value == "capture")}
             elif tag in ("Assistant", "AssistantMetrics", "BLE"):
                 fields = {key: value for key, value in fields.items() if re.fullmatch(r"-?\d+", value) or
                           (key == "route" and value in ("wifi", "ble", "phone", "none")) or
@@ -597,6 +606,7 @@ def restore_defaults(session):
 def run_trial(args, session, log, np, sd, devices, prompt_info, route, trial, repeat, previous_turn):
     path, prompt, digest, original_rate = prompt_info
     result = {"trial": trial, "repeat": repeat, "route_requested": route, "playback_policy": args.playback,
+              "capture_path": "adopted" if getattr(args, "early_capture", False) else "direct",
               "media_requested": args.media,
               "wav": str(path), "wav_sha256": digest, "wav_original_rate": original_rate,
               "sample_rate": args.samplerate, "status": "error", "failure_reason": "incomplete_trial",
@@ -625,7 +635,8 @@ def run_trial(args, session, log, np, sd, devices, prompt_info, route, trial, re
                       stream_sample_rate=stream.samplerate)
         stream.start()
         deadline = time.monotonic() + args.timeout
-        session.command("assistant-start", timeout=min(15, args.timeout), observer=tracker.observe)
+        start_command = "assistant-early-start" if getattr(args, "early_capture", False) else "assistant-start"
+        session.command(start_command, timeout=min(15, args.timeout), observer=tracker.observe)
         while time.monotonic() < deadline:
             events = session.command("status", timeout=min(3, max(0.01, deadline - time.monotonic())),
                                      observer=tracker.observe)
@@ -777,6 +788,8 @@ def main():
     parser.add_argument("--media", choices=("default", *MEDIA_PROFILES), default="default",
                          help="default usa o perfil normal do BOOT (opus48); Wi-Fi ignora compressao")
     parser.add_argument("--repeats", type=int, default=1)
+    parser.add_argument("--early-capture", action="store_true",
+                        help="Testa adocao da captura antecipada (debug USB); nao simula wake fisico")
     parser.add_argument("--port", default="COM7")
     parser.add_argument("--input-device", help="ID ou substring do microfone local")
     parser.add_argument("--output-device", help="ID ou substring da saida local, preferencialmente cabeada")

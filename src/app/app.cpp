@@ -2,6 +2,11 @@
 #include "../ui/screens.h"
 #include "../ui/wallpapers.h"
 #include "../board/battery.h"
+#include "../board/boot_trace.h"
+#include "../audio/power_selftest.h"
+#include "../audio/tone_test.h"
+#include <cstdio>
+#include <cstring>
 #include <LittleFS.h>
 #include "../storage/note_files.h"
 #include <esp_heap_caps.h>
@@ -96,15 +101,55 @@ App::App(EPaperDisplay &epd, Canvas &canvas, NotesStore &notes, SettingsStore &s
       menu_(canvas, epd), keyboard_(canvas, epd) {}
 
 void App::begin(SleepRequestFn onSleepRequested, ConnectRequestFn onConnectRequested,
-                 PortalRequestFn onPortalRequested, ConnectRequestFn onAssistantConnectRequested) {
+                 PortalRequestFn onPortalRequested, ConnectRequestFn onAssistantConnectRequested,
+                 UiPrepareFn onUiPrepare, bool deferUi) {
   onSleepRequested_ = onSleepRequested;
   onConnectRequested_ = onConnectRequested;
   onPortalRequested_ = onPortalRequested;
   onAssistantConnectRequested_ = onAssistantConnectRequested;
-  refreshNotes();
+  onUiPrepare_ = onUiPrepare;
   screen_ = Screen::Home;
-  drawHome();
+  if (!deferUi) { ensureUi(); refreshNotes(); drawHome(); }
   markActivity();
+}
+
+void App::ensureUi() {
+  // Only the UI task may use Canvas after the audio view relinquishes it.
+  feedback_.finish();
+  feedbackRestorePending_ = false;
+  if (uiPrepared_) return;
+  uiPrepared_ = true;
+  if (!onUiPrepare_ || onUiPrepare_()) BootTrace::mark(BootTrace::UiReady);
+}
+
+bool App::prepareWakeCapture() {
+  if (capturePending_) return !captureFailed_;
+  if (isAudioActive() || isSyncActive() || isExportActive()) return false;
+  capturePending_ = true;
+  feedbackRestorePending_ = false;
+  const Settings &cfg = settingsStore_.get();
+  captureFailed_ = !capture_.start(codec_, std::max<uint32_t>(cfg.audioSampleRateHz, 16000), cfg.micGainDb);
+  if (!captureFailed_) feedback_.request(ListeningFeedback::State::Listening);
+  return !captureFailed_;
+}
+
+void App::cancelPendingCapture() {
+  if (!capturePending_) return;
+  capture_.end();
+  capturePending_ = captureFailed_ = false;
+  feedbackRestorePending_ = true;
+}
+
+void App::handleButtonOverflow() {
+  chord_.reset();
+  cancelPendingCapture();
+  if (assistantJob_.active()) assistantJob_.cancel();
+  if (recording_) stopRecording();
+}
+
+bool App::canSleep() const {
+  return !isAudioActive() && !isSyncActive() && !isExportActive() &&
+         !recorder_.isActive() && !feedback_.busy() && screen_ != Screen::Saving && screen_ != Screen::PhonePairing;
 }
 
 void App::markActivity() { lastActivityMs_ = millis(); }
@@ -119,6 +164,7 @@ void App::formatDuration(uint32_t bytes, uint32_t sampleRateHz, char *out, size_
 }
 
 void App::refreshNotes() {
+  if (!storageReady_) { noteCount_ = 0; return; }
   // Tambem cobre pareamento iniciado pelo menu Wi-Fi, fora de startSync().
   uint32_t generation = settingsStore_.get().driveAuthGeneration;
   if (generation != notesDriveGeneration_) {
@@ -133,12 +179,14 @@ void App::refreshNotes() {
 // ---------------------------------------------------------------------
 
 void App::goHome() {
+  ensureUi();
   screen_ = Screen::Home;
   refreshNotes();
   drawHome();
 }
 
 void App::goRootMenu() {
+  ensureUi();
   refreshNotes();
   screen_ = Screen::RootMenu;
   drawRootMenu();
@@ -175,6 +223,7 @@ void App::goWifiMenu() {
 // Liga o radio e conecta sob demanda, se ainda nao estiver conectado.
 // Bloqueante - desenha sua propria tela de espera.
 bool App::ensureOnline() {
+  ensureUi();
   if (NetworkRoute::online() && (!settingsStore_.hasDriveApp() || settingsStore_.hasDriveAuth())) return true;
   Screens::drawState(canvas_, epd_, Screens::StateIcon::Wifi, "conectando",
                       "Wi-Fi primeiro; celular BLE como alternativa");
@@ -197,11 +246,17 @@ void App::reportNoNetworkAndGoHome() {
 // ---------------------------------------------------------------------
 
 void App::drawHome() {
+  if (!storageReady_) {
+    Screens::drawText(canvas_, epd_, "Armazenamento indisponivel",
+                      "Nao foi possivel preparar as notas. Nenhum arquivo foi apagado ou formatado.",
+                      "PWR: menu/configuracoes");
+    return;
+  }
   RtcDateTime now;
   bool timeValid = rtc_.getDateTime(now) && now.year >= 2024;
   bool hasDrive = settingsStore_.hasDriveAuth();
   bool hasStt = (settingsStore_.get().sttEndpoint[0] != '\0');
-  int pending = notes_.countPendingSync(hasStt, hasDrive);
+  int pending = storageReady_ ? notes_.countPendingSync(hasStt, hasDrive) : 0;
   int batteryPercent = Battery::readPercent();
 
   float tempC = 0, humidity = 0;
@@ -389,7 +444,20 @@ void App::drawWifiScanList() {
 // ---------------------------------------------------------------------
 
 void App::startRecording() {
+  BootTrace::mark(BootTrace::IntentResolved);
+  if (!storageReady_) {
+    cancelPendingCapture();
+    showSyncResult("Armazenamento indisponivel; nenhuma nota foi apagada ou formatada.");
+    return;
+  }
+  if (!capturePending_) prepareWakeCapture();
+  if (captureFailed_ || capture_.failed()) {
+    cancelPendingCapture();
+    showSyncResult("Falha na captura de audio. Nenhuma gravacao foi iniciada.");
+    return;
+  }
   if (NoteFiles::recordingBytes() < bytesPerSec() * 2) {
+    cancelPendingCapture();
     showSyncResult("Memoria insuficiente para gravar. Libere espaco nas notas ja copiadas.");
     return;
   }
@@ -398,28 +466,28 @@ void App::startRecording() {
   notes_.buildPath(now, currentRecordingPath_, sizeof(currentRecordingPath_));
 
   uint32_t sampleRate = settingsStore_.get().audioSampleRateHz;
-  if (!codec_.setSampleRate(sampleRate)) {
-    Serial.println("!! ERRO: setSampleRate falhou.");
-    return;
-  }
-  codec_.enable(true);
-  codec_.setMicGain(settingsStore_.get().micGainDb);
-  if (!recorder_.start(currentRecordingPath_, sampleRate, &codec_)) {
-    codec_.enable(false);
+  if (!recorder_.start(currentRecordingPath_, sampleRate, &capture_)) {
+    cancelPendingCapture();
     Serial.println("!! ERRO: Recorder.start falhou.");
     showSyncResult("Nao foi possivel iniciar gravacao; nenhum audio existente foi sobrescrito.");
     return;
   }
 
+  capturePending_ = false;
   recording_ = true;
   discardRecording_ = false;
   screen_ = Screen::Recording;
   recordingStartMs_ = millis();
-  Screens::drawRecording(canvas_, epd_, 0, recorder_.maximumBytes() / bytesPerSec());
+  // Do not block event dispatch on the panel. App::loop draws after queued
+  // wake/release/stop events have all reached their destination.
   Serial.printf("Gravando em %s (%lu Hz)\n", currentRecordingPath_, (unsigned long)sampleRate);
 }
 
 void App::stopRecording(bool discard) {
+#if ARDUINO_USB_CDC_ON_BOOT
+  Serial.printf("[RecordStop] screen=%d recording=%d discard_requested=%d full=%d failed=%d\n",
+                (int)screen_, recording_, discard, recorder_.storageFull(), recorder_.writeFailed());
+#endif
   if (!recording_ || screen_ == Screen::Saving) return;
   discardRecording_ = discard;
   recorder_.requestStop();
@@ -433,6 +501,8 @@ void App::serviceRecordingSave() {
   // Nada de sono, rede, leitura de notas ou operacoes concorrentes enquanto
   // o writer ainda possui o PCM. O loop continua atendendo o watchdog.
   if (recorder_.isFinished()) { finishRecording(); return; }
+  if (feedback_.busy()) return;
+  ensureUi();
   uint32_t now = millis();
   if (now - savingLastDrawMs_ >= 2000) {
     savingLastDrawMs_ = now;
@@ -446,8 +516,9 @@ void App::serviceRecordingSave() {
 
 void App::finishRecording() {
   uint32_t bytes = recorder_.finish();
-  codec_.enable(false);
+  codec_.end();
   recording_ = false;
+  ensureUi();
   markActivity();
   Serial.printf("Gravacao parada: %u bytes, %u overflow(s) no ring buffer\n", bytes,
                 (unsigned)recorder_.overflowCount());
@@ -456,8 +527,14 @@ void App::finishRecording() {
                 recorder_.storageFull(), recorder_.writeFailed());
   if (discardRecording_) {
     bool removed = NoteFiles::removeWav(currentRecordingPath_); notes_.markDirty();
+#if ARDUINO_USB_CDC_ON_BOOT
+    Serial.printf("[RecordDiscard] removed=%d path=%s\n", removed, currentRecordingPath_);
+#endif
     if (!removed) { showSyncResult("Falha ao descartar; exclusao sera retomada ao reiniciar."); return; }
-    Serial.println("Gravacao descartada."); goHome(); return;
+    Serial.println("Gravacao descartada.");
+    // A visible receipt must not wait for catalog/MD5 scans in goHome().
+    showSyncResult("Gravacao descartada. Nenhuma nota foi salva ou enviada.");
+    return;
   }
 
   // Nunca apresentar um marcador vazio como nota 0s. Confirmar ausencia
@@ -496,28 +573,38 @@ void App::finishRecording() {
   goHome();
 }
 
-void App::playSelected(int index) {
+bool App::playSelected(int index) {
   NoteEntry e;
-  if (!notes_.getAt(index, e)) return;
+  if (!notes_.getAt(index, e)) return false;
   Serial.printf("Reproduzindo %s\n", e.path);
   if (!codec_.setVolume(settingsStore_.get().speakerVolumePercent)) {
     Serial.println("[Audio] Falha ao ajustar volume; reproducao cancelada.");
-    return;
+    return false;
   }
-  player_.play(codec_, e.path);
-  codec_.enable(false);
+  playing_ = true;
+  const bool played = player_.play(codec_, e.path);
+  playing_ = false;
+  codec_.end();
+  return played;
 }
 
 void App::startAssistant() {
   if (recording_ || isSyncActive() || isExportActive() || assistantJob_.active()) return;
   free(textViewerBuf_); textViewerBuf_ = nullptr;
   NetworkRoute::configure(settingsStore_.get());
-  assistantJob_.start(settingsStore_.get(), codec_, onAssistantConnectRequested_);
+  BootTrace::mark(BootTrace::IntentResolved);
+  if (capturePending_ && (captureFailed_ || capture_.failed())) {
+    cancelPendingCapture();
+    showSyncResult("Falha na captura antecipada; tente falar novamente.");
+    return;
+  }
+  assistantJob_.start(settingsStore_.get(), codec_, onAssistantConnectRequested_,
+                      capturePending_ ? &capture_ : nullptr);
+  capturePending_ = false;
   screen_ = Screen::AssistantBusy;
   assistantLastDrawMs_ = millis() - 2000;
   assistantLastState_ = AssistantJob::State::Idle;
   markActivity();
-  serviceAssistant();
 }
 
 void App::serviceAssistant() {
@@ -555,25 +642,21 @@ void App::serviceAssistant() {
     else NetworkRoute::finish();
     wifiMgr_.disconnect();
     screen_ = Screen::AssistantResult;
+    ensureUi();
     Screens::drawText(canvas_, epd_, view.error[0] ? "Assistente: aviso" : "Assistente",
                       message.c_str(), "Segure BOOT: falar | PWR: sair");
     markActivity();
     return;
   }
-  const uint32_t now = millis();
-  if (view.state != assistantLastState_ || now - assistantLastDrawMs_ >= 2000) {
-    String body = view.detail;
-    body += "\n" + String(view.capturedMs / 1000) + " s | " + NetworkRoute::label();
-    if (view.text[0]) body += "\n\n" + String(view.text);
-    Screens::drawText(canvas_, epd_, "Assistente", body.c_str(),
-                      view.released ? "PWR: cancelar" : "Solte BOOT para responder");
-    assistantLastDrawMs_ = now;
-    assistantLastState_ = view.state;
-  }
+  const auto visual = !view.released ? ListeningFeedback::State::Listening :
+      view.state == AssistantJob::State::Speaking ? ListeningFeedback::State::Speaking :
+                                                   ListeningFeedback::State::Thinking;
+  feedback_.request(visual);
 }
 
 void App::startPhonePairing() {
   if (isSyncActive() || isExportActive() || isAudioActive()) return;
+  ensureUi();
   Settings &cfg = settingsStore_.get();
   if (!settingsStore_.savePhone(true, cfg.blePasskey)) {
     showSyncResult("Falha ao salvar configuracao do celular."); return;
@@ -631,6 +714,7 @@ void App::probeAssistantModels(bool configure) {
 
 void App::startNoteExport() {
   if (isAudioActive() || isSyncActive() || isExportActive()) return;
+  ensureUi();
   NoteEntry entry;
   if (!notes_.getAt(notesSel_, entry)) return;
   NetworkRoute::configure(settingsStore_.get());
@@ -655,6 +739,10 @@ void App::serviceNoteExport() {
 
 bool App::startSync(int index, bool forNote, const char *wavPath) {
   if (isSyncActive() || isExportActive() || isAudioActive()) return false;
+  if (!storageReady_) {
+    showSyncResult("Armazenamento indisponivel; nao foi possivel verificar ou sincronizar as notas.", forNote);
+    return false;
+  }
   if (!settingsStore_.hasDriveApp() && !settingsStore_.hasDriveAuth() &&
       !settingsStore_.get().sttEndpoint[0]) {
     showSyncResult("Nenhum servico configurado. Configure STT ou Drive no menu.", forNote);
@@ -749,6 +837,7 @@ void App::serviceSync() {
 }
 
 void App::showSyncResult(const String &message, bool forNote) {
+  ensureUi();
   screen_ = Screen::SyncResult;
   syncResultForNote_ = forNote;
   markActivity();
@@ -806,6 +895,19 @@ void App::deleteAllNotes() {
 // ---------------------------------------------------------------------
 
 void App::onButton(BtnId id, BtnAction action) {
+  if (chord_.consume(id, action)) {
+    cancelPendingCapture();
+    if (assistantJob_.active()) assistantJob_.cancel();
+    if (recording_) stopRecording();
+    return;
+  }
+  if (action == BtnAction::PressDown) {
+    markActivity();
+    if (id == BtnId::Boot && (screen_ == Screen::Home || screen_ == Screen::AssistantResult))
+      prepareWakeCapture();
+    else if (id == BtnId::Pwr) cancelPendingCapture();
+    return;
+  }
   // A soltura longa só pertence ao PTT. Não deve virar uma segunda ação nas
   // telas que já tratam pressão longa (descartar gravação, voltar, cancelar).
   if (action == BtnAction::LongPressRelease) {
@@ -830,7 +932,7 @@ void App::onButton(BtnId id, BtnAction action) {
     case Screen::ExportBusy: break;
     case Screen::AssistantResult:
       if (id == BtnId::Boot && action == BtnAction::LongPress) startAssistant();
-      else goHome();
+      else { cancelPendingCapture(); goHome(); }
       break;
     case Screen::PhonePairing:
       stopPhonePairing();
@@ -993,8 +1095,8 @@ void App::onButtonNoteDetail(BtnId id, BtnAction action) {
       break;
     }
     case kNdPlay:
-      playSelected(notesSel_);
-      drawNoteDetail();
+      if (playSelected(notesSel_)) drawNoteDetail();
+      else showSyncResult("Nao foi possivel reproduzir esta nota. Arquivo ou formato de audio indisponivel.", true);
       break;
     case kNdSync:
       syncOneNote(notesSel_);
@@ -1273,9 +1375,18 @@ void App::onButtonKeyboardPassword(BtnId id, BtnAction action) {
 // ---------------------------------------------------------------------
 
 void App::loop() {
+  if (capturePending_) return; // classify the wake gesture before UI/catalog work
   NetworkRoute::service();
-  if (exportJob_.active() || screen_ == Screen::ExportBusy) { serviceNoteExport(); return; }
   if (assistantJob_.active() || screen_ == Screen::AssistantBusy) { serviceAssistant(); return; }
+  if (screen_ == Screen::Recording) {
+    feedback_.request(ListeningFeedback::State::Listening);
+    if (recorder_.storageFull() || recorder_.writeFailed() || recorder_.isFinished()) stopRecording();
+    return;
+  }
+  if (screen_ == Screen::Saving) { serviceRecordingSave(); return; }
+  if (feedbackRestorePending_) { goHome(); return; }
+  ensureUi();
+  if (exportJob_.active() || screen_ == Screen::ExportBusy) { serviceNoteExport(); return; }
   if (screen_ == Screen::PhonePairing) {
     const bool ready = PhoneRelay::ready();
     if (ready && !phonePairingReady_) {
@@ -1287,26 +1398,6 @@ void App::loop() {
     return;
   }
   if (isSyncActive()) { serviceSync(); return; }
-  if (screen_ == Screen::Saving) { serviceRecordingSave(); return; }
-  if (screen_ == Screen::Recording) {
-    static uint32_t lastUiUpdate = 0;
-    uint32_t now = millis();
-    if (now - lastUiUpdate >= 1000) {
-      lastUiUpdate = now;
-      uint32_t elapsedSec = (now - recordingStartMs_) / 1000;
-      uint32_t written = recorder_.bytesWritten();
-      uint32_t freeSec = (recorder_.maximumBytes() - written) / bytesPerSec();
-      Screens::drawRecording(canvas_, epd_, elapsedSec, freeSec);
-      if (recorder_.overflowCount() > 0) {
-        Serial.printf("!! AVISO: %lu overflow(s) no ring buffer de audio\n",
-                      (unsigned long)recorder_.overflowCount());
-      }
-    }
-    if (recorder_.storageFull() || recorder_.writeFailed()) {
-      stopRecording();
-    }
-    return;
-  }
 
   // Fora da gravacao, qualquer tela (inicial ou menus) dorme sozinha
   // depois do tempo configurado sem apertar botao - o objetivo e nao
@@ -1321,6 +1412,11 @@ void App::loop() {
 void App::diagnosticCommand(const String &command) {
   DiagnosticDone done{command};
   markActivity();
+  if ((command == "wifi" || command == "repair-drive") &&
+      (isAudioActive() || isSyncActive() || isExportActive())) {
+    Serial.println("[Diag] Rede indisponivel durante captura ou operacao ativa.");
+    return;
+  }
   if (exportJob_.active()) {
     Serial.println("[Diag] exportacao ao Obsidian em andamento"); return;
   }
@@ -1361,6 +1457,63 @@ void App::diagnosticCommand(const String &command) {
     Serial.printf("[BenchmarkMedia] %s\n", name.c_str());
     return;
   }
+#if ARDUINO_USB_CDC_ON_BOOT
+  if (command == "feedback-start") {
+    Serial.printf("[FeedbackTest] started=%d\n", canSleep() && prepareWakeCapture());
+    return;
+  }
+  if (command == "feedback-stop") {
+    cancelPendingCapture();
+    Serial.println("[FeedbackTest] capture_cancelled");
+    return;
+  }
+  if (command.startsWith("audio-tone ")) {
+    char mode[5] = {}, sequence[8] = {}, extra = 0;
+    ToneTestParams params{};
+    unsigned frequency = 0, duration = 0, settle = 0;
+    int consumed = 0;
+    const int fields = std::sscanf(command.c_str() + 11, "%4s %f %u %u %f %u %7s %n", mode,
+                                   &params.amplitudeDbfs, &frequency, &duration,
+                                   &params.volumePercent, &settle, sequence, &consumed);
+    const char *remaining = command.c_str() + 11 + consumed;
+    const bool trimParsed = fields == 7 && (!remaining[0] ||
+        std::sscanf(remaining, "%f %c", &params.dacTrimDb, &extra) == 1);
+    if (!trimParsed || (std::strcmp(mode, "dac") && std::strcmp(mode, "both") && std::strcmp(mode, "drc")) ||
+        (std::strcmp(sequence, "cold") && std::strcmp(sequence, "capture") && std::strcmp(sequence, "resume")) ||
+        !canSleep()) {
+      Serial.printf("[ToneDone] {\"pass\":false,\"quiescent\":%s,\"framecount\":0,\"reason\":\"busy_or_invalid_command\"}\n",
+                    codec_.quiescent() ? "true" : "false");
+      return;
+    }
+    params.both = !std::strcmp(mode, "both");
+    params.speechLeveling = !std::strcmp(mode, "drc");
+    params.frequencyHz = frequency;
+    params.durationMs = duration;
+    params.settleMs = settle;
+    params.sequence = !std::strcmp(sequence, "capture") ? ToneTestParams::Sequence::CaptureFirst :
+                      !std::strcmp(sequence, "resume") ? ToneTestParams::Sequence::Resume : ToneTestParams::Sequence::Cold;
+    runToneTest(codec_, params);
+    markActivity();
+    return;
+  }
+  if (command == "assistant-early-start" && !isSyncActive() && !isAudioActive()) {
+    prepareWakeCapture();
+    delay(100); // diagnostic only: establish a prefix before choosing the PTT consumer
+    startAssistant();
+    return;
+  }
+  if (command == "power-selftest 1" || command == "power-selftest 30") {
+    if (!storageReady_ || !canSleep()) {
+      Serial.println("[PowerTestDone] rejected=busy_or_storage_unavailable");
+      return;
+    }
+    const bool passed = runPowerSelfTest(capture_, recorder_, codec_, settingsStore_.get().micGainDb,
+                                         command == "power-selftest 30" ? 30 : 1);
+    Serial.printf("[PowerTestResult] success=%d\n", passed);
+    markActivity();
+    return;
+  }
+#endif
   if (command == "assistant-models" || command == "assistant-enable") {
     probeAssistantModels(command == "assistant-enable"); return;
   }
@@ -1409,6 +1562,12 @@ void App::diagnosticCommand(const String &command) {
   }
   if (command == "status") {
     const Settings &cfg = settingsStore_.get();
+    Serial.printf("[Jobs] screen=%d recording=%d capture_pending=%d capture_active=%d recorder_active=%d assistant_active=%d sync_active=%d export_active=%d\n",
+                  (int)screen_, recording_, capturePending_, capture_.active(), recorder_.isActive(),
+                  assistantJob_.active(), isSyncActive(), isExportActive());
+    Serial.printf("[PowerConfig] sample_rate=%lu mic_gain_db=%.1f volume_percent=%.1f timeout_sec=%u auto_sync=%d\n",
+                  (unsigned long)cfg.audioSampleRateHz, cfg.micGainDb, cfg.speakerVolumePercent,
+                  cfg.screensaverTimeoutSec, cfg.autoSyncEnabled);
     Serial.printf("[Status] notas=%d pendentes=%d livres=%llu gravaveis=%llu psram=%u\n",
                   notes_.count(), notes_.countPendingSync(cfg.sttEndpoint[0], settingsStore_.hasDriveAuth()),
                   (unsigned long long)NoteFiles::freeBytes(), (unsigned long long)NoteFiles::recordingBytes(),

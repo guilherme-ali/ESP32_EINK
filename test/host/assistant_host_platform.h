@@ -39,6 +39,9 @@ void vTaskSuspend(TaskHandle_t);
 void vTaskDelete(TaskHandle_t);
 uint32_t millis();
 uint64_t assistantMonotonicUs();
+unsigned uxTaskGetStackHighWaterMark(TaskHandle_t);
+struct AssistantHostSerial { void printf(const char *, ...); };
+extern AssistantHostSerial Serial;
 void esp_fill_random(void *, size_t);
 int mbedtls_sha1_ret(const unsigned char *, size_t, unsigned char *);
 constexpr unsigned MALLOC_CAP_SPIRAM = 1, MALLOC_CAP_8BIT = 2;
@@ -46,12 +49,43 @@ void *heap_caps_malloc(size_t, unsigned);
 
 class AudioCodec {
 public:
+  bool prepareCapture(uint32_t, float);
+  bool preparePlayback(uint32_t, float, bool boundedSpeech = false);
+  void end();
   bool setSampleRate(uint32_t);
   bool enable(bool);
   bool setMicGain(float) { return true; }
   bool setVolume(float) { return true; }
+  float volumePercent() const;
+  bool readRegister(uint8_t, uint16_t &);
   bool read(void *, size_t, size_t *, uint32_t);
   bool write(const void *, size_t, size_t *, uint32_t);
+};
+// Dedicated boundary fake: the session owns a producer and returns mono PCM
+// already converted to the requested rate, not another reader of AudioCodec.
+class CaptureSession {
+public:
+  ~CaptureSession() { end(); }
+  bool start(AudioCodec &, uint32_t, float);
+  bool setOutputRate(uint32_t);
+  bool read(int16_t *, size_t, size_t *, uint32_t timeoutMs = 100);
+  void requestStop();
+  bool finished() const { return finished_.load(); }
+  bool drained() const;
+  bool failed() const;
+  bool active() const { return !finished_.load() && !ended_.load(); }
+  uint32_t overflowCount() const;
+  uint32_t inputRate() const { return inputRate_; }
+  void end();
+private:
+  AudioCodec *codec_ = nullptr;
+  std::thread producer_;
+  mutable std::mutex mutex_;
+  std::vector<int16_t> pcm_;
+  size_t cursor_ = 0;
+  uint32_t inputRate_ = 0;
+  bool readStarted_ = false, outputReady_ = false;
+  std::atomic<bool> stop_{false}, finished_{false}, ended_{true};
 };
 struct HttpResponse {
   int statusCode = 0;
@@ -98,8 +132,23 @@ extern std::atomic<bool> phoneRoute, releaseResponseTail, responseHeadRead, fast
 extern std::atomic<bool> earlyPlayback;
 extern std::string delayedAfterEnd;
 extern std::atomic<size_t> playbackWriteLimit;
+extern std::atomic<size_t> failPlaybackAfter, pausePlaybackAfter;
+extern std::atomic<bool> playbackPaused;
+extern std::atomic<unsigned> audioStackBytes;
+extern std::string serialOutput;
 extern std::atomic<unsigned> closeDelayMs;
 extern std::atomic<bool> closingSocket, writeDuringClose;
+extern std::vector<int16_t> sessionPrefix, sessionTail;
+extern std::atomic<unsigned> capturePreparations, playbackPreparations, sessionReads, sessionEnds;
+extern std::atomic<unsigned> sessionStopRequests;
+extern std::atomic<bool> sessionProducerAlive, sessionStopRequested, sessionReadAfterEnd;
+extern std::atomic<bool> sessionFail, sessionOverflow, sessionRejectRate, failPrepareCapture, failPreparePlayback;
+extern std::atomic<bool> playbackBeforeSessionEnd;
+extern std::atomic<uint32_t> sessionOutputRate;
+extern std::atomic<float> playbackVolume;
+extern std::string wireAfterSetup, wireAfterEnd, wireAfterToolResponse;
+extern std::atomic<bool> eofAfterSetup, eofAfterEnd, eofAfterToolResponse;
+extern std::atomic<bool> wireTailRead;
 void reset();
 void sleep(unsigned ms);
 std::vector<std::string> messages();

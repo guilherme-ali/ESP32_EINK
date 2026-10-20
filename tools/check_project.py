@@ -136,8 +136,9 @@ def main() -> int:
     print(f"Host build (progress_tests, sem SDK): {'OK' if portable_ok else 'FALHOU'}")
     ok = (run([str(portable)], timeout=30) if portable_ok else False) and ok
     recorder = BUILD / ("recorder_tests" + (".exe" if os.name == "nt" else ""))
-    recorder_ok = run([cxx, *flags, "-pthread", "-Werror",
-                       str(ROOT / "src" / "audio" / "recorder.cpp"),
+    recorder_ok = run([cxx, "-I" + str(HOST / "recorder_stubs"), *flags, "-pthread", "-Werror",
+                        str(ROOT / "src" / "audio" / "recorder.cpp"),
+                        str(ROOT / "src" / "audio" / "capture_session.cpp"),
                        *(str(path) for path in SOURCES), str(HOST / "fakes.cpp"),
                        str(HOST / "recorder_tests.cpp"), str(obj), "-Wl,--gc-sections", "-o", str(recorder)],
                       diagnostics=True)
@@ -158,7 +159,8 @@ def main() -> int:
                            "--suppress=normalCheckLevelMaxBranches",
                            "-I" + str(HOST / "stubs"), "-I" + str(cjson),
                             *(str(path) for path in SOURCES),
-                            str(ROOT / "src" / "audio" / "recorder.cpp")], cwd=lint_cwd,
+                             str(ROOT / "src" / "audio" / "recorder.cpp"),
+                             str(ROOT / "src" / "audio" / "capture_session.cpp")], cwd=lint_cwd,
                           diagnostics=True)
             print(f"cppcheck: {'OK' if lint_ok else 'FALHOU'}")
             ok = lint_ok and ok

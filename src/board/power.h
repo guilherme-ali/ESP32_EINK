@@ -14,12 +14,13 @@
 // pino ficando em LOW - o problema so aparece na bateria sozinha:
 // desligar esse pino, mesmo que so um instante (como fazia antes ao
 // redor de cada leitura de ADC), derruba a energia do aparelho inteiro
-// na hora. Por isso vbatOn() e chamado uma vez no construtor e nunca
+// na hora. Por isso vbatOn() e aplicado no inicio do setup e nunca
 // mais desligado no uso normal (nem antes do deep sleep - o latch
 // precisa continuar ligado pro aparelho conseguir acordar depois).
 class BoardPower {
 public:
   BoardPower(uint8_t epdPin, uint8_t audioPin, uint8_t vbatPin);
+  void begin(); // preload safe levels before releasing deep-sleep holds
 
   void epdOn();
   void epdOff();

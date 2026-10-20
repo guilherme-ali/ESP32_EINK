@@ -9,6 +9,10 @@
 // ao resto do app desde o boot).
 namespace Screens {
 
+// Apenas framebuffer, SEM refresh/IO. Permite o primeiro FULL ja com conteudo.
+// Estado de voz minimalista: titulo FONT_CLOCK, icone e uma unica dica BODY.
+void paintVoiceState(Canvas &canvas, const char *title, const char *hint, bool listening);
+
 // Hora grande + data por extenso + status que antes vivia na tela de
 // bloqueio (notas, pendentes, bateria, temperatura/umidade opcional).
 // timeValid=false (RTC nunca sincronizado) mostra "--:--" e omite a data.

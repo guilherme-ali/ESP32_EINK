@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include <string.h>
+#include <stdlib.h>
 #include "es8311_codec.h"
 #include "es8311_reg.h"
 #include "esp_log.h"
@@ -231,11 +232,11 @@ static int es8311_set_bits_per_sample(audio_codec_es8311_t *codec, int bits)
 
 static int get_coeff(uint32_t mclk, uint32_t rate)
 {
-    for (int i = 0; i < (sizeof(coeff_div) / sizeof(coeff_div[0])); i++) {
+    for (int i = 0; i < (int)(sizeof(coeff_div) / sizeof(coeff_div[0])); i++) {
         if (coeff_div[i].rate == rate && coeff_div[i].mclk == mclk)
             return i;
     }
-    return ESP_CODEC_DEV_NOT_FOUND;
+    return -1; // esp_err_t NOT_FOUND is positive and is not a valid array index.
 }
 
 static int es8311_suspend(audio_codec_es8311_t *codec)
@@ -262,7 +263,11 @@ static int es8311_start(audio_codec_es8311_t *codec)
 {
     int ret = ESP_CODEC_DEV_OK;
     int adc_iface = 0, dac_iface = 0;
+    const bool adc = (codec->cfg.codec_mode & ESP_CODEC_DEV_WORK_MODE_ADC) != 0;
+    const bool dac = (codec->cfg.codec_mode & ESP_CODEC_DEV_WORK_MODE_DAC) != 0;
     int regv = 0x80;
+    if (!adc) regv |= 0x02; // Hold unused ADC digital block in reset.
+    if (!dac) regv |= 0x01; // Hold unused DAC digital block in reset.
     if (codec->cfg.master_mode) {
         regv |= 0x40;
     } else {
@@ -270,6 +275,8 @@ static int es8311_start(audio_codec_es8311_t *codec)
     }
     ret |= es8311_write_reg(codec, ES8311_RESET_REG00, regv);
     regv = 0x3F;
+    if (!adc) regv &= ~0x08; // CLKADC_ON, ES8311 User Guide section 8.5.
+    if (!dac) regv &= ~0x04; // CLKDAC_ON.
     if (codec->cfg.use_mclk) {
         regv &= 0x7F;
     } else {
@@ -282,7 +289,7 @@ static int es8311_start(audio_codec_es8311_t *codec)
     }
     ret |= es8311_write_reg(codec, ES8311_CLK_MANAGER_REG01, regv);
 
-    ret = es8311_read_reg(codec, ES8311_SDPIN_REG09, &dac_iface);
+    ret |= es8311_read_reg(codec, ES8311_SDPIN_REG09, &dac_iface);
     ret |= es8311_read_reg(codec, ES8311_SDPOUT_REG0A, &adc_iface);
     if (ret != ESP_CODEC_DEV_OK) {
         return ret;
@@ -306,22 +313,23 @@ static int es8311_start(audio_codec_es8311_t *codec)
     ret |= es8311_write_reg(codec, ES8311_SDPIN_REG09, dac_iface);
     ret |= es8311_write_reg(codec, ES8311_SDPOUT_REG0A, adc_iface);
 
-    ret |= es8311_write_reg(codec, ES8311_ADC_REG17, 0xBF);
-    ret |= es8311_write_reg(codec, ES8311_SYSTEM_REG0E, 0x02);
-    ret |= es8311_write_reg(codec, ES8311_SYSTEM_REG12, 0x00);
-    ret |= es8311_write_reg(codec, ES8311_SYSTEM_REG14, 0x1A);
+    ret |= es8311_write_reg(codec, ES8311_ADC_REG17, adc ? 0xBF : 0x00);
+    ret |= es8311_write_reg(codec, ES8311_SYSTEM_REG0E, adc ? 0x02 : 0x72);
+    ret |= es8311_write_reg(codec, ES8311_SYSTEM_REG12, dac ? 0x00 : 0x02);
+    ret |= es8311_write_reg(codec, ES8311_SYSTEM_REG14, adc ? 0x1A : 0x00);
 
     // pdm dmic enable or disable
     regv = 0;
     ret |= es8311_read_reg(codec, ES8311_SYSTEM_REG14, &regv);
-    if (codec->cfg.digital_mic) {
+    if (adc && codec->cfg.digital_mic) {
         regv |= 0x40;
     } else {
         regv &= ~(0x40);
     }
     ret |= es8311_write_reg(codec, ES8311_SYSTEM_REG14, regv);
-    ret |= es8311_write_reg(codec, ES8311_SYSTEM_REG0D, 0x01);
-    ret |= es8311_write_reg(codec, ES8311_ADC_REG15, 0x40);
+    // Power down the unused converter reference/bias (User Guide section 9.2).
+    ret |= es8311_write_reg(codec, ES8311_SYSTEM_REG0D, 0x01 | (!adc ? 0x30 : 0) | (!dac ? 0x08 : 0));
+    ret |= es8311_write_reg(codec, ES8311_ADC_REG15, adc ? 0x40 : 0x00);
     ret |= es8311_write_reg(codec, ES8311_DAC_REG37, 0x08);
     ret |= es8311_write_reg(codec, ES8311_GP_REG45, 0x00);
     return ret;
@@ -399,9 +407,10 @@ static void es8311_pa_power(audio_codec_es8311_t *codec, es_pa_setting_t pa_sett
         return;
     }
     if (pa_setting & ES_PA_SETUP) {
+        codec->cfg.gpio_if->set(pa_pin, codec->cfg.pa_reverted ? true : false);
         codec->cfg.gpio_if->setup(pa_pin, AUDIO_GPIO_DIR_OUT, AUDIO_GPIO_MODE_FLOAT);
     } 
-    if (pa_setting & ES_PA_ENABLE) {
+    if ((pa_setting & ES_PA_ENABLE) && (codec->cfg.codec_mode & ESP_CODEC_DEV_WORK_MODE_DAC)) {
         codec->cfg.gpio_if->set(pa_pin, codec->cfg.pa_reverted ? false : true);
     }
     if (pa_setting & ES_PA_DISABLE) {
@@ -470,7 +479,7 @@ static int es8311_config_sample(audio_codec_es8311_t *codec, int sample_rate)
     regv |= coeff_div[coeff].lrck_l << 0;
     ret |= es8311_write_reg(codec, ES8311_CLK_MANAGER_REG08, regv);
 
-    ret = es8311_read_reg(codec, ES8311_CLK_MANAGER_REG06, &regv);
+    ret |= es8311_read_reg(codec, ES8311_CLK_MANAGER_REG06, &regv);
     regv &= 0xE0;
     if (coeff_div[coeff].bclk_div < 19) {
         regv |= (coeff_div[coeff].bclk_div - 1) << 0;
@@ -489,6 +498,7 @@ static int es8311_open(const audio_codec_if_t *h, void *cfg, int cfg_size)
         return ESP_CODEC_DEV_INVALID_ARG;
     }
     memcpy(&codec->cfg, cfg, sizeof(es8311_codec_cfg_t));
+    es8311_pa_power(codec, ES_PA_SETUP | ES_PA_DISABLE);
     if (codec->cfg.mclk_div == 0) {
         codec->cfg.mclk_div = MCLK_DEFAULT_DIV;
     }
@@ -512,7 +522,7 @@ static int es8311_open(const audio_codec_if_t *h, void *cfg, int cfg_size)
     ret |= es8311_write_reg(codec, ES8311_SYSTEM_REG11, 0x7F);
     ret |= es8311_write_reg(codec, ES8311_RESET_REG00, 0x80);
 
-    ret = es8311_read_reg(codec, ES8311_RESET_REG00, &regv);
+    ret |= es8311_read_reg(codec, ES8311_RESET_REG00, &regv);
     if (codec_cfg->master_mode) {
         ESP_LOGI(TAG, "Work in Master mode");
         regv |= 0x40;
@@ -557,8 +567,13 @@ static int es8311_open(const audio_codec_if_t *h, void *cfg, int cfg_size)
     if (ret != 0) {
         return ESP_CODEC_DEV_WRITE_FAIL;
     }
-    es8311_pa_power(codec, ES_PA_SETUP | ES_PA_ENABLE);
     codec->is_open = true;
+    codec->enabled = false;
+    // Open must be a real suspended state, not merely enabled=false in RAM.
+    if (es8311_set_mute(h, true) != ESP_CODEC_DEV_OK || es8311_suspend(codec) != ESP_CODEC_DEV_OK) {
+        codec->is_open = false;
+        return ESP_CODEC_DEV_WRITE_FAIL;
+    }
     return ESP_CODEC_DEV_OK;
 }
 
@@ -569,9 +584,11 @@ static int es8311_close(const audio_codec_if_t *h)
         return ESP_CODEC_DEV_INVALID_ARG;
     }
     if (codec->is_open) {
-        es8311_suspend(codec);
         es8311_pa_power(codec, ES_PA_DISABLE);
+        es8311_set_mute(h, true);
+        es8311_suspend(codec);
         codec->is_open = false;
+        codec->enabled = false;
     }
     return ESP_CODEC_DEV_OK;
 }
@@ -582,10 +599,11 @@ static int es8311_set_fs(const audio_codec_if_t *h, esp_codec_dev_sample_info_t 
     if (codec == NULL || codec->is_open == false) {
         return ESP_CODEC_DEV_INVALID_ARG;
     }
-    es8311_set_bits_per_sample(codec, fs->bits_per_sample);
-    es8311_config_fmt(codec, ES_I2S_NORMAL);
-    es8311_config_sample(codec, fs->sample_rate);
-    return ESP_CODEC_DEV_OK;
+    if (fs == NULL) return ESP_CODEC_DEV_INVALID_ARG;
+    int ret = es8311_set_bits_per_sample(codec, fs->bits_per_sample);
+    ret |= es8311_config_fmt(codec, ES_I2S_NORMAL);
+    ret |= es8311_config_sample(codec, fs->sample_rate);
+    return ret;
 }
 
 static int es8311_enable(const audio_codec_if_t *h, bool enable)
@@ -598,15 +616,23 @@ static int es8311_enable(const audio_codec_if_t *h, bool enable)
     if (codec->is_open == false) {
         return ESP_CODEC_DEV_WRONG_STATE;
     }
-    if (enable == codec->enabled) {
+    if (!enable) es8311_pa_power(codec, ES_PA_DISABLE);
+    if (enable && codec->enabled) {
         return ESP_CODEC_DEV_OK;
     }
     if (enable) {
         ret = es8311_start(codec);
-        es8311_pa_power(codec, ES_PA_ENABLE);
+        if (ret == ESP_CODEC_DEV_OK) {
+            es8311_pa_power(codec, ES_PA_ENABLE);
+        } else {
+            es8311_pa_power(codec, ES_PA_DISABLE);
+            es8311_suspend(codec);
+        }
     } else {
-        es8311_pa_power(codec, ES_PA_DISABLE);
-        ret = es8311_suspend(codec);
+        ret = es8311_set_mute(h, true);
+        ret |= es8311_suspend(codec);
+        // A partial suspend must not leave a subsequent enable as a no-op.
+        codec->enabled = false;
     }
     if (ret == ESP_CODEC_DEV_OK) {
         codec->enabled = enable;

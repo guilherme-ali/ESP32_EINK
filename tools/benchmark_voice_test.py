@@ -449,6 +449,20 @@ class SerialSessionTest(unittest.TestCase):
         events = benchmark.SerialSession(port, Mock()).read()
         self.assertNotIn("token", events[0]["fields"])
 
+    def test_numeric_playback_and_display_telemetry_without_payload(self):
+        port = FakePort(b"[PlaybackSource] kind=assistant scope=offered rms_dbfs=-25.125 samples=42 token=secret\n"
+                        b"[ListeningFeedback] state=0 refresh_done_us=123 ok=1 texto=private\n"
+                        b"[AssistantAudio] stage=capture stack_min_bytes=3000 secret=private\n")
+        events = []
+        session = benchmark.SerialSession(port, Mock())
+        while port.in_waiting:
+            events.extend(session.read())
+        self.assertEqual(events[0]["fields"]["rms_dbfs"], "-25.125")
+        self.assertEqual(events[1]["fields"], {"state": "0", "refresh_done_us": "123", "ok": "1"})
+        self.assertEqual(events[2]["fields"], {"stage": "capture", "stack_min_bytes": "3000"})
+        self.assertNotIn("secret", str(events))
+        self.assertNotIn("private", str(events))
+
     def test_media_parser_preserves_profile_and_wire_bytes_without_payload_fields(self):
         port = FakePort(b"[AssistantMedia] turn=42 media=opus64 tx_bytes=123 rx_bytes=456 token=secret texto=private\n",
                         chunk_size=3)
@@ -595,7 +609,7 @@ class PersistenceAndFailureTest(unittest.TestCase):
         self.assertTrue(errors)
         self.assertEqual(session.command.call_count, 151)
 
-    def test_turn_timeout_and_none_prompt_end_still_save_recording_csv_and_jsonl(self):
+    def test_turn_timeout_and_none_prompt_end_still_save_recording_csv_and_jsonl(self, early_capture=False):
         class Clock:
             now = 0
 
@@ -609,8 +623,12 @@ class PersistenceAndFailureTest(unittest.TestCase):
         class Session:
             started = False
 
+            def __init__(self):
+                self.commands = []
+
             def command(self, command, *args, observer=None, **kwargs):
-                if command == "assistant-start":
+                self.commands.append(command)
+                if command in ("assistant-start", "assistant-early-start"):
                     self.started = True
                 if command == "status" and self.started:
                     return [event("Assistant", turn=1, state=2, captured_ms=100, released=0, finished=0)]
@@ -637,17 +655,21 @@ class PersistenceAndFailureTest(unittest.TestCase):
             def close(self):
                 pass
 
-        args = SimpleNamespace(playback="ready", media="legacy", samplerate=8000, timeout=0.2, tail_seconds=0.01)
+        args = SimpleNamespace(playback="ready", media="legacy", samplerate=8000, timeout=0.2, tail_seconds=0.01,
+                               early_capture=early_capture)
+        session = Session()
         clock = Clock()
         with tempfile.TemporaryDirectory(dir=TEMP_ROOT) as folder:
             log = benchmark.RunLog(Path(folder), {})
             log.trial_id = "trial-0001"
             try:
                 with patch.object(benchmark.time, "monotonic", clock.monotonic), patch.object(benchmark.time, "sleep", clock.sleep):
-                    result = benchmark.run_trial(args, Session(), log, np, SimpleNamespace(Stream=Stream), (0, 1),
+                    result = benchmark.run_trial(args, session, log, np, SimpleNamespace(Stream=Stream), (0, 1),
                                                  (Path("fixture.wav"), voice(8000, 0.4).reshape(-1, 1), "digest", 8000),
                                                  "wifi", 1, 1, None)
                 self.assertTrue(result["timed_out"])
+                self.assertIn("assistant-early-start" if early_capture else "assistant-start", session.commands)
+                self.assertEqual(result["capture_path"], "adopted" if early_capture else "direct")
                 self.assertFalse(result["valid"])
                 self.assertIsNone(result["latency_ms"])
                 self.assertIn("turn_timeout", result["failure_reason"])
@@ -657,6 +679,9 @@ class PersistenceAndFailureTest(unittest.TestCase):
                 self.assertNotEqual(benchmark.exit_code([result]), 0)
             finally:
                 log.close()
+
+    def test_early_capture_command_is_explicit_and_persists_its_path(self):
+        self.test_turn_timeout_and_none_prompt_end_still_save_recording_csv_and_jsonl(True)
 
     def test_media_profile_gates_synthetic_trial_and_persists_json_csv(self):
         prompt = voice(8000, 0.4).reshape(-1, 1)

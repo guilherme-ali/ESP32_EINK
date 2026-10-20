@@ -3,11 +3,13 @@
 // Compilar com -std=c++17 -pthread -ffunction-sections -fdata-sections,
 // -Itest/host/stubs, -I<diretorio cJSON.h> e -Wl,--gc-sections.
 #include "../../src/audio/recorder.h"
+#include "../../src/audio/capture_session.h"
 #include "../../src/audio/wav.h"
 #include "../../src/storage/note_files.h"
 #include <FSImpl.h>
 #include <LittleFS.h>
 #include <freertos/stream_buffer.h>
+#include <esp_heap_caps.h>
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -50,11 +52,20 @@ struct Source {
   uint32_t seed = 1;
   size_t chunkFrames = 512;
   bool paced = true;
+  bool failPrepare = false, malformed = false;
+  size_t failAtFrame = SIZE_MAX;
+  size_t failedReadBytes = 0, invalidAtFrame = SIZE_MAX, invalidReadBytes = 0;
+  std::atomic<size_t> pauseAtFrame{SIZE_MAX};
+  std::atomic<size_t> prepareCalls{0}, endCalls{0}, readers{0}, maxReaders{0};
   std::atomic<bool> allowRead{false}, eof{false};
   std::atomic<size_t> calls{0}, emittedFrames{0};
+  std::atomic<size_t> emptyReads{0};
   void configure(size_t frames, uint32_t newSeed = 1, bool pacing = true, size_t chunk = 512) {
     totalFrames = frames; nextFrame = 0; seed = newSeed; paced = pacing; chunkFrames = chunk;
     allowRead = false; eof = false; calls = emittedFrames = 0;
+    failPrepare = malformed = false; failAtFrame = invalidAtFrame = SIZE_MAX;
+    failedReadBytes = invalidReadBytes = 0; emptyReads = 0;
+    pauseAtFrame = SIZE_MAX; prepareCalls = endCalls = readers = maxReaders = 0;
   }
 } source;
 
@@ -111,6 +122,53 @@ struct Recording {
     CHECK(!recorder.isActive()); CHECK(!HostRTOS::activeTasks.load());
   }
 };
+
+struct EarlyRecording {
+  AudioCodec codec;
+  CaptureSession session;
+  Recorder recorder;
+  ~EarlyRecording() {
+    source.allowRead = true;
+    HostRTOS::allowTask("session_cap");
+    waitCleanup(recorder);
+    session.end();
+    HostRTOS::joinAll();
+  }
+  void start(size_t frames, uint32_t seed = 1, uint32_t input = rate, bool paced = true) {
+    source.configure(frames, seed, paced);
+    HostRTOS::allowTask("session_cap", false); HostRTOS::allowTask("audio_wr", false);
+    CHECK(session.start(codec, input, 24));
+  }
+  void releaseCapture() { source.allowRead = true; HostRTOS::allowTask("session_cap"); }
+  void stopCapture() {
+    session.requestStop();
+    HostRTOS::allowTask("session_cap");
+    waitFor([this] { return session.finished(); }, "producer da sessao terminou");
+  }
+  void finalize() {
+    HostRTOS::allowTask("audio_wr");
+    waitFor([this] { return recorder.isFinished(); }, "writer da sessao drenou");
+    HostRTOS::joinAll();
+    CHECK(source.endCalls == 0); // Codec ainda pertence a sessao ate finish().
+    recorder.finish();
+    CHECK(!session.active() && !recorder.isActive() && source.endCalls == 1);
+  }
+};
+
+std::string convertedPcm(size_t frames, uint32_t seed, uint32_t input, uint32_t output) {
+  PcmRateConverter converter;
+  CHECK(converter.configure(input, output));
+  std::string result;
+  auto append = [&result](int16_t value) {
+    result.push_back(static_cast<char>(value));
+    result.push_back(static_cast<char>(static_cast<uint16_t>(value) >> 8));
+  };
+  int16_t value = 0;
+  for (size_t i = 0; i < frames; ++i)
+    if (converter.push(static_cast<int16_t>(sample(i, seed)), value)) append(value);
+  while (converter.finish(value)) append(value);
+  return result;
+}
 WavHeader storedHeader(const char *path = wavPath) {
   const auto raw = LittleFS.bytes(path);
   CHECK(raw.size() == sizeof(WavHeader));
@@ -501,16 +559,341 @@ TEST(legacy_finalized_wav_still_reads_exactly_without_sidecar_or_rewrite) {
   const auto pcm = expectedPcm(3001, 67);
   checkRecovered(headerBytes(makeWavHeader(rate, 1, static_cast<uint32_t>(pcm.size()))) + pcm, pcm, false);
 }
+
+TEST(session_exclusive_owner_immediate_stop_end_idempotent_and_reuse) {
+  EarlyRecording r; r.start(1000);
+  CaptureSession other; AudioCodec otherCodec;
+  CHECK(!other.start(otherCodec, rate, 24) && source.prepareCalls == 1);
+  CHECK(!r.session.start(r.codec, rate, 24));
+  CHECK(r.session.active() && !r.session.finished() && !r.session.drained());
+  r.session.requestStop(); r.releaseCapture();
+  waitFor([&] { return r.session.finished(); }, "stop antes primeiro read I2S");
+  CHECK(source.calls == 0 && source.endCalls == 0 && !r.session.failed());
+  int16_t mono; size_t count = 99;
+  CHECK(r.session.read(&mono, 1, &count, 0) && count == 0 && r.session.drained());
+  CHECK(!r.session.setOutputRate(8000));
+  r.session.end(); r.session.end(); CHECK(source.endCalls == 1);
+  CHECK(other.start(otherCodec, rate, 24)); other.requestStop(); other.end();
+  HostRTOS::joinAll(); CHECK(source.endCalls == 2);
+}
+
+TEST(session_early_prefix_adopted_once_in_order_without_second_capture_or_ring) {
+  EarlyRecording r; r.start(3 * rate + 37, 0x411);
+  source.pauseAtFrame = 777; r.releaseCapture();
+  waitFor([] { return source.emittedFrames == 777; }, "prefixo anterior ao destino");
+  CHECK(HostRTOS::sentBytes == 777 * 2 && HostRTOS::receivedBytes == 0);
+  CHECK(!LittleFS.exists(wavPath) && source.endCalls == 0);
+  CHECK(r.recorder.start(wavPath, rate, &r.session));
+  CHECK(HostRTOS::createCalls == 2 && HostRTOS::streamCreates == 1 && source.prepareCalls == 1);
+  CHECK(HostRecorderHeap::calls == 1 && HostRecorderHeap::bytes == 8 * rate * 2 + 1);
+  CHECK(r.recorder.finish() == 0 && r.session.active());
+  source.pauseAtFrame = SIZE_MAX; HostRTOS::allowTask("audio_wr");
+  waitFor([] { return source.eof.load(); }, "fluxo posterior ao prefixo");
+  r.recorder.requestStop(); r.finalize();
+  CHECK(source.maxReaders == 1 && !r.recorder.writeFailed() && !r.recorder.overflowCount());
+  CHECK(HostRecorderHeap::calls == 1); // Sem alocacao PSRAM por bloco/amostra.
+  CHECK(HostRTOS::sentBytes == (3 * rate + 37) * 2 && HostRTOS::sentBytes == HostRTOS::receivedBytes);
+  checkAudio(wavPath, 3 * rate + 37, 0x411); checkAppendOnly();
+  CHECK(r.recorder.checkpointBytes() == r.recorder.bytesWritten());
+}
+
+TEST(session_overflow_terminal_preserves_eight_second_mono_prefix_and_drains_failure) {
+  EarlyRecording r; r.start(SIZE_MAX, 72, rate, false); r.releaseCapture();
+  waitFor([&] { return r.session.finished(); }, "overflow terminal da sessao");
+  CHECK(r.session.failed() && r.session.overflowCount() == 1 && !r.session.drained());
+  CHECK(HostRTOS::streamHighWater == 8 * rate * 2 && source.endCalls == 0);
+  size_t calls = source.calls; std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  CHECK(source.calls == calls);
+  CHECK(r.recorder.start(wavPath, rate, &r.session)); r.finalize();
+  CHECK(r.recorder.writeFailed() && r.recorder.overflowCount() == 1);
+  checkAudio(wavPath, 8 * rate, 72); checkAppendOnly();
+}
+
+TEST(session_codec_read_failure_drains_accepted_prefix_without_false_success) {
+  EarlyRecording r; r.start(10000, 99); source.failAtFrame = 1024; r.releaseCapture();
+  waitFor([&] { return r.session.finished(); }, "erro explicito do codec");
+  CHECK(r.session.failed() && !r.session.overflowCount() && source.endCalls == 0);
+  CHECK(r.recorder.start(wavPath, rate, &r.session)); r.finalize();
+  CHECK(r.recorder.writeFailed()); checkAudio(wavPath, 1024, 99);
+}
+
+TEST(session_task_prepare_stream_failures_cleanup_and_allow_retry) {
+  for (unsigned fault = 0; fault < 4; ++fault) {
+    EarlyRecording r;
+    source.configure(1000);
+    if (fault == 0) HostRTOS::failTaskName = "session_cap";
+    if (fault == 1) source.failPrepare = true;
+    if (fault == 2) HostRTOS::failStreamCreate = true;
+    if (fault == 3) HostRecorderHeap::fail = true;
+    CHECK(!r.session.start(r.codec, rate, 24));
+    CHECK(r.session.failed() && !r.session.active() && r.session.finished());
+    CHECK(source.endCalls == (fault >= 2 ? 0 : 1));
+    HostRTOS::failTaskName.clear(); HostRTOS::failStreamCreate = false;
+    HostRecorderHeap::fail = false;
+    source.failPrepare = false;
+    CHECK(r.session.start(r.codec, rate, 24)); r.stopCapture(); r.session.end();
+    HostRTOS::joinAll();
+  }
+}
+
+TEST(session_destination_admission_failure_does_not_consume_prefix_or_release_external_owner) {
+  EarlyRecording r; r.start(1024, 88); r.releaseCapture();
+  waitFor([] { return source.eof.load(); }, "prefixo antes falha FS"); r.stopCapture();
+  LittleFS.faults->failOpen = tmpPath;
+  CHECK(!r.recorder.start(wavPath, rate, &r.session));
+  CHECK(r.session.active() && !r.session.drained() && source.endCalls == 0);
+  CHECK(HostRTOS::receivedBytes == 0 && HostRTOS::createCalls == 1);
+  LittleFS.faults->failOpen.clear();
+  CHECK(r.recorder.start(wavPath, rate, &r.session)); r.finalize();
+  checkAudio(wavPath, 1024, 88);
+}
+
+TEST(session_writer_task_failure_joins_producer_before_codec_release) {
+  EarlyRecording r; r.start(1000); r.releaseCapture();
+  HostRTOS::failTaskName = "audio_wr";
+  CHECK(!r.recorder.start(wavPath, rate, &r.session));
+  HostRTOS::joinAll();
+  CHECK(!r.session.active() && !r.recorder.isActive() && source.endCalls == 1);
+  CHECK(!LittleFS.exists(wavPath) && !LittleFS.exists(pcmPath));
+}
+
+TEST(session_converter_counts_tail_order_and_output_rate_lock_across_read_boundaries) {
+  for (uint32_t input : {16000U, 32000U, 44100U, 48000U}) {
+    for (size_t capacity : {size_t(1), size_t(13), size_t(733)}) {
+      EarlyRecording r; r.start(1001, 133, input);
+      const uint32_t output = input == 16000 ? 8000 : 16000;
+      CHECK(r.session.setOutputRate(output));
+      CHECK(!r.session.setOutputRate(input + 1));
+      r.releaseCapture(); waitFor([] { return source.eof.load(); }, "dados para conversor"); r.stopCapture();
+      CHECK(!r.session.drained() && !r.session.failed());
+      std::vector<int16_t> buffer(capacity); std::string actual;
+      size_t reads = 0;
+      while (!r.session.drained()) {
+        size_t count = SIZE_MAX;
+        CHECK(r.session.read(buffer.data(), capacity, &count, 0));
+        CHECK(count <= capacity && ++reads < 2000);
+        actual.append(reinterpret_cast<const char *>(buffer.data()), count * 2);
+        CHECK(!r.session.setOutputRate(input));
+      }
+      CHECK(actual == convertedPcm(1001, 133, input, output));
+      CHECK(actual.size() == ((uint64_t(1001) * output + input - 1) / input) * 2);
+      CHECK(source.endCalls == 0); r.session.end(); HostRTOS::joinAll();
+    }
+  }
+}
+
+TEST(session_timeout_is_bounded_and_malformed_input_is_terminal) {
+  EarlyRecording r; r.start(1000);
+  CHECK(!r.session.setOutputRate(12000));
+  CHECK(r.session.setOutputRate(rate)); // Rejeicao anterior nao impede nova selecao.
+  int16_t buffer[128]; size_t count = 3;
+  const auto begin = Clock::now();
+  CHECK(r.session.read(buffer, 128, &count, 20) && count == 0);
+  CHECK(Clock::now() - begin < std::chrono::milliseconds(100));
+  CHECK(!r.session.setOutputRate(8000));
+  source.malformed = true; r.releaseCapture();
+  waitFor([&] { return r.session.finished(); }, "bloco estereo invalido");
+  CHECK(r.session.failed() && !r.session.read(buffer, 128, &count, 0));
+  CHECK(!count && r.session.drained());
+}
+
+TEST(session_end_waits_inflight_codec_read_and_destructor_releases_exclusive_owner) {
+  source.configure(1000);
+  AudioCodec codec;
+  {
+    CaptureSession session; CHECK(session.start(codec, rate, 24));
+    waitFor([] { return source.calls.load() != 0; }, "read em voo");
+    CHECK(source.endCalls == 0); session.end();
+    CHECK(!session.active() && session.finished() && !source.readers && source.endCalls == 1);
+  }
+  {
+    CaptureSession session; CHECK(session.start(codec, rate, 24));
+    // Destrutor precisa parar produtor, liberar ring e devolver ownership.
+  }
+  HostRTOS::joinAll(); CHECK(source.endCalls == 2);
+}
+
+TEST(session_recorder_8k_converts_native_16k_and_drains_filter_tail) {
+  EarlyRecording r; r.start(1001, 23, 8000);
+  CHECK(r.session.inputRate() == 16000);
+  CHECK(r.recorder.start(wavPath, 8000, &r.session));
+  r.releaseCapture(); waitFor([] { return source.eof.load(); }, "captura 16 para nota8");
+  r.recorder.requestStop(); r.finalize();
+  CHECK(!r.recorder.writeFailed() && r.recorder.bytesWritten() == 1002);
+  CHECK(storedHeader().sampleRate == 8000);
+  CHECK(LittleFS.bytes(pcmPath) == convertedPcm(1001, 23, 16000, 8000)); checkAppendOnly();
+}
+
+TEST(session_storage_full_and_partial_write_forward_stop_then_drain_without_hardware_release_race) {
+  for (bool partial : {false, true}) {
+    LittleFS.reset();
+    if (partial) LittleFS.faults->pathWriteLimits[pcmPath] = 8191;
+    else LittleFS.capacity = NoteFiles::kReserveBytes + sizeof(WavHeader) + 40001;
+    EarlyRecording r; r.start(SIZE_MAX, 64);
+    CHECK(r.recorder.start(wavPath, rate, &r.session));
+    r.releaseCapture(); r.finalize();
+    CHECK(r.session.finished() && r.session.drained() && !r.session.failed());
+    CHECK(r.recorder.writeFailed() == partial && r.recorder.storageFull() != partial);
+    if (partial) CHECK(r.recorder.bytesWritten() == 8190);
+    else checkAudio(wavPath, r.recorder.maximumBytes() / 2, 64);
+    checkAppendOnly();
+  }
+}
+
+TEST(legacy_read_false_is_terminal_even_with_reported_bytes_and_drains_exact_prefix) {
+  for (size_t prefix : {size_t(0), size_t(1024)}) {
+    for (size_t reported : {size_t(0), size_t(4), size_t(2048)}) {
+      LittleFS.reset();
+      Recording r; r.start(10000, 92);
+      source.failAtFrame = prefix; source.failedReadBytes = reported;
+      r.release();
+      waitFor([&] { return r.recorder.isFinished(); }, "erro legacy encerra sem stop externo");
+      HostRTOS::joinAll();
+      CHECK(r.recorder.writeFailed() && !r.recorder.overflowCount() && !r.recorder.storageFull());
+      CHECK(source.calls == prefix / 512 + 1 && source.emittedFrames == prefix);
+      r.finalize();
+      CHECK(r.recorder.bytesWritten() == prefix * 2 && storedHeader().dataSize == prefix * 2);
+      CHECK(LittleFS.bytes(pcmPath) == expectedPcm(prefix, 92)); checkAppendOnly();
+      if (prefix) checkAudio(wavPath, prefix, 92);
+    }
+  }
+}
+
+TEST(legacy_and_session_invalid_lengths_never_trim_or_enqueue_corrupted_frames) {
+  for (size_t invalid : {size_t(1), size_t(2), size_t(3), size_t(5), size_t(2047),
+                         size_t(2049), size_t(2052), SIZE_MAX}) {
+    LittleFS.reset();
+    {
+      Recording r; r.start(10000, 48);
+      source.invalidAtFrame = 1024; source.invalidReadBytes = invalid;
+      r.release();
+      waitFor([&] { return r.recorder.isFinished(); }, "tamanho legacy invalido terminal");
+      HostRTOS::joinAll(); r.finalize();
+      CHECK(r.recorder.writeFailed() && !r.recorder.overflowCount());
+      CHECK(source.calls == 3); checkAudio(wavPath, 1024, 48); checkAppendOnly();
+    }
+    LittleFS.reset();
+    {
+      EarlyRecording r; r.start(10000, 48);
+      source.invalidAtFrame = 1024; source.invalidReadBytes = invalid;
+      r.releaseCapture();
+      waitFor([&] { return r.session.finished(); }, "tamanho session invalido terminal");
+      CHECK(r.session.failed() && !r.session.overflowCount() && source.calls == 3);
+      CHECK(r.recorder.start(wavPath, rate, &r.session)); r.finalize();
+      CHECK(r.recorder.writeFailed()); checkAudio(wavPath, 1024, 48); checkAppendOnly();
+    }
+  }
+}
+
+TEST(legacy_controlled_eof_is_healthy_empty_read_with_yield_until_explicit_stop) {
+  Recording r; r.start(1024, 81); r.release();
+  waitFor([] { return source.eof.load() && source.emptyReads >= 3; }, "EOF saudavel legacy");
+  CHECK(!r.recorder.writeFailed() && !r.recorder.isFinished());
+  CHECK(HostRTOS::delays("audio_cap") >= 2);
+  r.recorder.requestStop();
+  waitFor([&] { return r.recorder.isFinished(); }, "stop depois EOF controlado");
+  HostRTOS::joinAll(); r.finalize();
+  CHECK(!r.recorder.writeFailed()); checkAudio(wavPath, 1024, 81);
+}
+
+TEST(legacy_and_session_empty_reads_timeout_after_two_real_seconds_and_drain_prefix) {
+  {
+    Recording r; r.start(1024, 18); r.release();
+    waitFor([] { return source.eof.load(); }, "ultimo bloco legacy");
+    const auto begin = Clock::now();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    CHECK(!r.recorder.writeFailed() && !r.recorder.isFinished());
+    waitFor([&] { return r.recorder.isFinished(); }, "legacy sem amostras por2s",
+            std::chrono::seconds(4));
+    CHECK(Clock::now() - begin >= std::chrono::milliseconds(1900));
+    CHECK(Clock::now() - begin < std::chrono::milliseconds(3500));
+    HostRTOS::joinAll(); r.finalize();
+    CHECK(r.recorder.writeFailed() && !r.recorder.overflowCount());
+    CHECK(HostRTOS::delays("audio_cap") > 100); checkAudio(wavPath, 1024, 18);
+  }
+  LittleFS.reset();
+  {
+    EarlyRecording r; r.start(1024, 19); r.releaseCapture();
+    waitFor([] { return source.eof.load(); }, "ultimo bloco session");
+    const auto begin = Clock::now();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    CHECK(!r.session.failed() && !r.session.finished());
+    waitFor([&] { return r.session.finished(); }, "session sem amostras por2s",
+            std::chrono::seconds(4));
+    CHECK(Clock::now() - begin >= std::chrono::milliseconds(1900));
+    CHECK(Clock::now() - begin < std::chrono::milliseconds(3500));
+    CHECK(r.session.failed() && !r.session.drained() && !r.session.overflowCount());
+    CHECK(HostRTOS::delays("session_cap") > 100 && source.endCalls == 0);
+    CHECK(r.recorder.start(wavPath, rate, &r.session)); r.finalize();
+    CHECK(r.recorder.writeFailed()); checkAudio(wavPath, 1024, 19);
+  }
+}
+
+TEST(session_no_samples_timeout_resets_on_valid_partial_block_and_normal_stop_does_not_fail) {
+  EarlyRecording r; r.start(1024, 20); source.chunkFrames = 37;
+  source.pauseAtFrame = 512; r.releaseCapture();
+  waitFor([] { return source.emittedFrames == 512; }, "primeiro bloco antes pausa");
+  std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+  CHECK(!r.session.failed() && !r.session.finished());
+  source.pauseAtFrame = SIZE_MAX;
+  waitFor([] { return source.eof.load(); }, "segundo bloco reinicia timeout");
+  std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+  CHECK(!r.session.failed() && !r.session.finished());
+  r.stopCapture();
+  CHECK(!r.session.failed());
+  CHECK(r.recorder.start(wavPath, rate, &r.session)); r.finalize();
+  CHECK(!r.recorder.writeFailed()); checkAudio(wavPath, 1024, 20);
+}
+
+TEST(session_initial_empty_read_timeout_is_terminal_without_silent_success_or_heap_churn) {
+  EarlyRecording r; r.start(0); r.releaseCapture();
+  waitFor([] { return source.eof.load(); }, "I2S vazio desde inicio");
+  const auto begin = Clock::now();
+  waitFor([&] { return r.session.finished(); }, "limite inicial de2s", std::chrono::seconds(4));
+  CHECK(Clock::now() - begin >= std::chrono::milliseconds(1900));
+  CHECK(Clock::now() - begin < std::chrono::milliseconds(3500));
+  CHECK(r.session.failed() && !r.session.overflowCount() && source.endCalls == 0);
+  CHECK(HostRTOS::sentBytes == 0 && HostRecorderHeap::calls == 1);
+  int16_t mono; size_t count = 1;
+  CHECK(!r.session.read(&mono, 1, &count, 0) && !count && r.session.drained());
+  r.session.end(); HostRTOS::joinAll();
+  CHECK(source.endCalls == 1 && !r.session.active() && r.session.failed());
+}
 } // namespace
 
+bool AudioCodec::prepareCapture(uint32_t, float) {
+  ++source.prepareCalls;
+  return !source.failPrepare;
+}
+
+void AudioCodec::end() {
+  if (source.readers.load()) std::terminate();
+  ++source.endCalls;
+}
+
 bool AudioCodec::read(void *buffer, size_t length, size_t *bytesRead, uint32_t timeoutMs) {
-  (void)timeoutMs;
+  if (!timeoutMs || timeoutMs > 200) std::terminate();
+  struct ReadGuard {
+    ReadGuard() {
+      size_t readers = ++source.readers;
+      size_t max = source.maxReaders.load();
+      while (max < readers && !source.maxReaders.compare_exchange_weak(max, readers)) {}
+    }
+    ~ReadGuard() { --source.readers; }
+  } guard;
   ++source.calls; *bytesRead = 0;
-  if (!source.allowRead.load()) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); return false; }
-  if (source.nextFrame >= source.totalFrames) {
-    source.eof = true; std::this_thread::sleep_for(std::chrono::milliseconds(1)); return false;
+  if (!source.allowRead.load() || source.nextFrame >= source.pauseAtFrame) {
+    ++source.emptyReads;
+    return true;
   }
-  size_t frames = std::min({length / 4, source.chunkFrames, source.totalFrames - source.nextFrame});
+  if (source.nextFrame >= source.failAtFrame) { *bytesRead = source.failedReadBytes; return false; }
+  if (source.nextFrame >= source.invalidAtFrame) { *bytesRead = source.invalidReadBytes; return true; }
+  if (source.nextFrame >= source.totalFrames) {
+    source.eof = true; ++source.emptyReads; return true;
+  }
+  size_t frames = std::min({length / 4, source.chunkFrames, source.totalFrames - source.nextFrame,
+                             source.pauseAtFrame.load() - source.nextFrame, source.failAtFrame - source.nextFrame,
+                             source.invalidAtFrame - source.nextFrame});
   auto *out = static_cast<uint8_t *>(buffer);
   for (size_t i = 0; i < frames; ++i) {
     uint16_t left = sample(source.nextFrame + i, source.seed);
@@ -519,6 +902,7 @@ bool AudioCodec::read(void *buffer, size_t length, size_t *bytesRead, uint32_t t
     out[4 * i + 2] = static_cast<uint8_t>(right); out[4 * i + 3] = static_cast<uint8_t>(right >> 8);
   }
   source.nextFrame += frames; source.emittedFrames += frames; *bytesRead = frames * 4;
+  if (source.malformed) --*bytesRead;
   if (source.paced) std::this_thread::sleep_for(std::chrono::microseconds(100));
   return frames > 0;
 }
@@ -532,7 +916,7 @@ int main(int argc, char **argv) {
   for (const auto &test : tests()) {
     if (argc == 2 && std::string(test.name).find(argv[1]) == std::string::npos) continue;
     ++selected;
-    HostRTOS::resetTasks(); HostRTOS::resetStreams(); LittleFS.reset();
+    HostRTOS::resetTasks(); HostRTOS::resetStreams(); HostRecorderHeap::reset(); LittleFS.reset();
     Host::resetClock(0x31415926U); // jamais tocado concorrentemente pelos stubs.
     try {
       test.run(); HostRTOS::joinAll();

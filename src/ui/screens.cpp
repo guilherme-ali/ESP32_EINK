@@ -25,6 +25,26 @@ void centerText(Canvas &canvas, int y, const char *text, uint8_t color, const Fo
   canvas.drawText((200 - w) / 2, y, text, color, font);
 }
 
+// Uma linha limitada a 180px, sem buffer de texto nem quebra invadindo a dica.
+void voiceLine(Canvas &canvas, int y, const char *text, const Font &font) {
+  if (!text) return;
+  const char *end = text;
+  int width = 0;
+  while (*end && *end != '\r' && *end != '\n') {
+    const char *next = end;
+    const int advance = Canvas::charWidth(Canvas::nextUtf8(next), font);
+    if (width + advance > kContentW) break;
+    width += advance;
+    end = next;
+  }
+  int x = (200 - width) / 2;
+  while (text < end) {
+    const uint16_t cp = Canvas::nextUtf8(text);
+    canvas.drawChar(x, y, cp, EPD_BLACK, font);
+    x += Canvas::charWidth(cp, font);
+  }
+}
+
 // Sakamoto - dia da semana sem precisar de RTC com registrador proprio.
 int dayOfWeek(int y, int m, int d) {
   static const int t[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
@@ -42,6 +62,28 @@ void formatFullDate(const RtcDateTime &now, char *out, size_t outLen) {
   snprintf(out, outLen, "%s, %u de %s", kWeekdays[dow], now.day, kMonths[now.month - 1]);
 }
 } // namespace
+
+void paintVoiceState(Canvas &canvas, const char *title, const char *hint, bool listening) {
+  canvas.clear(EPD_WHITE);
+  if (listening) {
+    // Microfone vetorial estatico, sem fonte de simbolos/emoji ou animacao.
+    canvas.drawRoundRect(89, 38, 22, 34, 10, EPD_BLACK);
+    canvas.drawRoundRect(90, 39, 20, 32, 9, EPD_BLACK);
+    canvas.drawLine(82, 59, 82, 68, EPD_BLACK);
+    canvas.drawLine(82, 68, 89, 79, EPD_BLACK);
+    canvas.drawLine(89, 79, 111, 79, EPD_BLACK);
+    canvas.drawLine(111, 79, 118, 68, EPD_BLACK);
+    canvas.drawLine(118, 68, 118, 59, EPD_BLACK);
+    canvas.drawFastVLine(100, 79, 10, EPD_BLACK);
+    canvas.drawFastHLine(91, 89, 19, EPD_BLACK);
+  } else {
+    canvas.fillCircle(82, 64, 3, EPD_BLACK);
+    canvas.fillCircle(100, 64, 3, EPD_BLACK);
+    canvas.fillCircle(118, 64, 3, EPD_BLACK);
+  }
+  voiceLine(canvas, 104, title, FONT_CLOCK);
+  voiceLine(canvas, 157, hint, FONT_BODY);
+}
 
 void drawHome(Canvas &canvas, EPaperDisplay &epd, const RtcDateTime &now, bool timeValid,
               int batteryPercent, bool showTempHumidity, bool hasTempHumidity, float tempC,
@@ -269,7 +311,7 @@ void drawSyncProgress(Canvas &canvas, EPaperDisplay &epd, const char *noteLabel,
                          FONT_BODY, kContentW, 18, 0, 1);
   canvas.drawWrappedText(kMarginX, 75, phaseLabel ? phaseLabel : "preparando", EPD_BLACK,
                          FONT_EMPHASIS, kContentW, 20, 0, 1);
-  snprintf(line, sizeof(line), "Nota atual: %s%u%%", estimated ? "~" : "", percent > 100 ? 100 : percent);
+  snprintf(line, sizeof(line), "Nota atual: %s%u%%", estimated ? "~" : "", percent > 100u ? 100u : percent);
   canvas.drawText(kMarginX, 99, line, EPD_BLACK, FONT_BODY);
   canvas.drawProgressBar(kMarginX, 118, kContentW, 12, percent > 100 ? 100 : percent, 100, EPD_BLACK);
   snprintf(line, sizeof(line), "Lote: %d / %d concluidas", completedNotes, totalNotes);

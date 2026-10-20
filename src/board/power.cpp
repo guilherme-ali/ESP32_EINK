@@ -1,7 +1,15 @@
 #include "power.h"
+#include <driver/gpio.h>
 
 BoardPower::BoardPower(uint8_t epdPin, uint8_t audioPin, uint8_t vbatPin)
-    : epdPin_(epdPin), audioPin_(audioPin), vbatPin_(vbatPin) {
+    : epdPin_(epdPin), audioPin_(audioPin), vbatPin_(vbatPin) {}
+
+void BoardPower::begin() {
+  // Preload all outputs HIGH while their previous sleep holds are still set.
+  // In particular, never expose the battery latch's reset LOW level.
+  gpio_set_level(static_cast<gpio_num_t>(vbatPin_), 1);
+  gpio_set_level(static_cast<gpio_num_t>(epdPin_), 1);
+  gpio_set_level(static_cast<gpio_num_t>(audioPin_), 1);
   pinMode(epdPin_, OUTPUT);
   pinMode(audioPin_, OUTPUT);
   pinMode(vbatPin_, OUTPUT);

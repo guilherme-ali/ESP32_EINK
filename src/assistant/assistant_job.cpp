@@ -1,6 +1,11 @@
 #include "assistant_job.h"
+#include "../audio/playback_level.h"
+#include "../audio/speech_leveler.h"
 #include "live_protocol.h"
 #include "transport.h"
+#ifndef ASSISTANT_HOST_TEST
+#include "../audio/capture_session.h"
+#endif
 #include <algorithm>
 #include <cstring>
 #include <ctime>
@@ -31,6 +36,7 @@ bool bounded(const char *s, size_t capacity) { return memchr(s, 0, capacity) != 
 struct AssistantJob::Impl {
   AssistantJob *owner;
   AudioCodec *codec;
+  CaptureSession *captureSession = nullptr; // audio task owns consumption/end
   ConnectFn connect;
   std::string key, model, gateway, token, zone;
   uint8_t *capture = nullptr, *incoming = nullptr, *output = nullptr;
@@ -63,6 +69,15 @@ struct AssistantJob::Impl {
   std::atomic<bool> workCancelled{false};
   std::string workPayload, workId, workResult;
   size_t workIndex = 0;
+#if ARDUINO_USB_CDC_ON_BOOT
+  // Audio task writes these; the owner reads only after every task is suspended.
+  PlaybackLevel sourceLevel, processedLevel;
+  float cachedPlaybackVolume = 0;
+  uint16_t dacVolumeRegister = 0;
+  uint32_t debugAudioStackFree = 0, levelerLatency = 0;
+  uint64_t levelerGuards = 0;
+  bool readDacVolume = false, audioStatsReady = false, audioStatsPrinted = false;
+#endif
   explicit Impl(AssistantJob *o, AudioCodec *c, ConnectFn fn) : owner(o), codec(c), connect(fn) {}
   void stamp(uint32_t AssistantJob::Telemetry::*field) {
     portENTER_CRITICAL(&telemetryMux);
@@ -119,6 +134,7 @@ struct AssistantJob::Impl {
   }
   void fail(const char *message) {
     failed = true; released = true;
+    if (captureSession && !captureDone.load(std::memory_order_acquire)) captureSession->requestStop();
     owner->status(State::Failed, "Assistente interrompido.", message);
   }
   bool queueAudio(const char *data) {
@@ -204,6 +220,9 @@ struct AssistantJob::Impl {
     }
     const cJSON *content = field(root, "serverContent");
     if (content) {
+      // A new segment invalidates a previous turnComplete, including when its
+      // audio/text and a Close arrive in the same receive slice.
+      if (field(content, "modelTurn") || field(content, "outputTranscription")) turnComplete = false;
       if (trueField(content, "interrupted")) {
         // Single PTT turn: a server interruption cannot be mistaken for success.
         fail("Resposta interrompida pelo servidor."); return false;
@@ -250,7 +269,7 @@ void AssistantJob::appendText(const char *text) {
   if (room > 1) copyText(view_.text + n, room, safe.c_str());
   portEXIT_CRITICAL(&mux_);
 }
-bool AssistantJob::start(const Settings &s, AudioCodec &codec, ConnectFn connect) {
+bool AssistantJob::start(const Settings &s, AudioCodec &codec, ConnectFn connect, CaptureSession *capture) {
   reap();
   if (impl_) return false;
   portENTER_CRITICAL(&mux_); view_ = Snapshot{}; portEXIT_CRITICAL(&mux_);
@@ -262,12 +281,15 @@ bool AssistantJob::start(const Settings &s, AudioCodec &codec, ConnectFn connect
       !Assistant::allowedModel(s.assistantModel, s.geminiFreeConfirmed) || !connect) {
     status(State::Failed, "Configuração do assistente inválida.",
       "Ative o assistente, configure um modelo Live permitido, chave e confirme acesso gratuito.");
+    if (capture) capture->end();
     portENTER_CRITICAL(&mux_); view_.finished = true; portEXIT_CRITICAL(&mux_); return false;
   }
   Impl *p = new (std::nothrow) Impl(this, &codec, connect);
   if (!p) { status(State::Failed, "Sem memória.", "Falha ao alocar sessão do assistente.");
+    if (capture) capture->end();
     portENTER_CRITICAL(&mux_); view_.finished = true; portEXIT_CRITICAL(&mux_); return false; }
   impl_ = p;
+  p->captureSession = capture;
   p->key = s.sttApiKey; p->model = s.assistantModel; p->gateway = s.assistantGatewayUrl;
   p->token = s.assistantGatewayToken; p->zone = s.assistantTimeZone;
   p->playbackVolume = s.speakerVolumePercent;
@@ -279,9 +301,11 @@ bool AssistantJob::start(const Settings &s, AudioCodec &codec, ConnectFn connect
   p->incoming = static_cast<uint8_t *>(heap_caps_malloc(Assistant::kJsonLimit + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   p->output = static_cast<uint8_t *>(heap_caps_malloc(kOutputBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   p->started = millis(); esp_fill_random(&p->nonce, sizeof(p->nonce));
-  if (!p->capture || !p->incoming || !p->output || !codec.setSampleRate(16000) ||
-      !codec.enable(true) || !codec.setMicGain(s.micGainDb) || !codec.setVolume(0)) {
-    p->fail("Sem PSRAM ou falha ao configurar codec em 16 kHz."); codec.enable(false);
+  if (!p->capture || !p->incoming || !p->output ||
+      (capture ? (capture->failed() || capture->overflowCount() || !capture->setOutputRate(16000)) :
+                 !codec.prepareCapture(16000, s.micGainDb))) {
+    p->fail("Sem PSRAM ou falha ao preparar captura em 16 kHz.");
+    if (capture) capture->end(); else codec.end();
     delete p; impl_ = nullptr;
     portENTER_CRITICAL(&mux_); view_.finished = true; portEXIT_CRITICAL(&mux_); return false;
   }
@@ -298,7 +322,9 @@ bool AssistantJob::start(const Settings &s, AudioCodec &codec, ConnectFn connect
   bool ok = true;
   if (networkStack > 16384)
     ok = xTaskCreatePinnedToCore(networkTask, "as_live", networkStack, p, 3, &p->networkHandle, 1) == pdPASS;
-  if (ok) ok = xTaskCreatePinnedToCore(audioTask, "as_audio", 5120, p, 5, &p->audioHandle, 0) == pdPASS;
+  // PCM buffers + the fixed lookahead ring require this reserve in ALL profiles.
+  constexpr uint32_t audioStackBytes = 8192;
+  if (ok) ok = xTaskCreatePinnedToCore(audioTask, "as_audio", audioStackBytes, p, 5, &p->audioHandle, 0) == pdPASS;
   const uint32_t gatewayStack = p->tools ? 12288 : 3072;
   if (ok) ok = xTaskCreatePinnedToCore(gatewayTask, "as_tools", gatewayStack, p, 2, &p->gatewayHandle, 1) == pdPASS;
   if (ok && !p->networkHandle) ok = xTaskCreatePinnedToCore(networkTask, "as_live", networkStack, p, 3, &p->networkHandle, 1) == pdPASS;
@@ -309,25 +335,34 @@ bool AssistantJob::start(const Settings &s, AudioCodec &codec, ConnectFn connect
 #endif
   if (!ok) {
     p->fail("Falha ao criar tasks do assistente."); p->cancelled = true; p->workerStop = true; p->networkDone = true;
-    if (!p->audioHandle) { p->captureDone = true; codec.enable(false); }
+    if (!p->audioHandle) {
+      if (capture) capture->end(); else codec.end();
+      p->captureDone = true;
+    }
   }
   p->launched = true;
   return ok;
 }
 void AssistantJob::release(bool physicalButton) {
   portENTER_CRITICAL(&mux_);
-  if (impl_) {
+  if (impl_ && !view_.finished) {
     if (!impl_->released.load()) {
       impl_->markRelease(physicalButton);
     }
     impl_->released = true;
+    if (impl_->captureSession && !impl_->captureDone.load(std::memory_order_acquire))
+      impl_->captureSession->requestStop();
   }
   view_.released = true;
   portEXIT_CRITICAL(&mux_);
 }
 void AssistantJob::cancel() {
   portENTER_CRITICAL(&mux_);
-  if (impl_) { impl_->cancelled = true; impl_->released = true; }
+  if (impl_ && !view_.finished) {
+    impl_->cancelled = true; impl_->released = true;
+    if (impl_->captureSession && !impl_->captureDone.load(std::memory_order_acquire))
+      impl_->captureSession->requestStop();
+  }
   view_.released = true;
   portEXIT_CRITICAL(&mux_);
 }
@@ -354,6 +389,18 @@ void AssistantJob::reap() {
     if (p->cancelled) copyText(view_.error, sizeof(view_.error), "Conversa cancelada.");
   }
   portEXIT_CRITICAL(&mux_);
+#if ARDUINO_USB_CDC_ON_BOOT
+  if (p->audioStatsReady && !p->audioStatsPrinted) {
+    p->audioStatsPrinted = true;
+    Serial.printf("[PlaybackSource] kind=assistant scope=offered samples=%llu rms_dbfs=%.3f max100ms_dbfs=%.3f peak_dbfs=%.3f fullscale=%lu volume_requested=%.1f volume_cached=%.1f reg32=%u reg32_valid=%d stack_min_bytes=%u\n",
+                  (unsigned long long)p->sourceLevel.samples, p->sourceLevel.rmsDbfs(), p->sourceLevel.maxWindowDbfs(),
+                  p->sourceLevel.peakDbfs(), (unsigned long)p->sourceLevel.fullScaleSamples, p->playbackVolume,
+                  p->cachedPlaybackVolume, (unsigned)p->dacVolumeRegister, p->readDacVolume, p->debugAudioStackFree);
+    Serial.printf("[PlaybackProcessed] kind=assistant scope=offered samples=%llu rms_dbfs=%.3f max100ms_dbfs=%.3f peak_dbfs=%.3f latency_samples=%u guards=%llu\n",
+                  (unsigned long long)p->processedLevel.samples, p->processedLevel.rmsDbfs(), p->processedLevel.maxWindowDbfs(),
+                  p->processedLevel.peakDbfs(), p->levelerLatency, (unsigned long long)p->levelerGuards);
+  }
+#endif
 }
 bool AssistantJob::active() const {
   const_cast<AssistantJob *>(this)->reap();
@@ -386,8 +433,57 @@ void AssistantJob::audioTask(void *ptr) {
     Impl *p = static_cast<Impl *>(ptr);
     while (!p->launched.load()) vTaskDelay(1);
     uint8_t stereo[2048]; size_t carry = 0;
+#if ARDUINO_USB_CDC_ON_BOOT
+    Serial.printf("[AssistantAudio] stage=capture stack_min_bytes=%u\n",
+                  static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
+#endif
     uint32_t lastData = millis(), captureStart = millis();
-    while (!p->released.load() && !Impl::stopped(p)) {
+    if (p->captureSession) {
+      CaptureSession &session = *p->captureSession;
+      int16_t mono[512];
+      while (!Impl::stopped(p)) {
+        if (uint32_t(millis() - captureStart) >= 30000 && !p->limited.exchange(true)) {
+          if (!p->released.exchange(true)) {
+            p->stamp(&AssistantJob::Telemetry::releaseUs);
+            portENTER_CRITICAL(&p->telemetryMux); p->telemetry.releaseSource = 3; portEXIT_CRITICAL(&p->telemetryMux);
+          }
+          p->owner->status(State::Thinking, "Captura interrompida no limite de 30 s.");
+        }
+        // No network dependency: stop the producer even while connect/send is
+        // blocked, then consume its committed prefix and converter tail.
+        if (p->released.load()) session.requestStop();
+        if (session.failed() || session.overflowCount()) { p->fail("Falha ou overflow na captura antecipada."); break; }
+        if (session.drained()) break;
+        const size_t accepted = p->captured.load();
+        const size_t capacity = std::min(size_t(512), (kCaptureBytes - accepted) / 2);
+        size_t samples = 0;
+        if (!session.read(mono, capacity, &samples, 40) || samples > capacity) {
+          p->fail("Falha de leitura da captura antecipada."); break;
+        }
+        if (!samples) {
+          if (session.drained()) break;
+          if (uint32_t(millis() - lastData) > 2000) { p->fail("Microfone não forneceu áudio."); break; }
+          vTaskDelay(1); continue;
+        }
+        lastData = millis();
+        memcpy(p->capture + accepted, mono, samples * 2);
+        p->captured.store(accepted + samples * 2, std::memory_order_release);
+        if (accepted + samples * 2 == kCaptureBytes) {
+          if (!p->released.exchange(true)) {
+            p->stamp(&AssistantJob::Telemetry::releaseUs);
+            portENTER_CRITICAL(&p->telemetryMux); p->telemetry.releaseSource = 3; portEXIT_CRITICAL(&p->telemetryMux);
+          }
+          p->limited = true;
+          p->owner->status(State::Thinking, "Captura interrompida no limite de 30 s.");
+          break;
+        }
+        vTaskDelay(1);
+      }
+      session.requestStop();
+      session.end(); // join before captureDone or any change of hardware mode
+      if ((session.failed() || session.overflowCount()) && !p->failed.load())
+        p->fail("Falha ou overflow na captura antecipada.");
+    } else while (!p->released.load() && !Impl::stopped(p)) {
       if (uint32_t(millis() - captureStart) >= 30000) {
         if (!p->released.exchange(true)) {
           p->stamp(&AssistantJob::Telemetry::releaseUs);
@@ -423,9 +519,35 @@ void AssistantJob::audioTask(void *ptr) {
       vTaskDelay(1);
     }
     if (carry) p->fail("Microfone encerrou com frame estéreo incompleto.");
+    if (!p->captureSession) p->codec->end();
     p->captureDone.store(true, std::memory_order_release);
     p->stamp(&AssistantJob::Telemetry::captureDoneUs);
     bool playback = false, feeding = false, buffering = false; uint32_t lastWrite = 0;
+    SpeechLeveler leveler;
+    if (!leveler.configure(24000)) p->fail("Falha ao configurar nivelador de fala.");
+#if ARDUINO_USB_CDC_ON_BOOT
+    PlaybackLevel &sourceLevel = p->sourceLevel;
+    PlaybackLevel &processedLevel = p->processedLevel;
+#endif
+    auto writePlayback = [&](size_t wanted) {
+      size_t offset = 0;
+      const uint32_t begin = millis();
+      while (offset < wanted && !Impl::stopped(p)) {
+        size_t written = 0;
+        bool ok = p->codec->write(stereo + offset, wanted - offset, &written, 40);
+        if (!ok || written > wanted - offset || uint32_t(millis() - begin) >= 2000) {
+          p->fail("Falha ou timeout na reprodução de áudio."); break;
+        }
+        offset += written; if (!written) vTaskDelay(1);
+        if (written) {
+          lastWrite = millis();
+          if (!p->consumed.load(std::memory_order_relaxed)) p->stamp(&AssistantJob::Telemetry::firstI2sUs);
+          p->update(&AssistantJob::Telemetry::lastI2sUs,
+            static_cast<uint32_t>(assistantMonotonicUs() - p->startedUs));
+        }
+      }
+      return offset == wanted;
+    };
     while (!Impl::stopped(p)) {
       const bool done = p->networkDone.load(std::memory_order_acquire);
       const bool responseReady = p->responseReady.load(std::memory_order_acquire);
@@ -448,33 +570,49 @@ void AssistantJob::audioTask(void *ptr) {
       if (!feeding && playback) p->owner->status(State::Speaking, "Respondendo...");
       feeding = true; buffering = false;
       if (!playback) {
-        if (!p->codec->setSampleRate(24000) || !p->codec->setVolume(p->playbackVolume)) {
+        if (!p->codec->preparePlayback(24000, p->playbackVolume, true)) {
           p->fail("Codec recusou reprodução em 24 kHz ou volume."); break;
         }
         playback = true; p->owner->status(State::Speaking, "Respondendo...");
+#if ARDUINO_USB_CDC_ON_BOOT
+        p->cachedPlaybackVolume = p->codec->volumePercent();
+        p->readDacVolume = p->codec->readRegister(0x32, p->dacVolumeRegister);
+#endif
       }
       size_t samples = std::min(available / 2, size_t(256));
       for (size_t i = 0; i < samples; ++i) {
         uint8_t lo = p->output[(c + i * 2) % kOutputBytes], hi = p->output[(c + i * 2 + 1) % kOutputBytes];
+        const int16_t value = static_cast<int16_t>(static_cast<uint16_t>(lo) | (static_cast<uint16_t>(hi) << 8));
+#if ARDUINO_USB_CDC_ON_BOOT
+        sourceLevel.add(&value, 1);
+#endif
+        const int16_t processed = leveler.process(value);
+#if ARDUINO_USB_CDC_ON_BOOT
+        processedLevel.add(&processed, 1);
+#endif
+        lo = static_cast<uint8_t>(processed);
+        hi = static_cast<uint8_t>(static_cast<uint16_t>(processed) >> 8);
         stereo[i * 4] = stereo[i * 4 + 2] = lo; stereo[i * 4 + 1] = stereo[i * 4 + 3] = hi;
       }
-      size_t offset = 0, wanted = samples * 4; const uint32_t begin = millis();
-      while (offset < wanted && !Impl::stopped(p)) {
-        size_t written = 0;
-        bool ok = p->codec->write(stereo + offset, wanted - offset, &written, 40);
-        if (!ok || written > wanted - offset || uint32_t(millis() - begin) >= 2000) {
-          p->fail("Falha ou timeout na reprodução de áudio."); break;
-        }
-        offset += written; if (!written) vTaskDelay(1);
-        if (written) {
-          lastWrite = millis();
-          if (!p->consumed.load(std::memory_order_relaxed)) p->stamp(&AssistantJob::Telemetry::firstI2sUs);
-          p->update(&AssistantJob::Telemetry::lastI2sUs,
-            static_cast<uint32_t>(assistantMonotonicUs() - p->startedUs));
-        }
-      }
-      if (offset != wanted) break;
+      // DSP is performed once per source block, never again on partial I2S retries.
+      if (!writePlayback(samples * 4)) break;
       p->consumed.store(c + samples * 2, std::memory_order_release); vTaskDelay(1);
+    }
+    while (playback && !Impl::stopped(p)) {
+      size_t samples = 0;
+      int16_t value = 0;
+      while (samples < 256 && leveler.flush(value)) {
+#if ARDUINO_USB_CDC_ON_BOOT
+        processedLevel.add(&value, 1);
+#endif
+        const uint8_t lo = static_cast<uint8_t>(value);
+        const uint8_t hi = static_cast<uint8_t>(static_cast<uint16_t>(value) >> 8);
+        stereo[samples * 4] = stereo[samples * 4 + 2] = lo;
+        stereo[samples * 4 + 1] = stereo[samples * 4 + 3] = hi;
+        ++samples;
+      }
+      if (!samples || !writePlayback(samples * 4)) break;
+      // Lookahead tail is output only: source/protocol duration stays N samples.
     }
     // codec.write queues into 8 x 512-frame DMA buffers. Give the last accepted
     // samples 180 ms to leave DMA at 24 kHz before disabling the amplifier.
@@ -482,7 +620,13 @@ void AssistantJob::audioTask(void *ptr) {
     p->released = true;
     if (uint32_t(millis() - p->started) >= kTurnMs && !p->cancelled && !p->failed)
       p->fail("Tempo máximo de conversa (180 s) excedido durante reprodução.");
-    if (!p->codec->enable(false) && !p->failed.load()) p->fail("Falha ao desligar codec.");
+    p->codec->end();
+#if ARDUINO_USB_CDC_ON_BOOT
+    p->debugAudioStackFree = static_cast<uint32_t>(uxTaskGetStackHighWaterMark(nullptr));
+    p->levelerLatency = static_cast<uint32_t>(leveler.latencySamples());
+    p->levelerGuards = leveler.hardGuardSamples();
+    p->audioStatsReady = true;
+#endif
   }
   vTaskSuspend(nullptr); // Reaped/deleted by the UI owner; no self-deletion race.
 }
@@ -552,8 +696,24 @@ void AssistantJob::networkTask(void *ptr) {
       // scheduling slice; bounded framing work prevents starving audio/TX.
       for (unsigned i = 0; i < 16 && !Impl::stopped(p); ++i) {
         auto event = socket.poll();
-        if (event == WsParser::Event::Error || event == WsParser::Event::Close) { p->fail(socket.error()); break; }
+        if (event == WsParser::Event::Error) { p->fail(socket.error()); break; }
+        if (event == WsParser::Event::Close) {
+          // Close data is the validated RFC 6455 control payload, not a guessed
+          // EOF status. Missing status/error closes must never hide truncation.
+          const uint8_t *close = socket.data();
+          bool toolsPending = p->work.load(std::memory_order_acquire) != Impl::Empty;
+          for (const auto &call : p->calls) if (!call.sent) toolsPending = true;
+          if (socket.size() >= 2 && close && close[0] == 3 && close[1] == 232 &&
+              setup && started && ended && sent && complete && response && !toolsPending &&
+              p->captureDone.load(std::memory_order_acquire) && sent == p->captured.load() && !socket.inputPending()) {
+            p->responseReady.store(true, std::memory_order_release);
+            p->stamp(&AssistantJob::Telemetry::responseReadyUs);
+            ready = false;
+          } else p->fail(socket.error());
+          break;
+        }
         if (event == WsParser::Event::Audio) {
+          complete = false;
           p->stamp(&AssistantJob::Telemetry::firstAudioMessageUs);
           if (!p->queuePcm(socket.data(), socket.size())) break;
           if (socket.size()) response = true;
@@ -562,7 +722,7 @@ void AssistantJob::networkTask(void *ptr) {
         if (event != WsParser::Event::Message) break;
         if (!p->message(socket.data(), socket.size(), setup, complete, response)) break;
       }
-      if (Impl::stopped(p)) break;
+      if (!ready || Impl::stopped(p)) break;
       if (!setup) {
         if (uint32_t(millis() - setupBegin) >= 15000) { p->fail("Timeout aguardando setupComplete do Gemini."); break; }
         vTaskDelay(1); continue;
@@ -620,7 +780,7 @@ void AssistantJob::networkTask(void *ptr) {
           p->work.store(Impl::Pending, std::memory_order_release);
         }
       }
-      if (ended && complete && response && !toolsPending && p->work.load() == Impl::Empty) {
+      if (ended && complete && response && !toolsPending && p->work.load() == Impl::Empty && !socket.inputPending()) {
         p->responseReady.store(true, std::memory_order_release);
         p->stamp(&AssistantJob::Telemetry::responseReadyUs);
         break;

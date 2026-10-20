@@ -56,17 +56,33 @@ def main():
     suite("audio_codec_volume_tests", [ROOT / "src/audio/codec.cpp", HOST / "audio_codec_volume_tests.cpp", HOST / "fakes.cpp"],
           ["-Ilib/es8311", "-Itest/host/stubs", "-Isrc/audio"])
     suite("button_tests", [ROOT / "src/board/buttons.cpp", ROOT / "src/board/multi_button.c", HOST / "button_tests.cpp"],
-          ["-Itest/host/button_tests_stubs"])
+           ["-Itest/host/button_tests_stubs"])
+    suite("sleep_gate_tests", [HOST / "sleep_gate_tests.cpp"])
+    suite("playback_level_tests", [HOST / "playback_level_tests.cpp"])
+    run([sys.executable, HOST / "audio_codec_check.py"])
+    run([sys.executable, HOST / "speech_leveler_check.py", "--runtime"])
+    run([sys.executable, HOST / "epaper_check.py"])
+    run([sys.executable, HOST / "listening_feedback_check.py"])
+    run([sys.executable, HOST / "power_selftest_check.py"])
+    run([sys.executable, ROOT / "tools/check_pcm_rate_converter.py"])
+    powershell = shutil.which("pwsh")
+    if powershell:
+        run([powershell, "-NoProfile", "-File", ROOT / "tools/power_test_test.ps1"])
+    else:
+        print("SKIP: validacao offline do kit PowerShell requer pwsh", flush=True)
     run([sys.executable, HOST / "assistant_check.py"])
     run([sys.executable, HOST / "voice_opus_check.py"])
     benchmark_venv = ROOT / "tools/.venv-benchmark/Scripts/python.exe"
     if benchmark_venv.is_file():
         run([benchmark_venv, ROOT / "tools/benchmark_voice_test.py"])
+        run([benchmark_venv, ROOT / "tools/calibrate_speaker_test.py"])
     elif subprocess.run([sys.executable, "-c", "import numpy"], cwd=ROOT, check=False,
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
         run([sys.executable, ROOT / "tools/benchmark_voice_test.py"])
     else:
         print("SKIP: testes analiticos do benchmark requerem tools/requirements-benchmark.txt", flush=True)
+    run([sys.executable, ROOT / "tools/device_console_test.py"])
+    run([sys.executable, ROOT / "tools/summarize_power_test_test.py"])
     npm = shutil.which("npm")
     if not npm:
         raise RuntimeError("Node/npm necessário para verificar o gateway")

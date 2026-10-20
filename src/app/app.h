@@ -5,9 +5,12 @@
 #include "../ui/keyboard.h"
 #include "../board/rtc.h"
 #include "../board/buttons.h"
+#include "../board/button_chord.h"
 #include "../board/shtc3.h"
 #include "../audio/codec.h"
 #include "../audio/recorder.h"
+#include "../audio/capture_session.h"
+#include "../ui/listening_feedback.h"
 #include "../audio/player.h"
 #include "../storage/notes.h"
 #include "../net/settings.h"
@@ -42,17 +45,30 @@ public:
   // usuario sair (BOOT longo) ou salvar (reinicia o ESP). Usado para
   // configurar STT/Drive, que nao cabem no teclado de 2 botoes.
   using PortalRequestFn = void (*)();
+  using UiPrepareFn = bool (*)();
   void begin(SleepRequestFn onSleepRequested, ConnectRequestFn onConnectRequested,
-             PortalRequestFn onPortalRequested, ConnectRequestFn onAssistantConnectRequested);
+             PortalRequestFn onPortalRequested, ConnectRequestFn onAssistantConnectRequested,
+             UiPrepareFn onUiPrepare = nullptr, bool deferUi = false);
+  bool prepareWakeCapture();
+  bool beginFeedback(ListeningFeedback::PowerOnFn powerOn) {
+    return feedback_.begin(epd_, canvas_, powerOn);
+  }
+  void setStorageReady(bool ready) { storageReady_ = ready; }
+  void cancelPendingCapture();
+  void handleButtonOverflow();
+  void redrawHome() { goHome(); markActivity(); }
+  bool canSleep() const;
+  bool feedbackBusy() const { return feedback_.busy(); }
+  void finishFeedback() { feedback_.finish(); }
+  void prepareMainUi() { ensureUi(); }
 
   void onButton(BtnId id, BtnAction action);
 
-  // Chamar toda iteracao do loop() principal: atualiza a tela de
-  // gravacao a cada segundo e verifica o timeout de inatividade.
+  // Dispatch stays independent from the asynchronous audio display.
   void loop();
   void diagnosticCommand(const String &command);
   bool isSyncActive() const { return syncJob_.isActive(); }
-  bool isAudioActive() const { return recording_ || assistantJob_.active(); }
+  bool isAudioActive() const { return capturePending_ || capture_.active() || recording_ || playing_ || assistantJob_.active(); }
   bool isExportActive() const { return exportJob_.active(); }
 
 private:
@@ -96,6 +112,15 @@ private:
   SyncJob syncJob_;
   AssistantJob assistantJob_;
   NoteExportJob exportJob_;
+  CaptureSession capture_;
+  ListeningFeedback feedback_;
+  bool feedbackRestorePending_ = false;
+  bool capturePending_ = false, captureFailed_ = false;
+  bool storageReady_ = false, playing_ = false;
+  bool uiPrepared_ = false;
+  UiPrepareFn onUiPrepare_ = nullptr;
+  ButtonChord chord_;
+  void ensureUi();
   Menu menu_;
   Keyboard keyboard_;
 
@@ -185,7 +210,7 @@ private:
   void stopRecording(bool discard = false);
   void finishRecording();
   void serviceRecordingSave();
-  void playSelected(int index);
+  bool playSelected(int index);
   void startAssistant();
   void serviceAssistant();
   void startPhonePairing();

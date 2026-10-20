@@ -26,22 +26,34 @@ struct EPaperPins {
 
 class EPaperDisplay {
 public:
+  enum class Error : uint8_t { None, InvalidSize, Allocation, Gpio, Spi, BusyTimeout };
+  static constexpr uint32_t kBusyTimeoutMs = 5000;
+
   EPaperDisplay(int width, int height, const EPaperPins &pins);
 
-  void init();
+  bool init();
   void clear();
-  void display();
+  bool display();
 
-  void initPartial();
-  void displayPartBaseImage();
-  void displayPart();
+  bool initPartial();
+  bool displayPartBaseImage();
+  bool displayPart();
 
   void drawPixel(uint16_t x, uint16_t y, uint8_t color);
 
-  int width() const { return width_; }
-  int height() const { return height_; }
-  uint8_t *buffer() { return buffer_; }
-  int bufferLen() const { return bufferLen_; }
+  // Erros sao latched ate reboot; antes de init, healthy=true e ready=false.
+  bool ready() const { return ready_; }
+  bool healthy() const { return error_ == Error::None; }
+  Error error() const { return error_; }
+  // Call with no display transaction active after removing panel power.
+  void invalidatePower() { ready_ = false; shadowValid_ = false; }
+
+  // Canvas usa acesso direto: sem init valido, area vazia e ponteiro nao nulo
+  // tornam clear/memcpy de tamanho zero e clipping seguros, sem inicializar HW.
+  int width() const { return ready() ? width_ : 0; }
+  int height() const { return ready() ? height_ : 0; }
+  uint8_t *buffer() { return ready() ? buffer_ : &discard_; }
+  int bufferLen() const { return ready() ? bufferLen_ : 0; }
 
 private:
   const EPaperPins pins_;
@@ -50,21 +62,28 @@ private:
   const int bufferLen_;
   spi_device_handle_t spi_ = nullptr;
   uint8_t *buffer_ = nullptr;
+  uint8_t discard_ = 0;
+  bool ready_ = false;
+  bool shadowValid_ = false;
+  Error error_ = Error::None;
 
   // Ultimo frame de fato enviado ao painel - displayPart() compara
   // buffer_ contra isto e pula o refresh inteiro quando nada mudou.
-  // Perdido a cada boot/wake (RAM comum, nao RTC_DATA_ATTR) - tudo bem,
-  // o primeiro desenho depois de acordar sempre difere (nao sabemos o
-  // que estava fisicamente na tela) e manda o refresh normalmente.
+  // Perdido a cada boot/wake/reset do controlador: shadowValid_ impede
+  // pular o primeiro refresh, mesmo se o frame coincidir com RAM zerada.
   uint8_t *shadow_ = nullptr;
 
-  void spiGpioInit();
-  void spiPortInit();
-  void readBusy();
+  bool begin();
+  bool check(esp_err_t result, Error error);
+  bool fail(Error error);
+  bool spiGpioInit();
+  bool spiPortInit();
+  bool readBusy();
+  bool reset();
 
-  void setCs(bool level) { gpio_set_level((gpio_num_t)pins_.cs, level); }
-  void setDc(bool level) { gpio_set_level((gpio_num_t)pins_.dc, level); }
-  void setRst(bool level) { gpio_set_level((gpio_num_t)pins_.rst, level); }
+  bool setCs(bool level) { return check(gpio_set_level((gpio_num_t)pins_.cs, level), Error::Gpio); }
+  bool setDc(bool level) { return check(gpio_set_level((gpio_num_t)pins_.dc, level), Error::Gpio); }
+  bool setRst(bool level) { return check(gpio_set_level((gpio_num_t)pins_.rst, level), Error::Gpio); }
 
   void spiSendByte(uint8_t data);
   void sendData(uint8_t data);
@@ -73,7 +92,7 @@ private:
 
   void setWindows(uint16_t xStart, uint16_t yStart, uint16_t xEnd, uint16_t yEnd);
   void setCursor(uint16_t xStart, uint16_t yStart);
-  void setLut(const uint8_t *lut);
-  void turnOnDisplay();
-  void turnOnDisplayPart();
+  bool setLut(const uint8_t *lut);
+  bool turnOnDisplay();
+  bool turnOnDisplayPart();
 };

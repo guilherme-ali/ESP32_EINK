@@ -18,9 +18,28 @@ constexpr int INPUT = 0;
 constexpr int OUTPUT = 1;
 constexpr int LOW = 0;
 constexpr int HIGH = 1;
+#ifdef AUDIO_CODEC_TEST_HOOKS
+namespace Host {
+inline int gpioLevels[64] = {};
+inline int gpioModes[64] = {};
+inline unsigned paHighWrites = 0;
+inline void (*gpioWriteHook)(int, int) = nullptr;
+inline void (*delayHook)(uint32_t) = nullptr;
+inline void (*serialWriteHook)(const char *) = nullptr;
+inline std::string serialOutput;
+}
+inline void pinMode(int pin, int mode) { Host::gpioModes[pin] = mode; }
+inline void digitalWrite(int pin, int value) {
+  Host::gpioLevels[pin] = value;
+  if (pin == 46 && value) ++Host::paHighWrites;
+  if (Host::gpioWriteHook) Host::gpioWriteHook(pin, value);
+}
+inline int digitalRead(int pin) { return Host::gpioLevels[pin]; }
+#else
 inline void pinMode(int, int) {}
 inline void digitalWrite(int, int) {}
 inline int digitalRead(int) { return HIGH; }
+#endif
 using std::min;
 using std::max;
 
@@ -101,7 +120,21 @@ inline size_t strlcpy(char *out, const char *in, size_t capacity) {
   if (capacity) { size_t copied = std::min(n, capacity - 1); std::memcpy(out, in, copied); out[copied] = '\0'; }
   return n;
 }
-struct HostSerial { void printf(const char *, ...) {} };
+struct HostSerial {
+  void printf(const char *format, ...) {
+#ifdef AUDIO_CODEC_TEST_HOOKS
+    char buffer[2048];
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+    Host::serialOutput += buffer;
+    if (Host::serialWriteHook) Host::serialWriteHook(buffer);
+#else
+    (void)format;
+#endif
+  }
+};
 inline HostSerial Serial;
 
 namespace Host {
@@ -109,7 +142,12 @@ inline uint32_t now = 0;
 inline void resetClock(uint32_t value = 0) { now = value; }
 }
 inline uint32_t millis() { return Host::now; }
-inline void delay(uint32_t ms) { Host::now += ms; }
+inline void delay(uint32_t ms) {
+#ifdef AUDIO_CODEC_TEST_HOOKS
+  if (Host::delayHook) Host::delayHook(ms);
+#endif
+  Host::now += ms;
+}
 inline void yield() { delay(1); }
 inline long random(long lower, long upper) { return upper > lower ? lower + (upper - lower) / 2 : lower; }
 inline long random(long upper) { return random(0, upper); }

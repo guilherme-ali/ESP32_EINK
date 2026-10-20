@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cassert>
 #include <iostream>
+#include <cstdarg>
+#include <cstdio>
 #ifndef NOMINMAX
 #define NOMINMAX 1
 #endif
@@ -20,6 +22,10 @@ namespace AssistantHost {
 std::mutex mutex;
 std::vector<std::string> jsonSent, requests, hosts;
 std::vector<uint8_t> playback;
+std::string serialOutput;
+std::atomic<size_t> failPlaybackAfter{SIZE_MAX}, pausePlaybackAfter{SIZE_MAX};
+std::atomic<bool> playbackPaused{false};
+std::atomic<unsigned> audioStackBytes{0};
 std::atomic<unsigned> captureReads{0}, writes{0}, tasksAlive{0}, socketsAlive{0}, rateChanges{0};
 std::atomic<bool> codecOn{false}, captureInRead{false}, clockRace{false}, callbackEntered{false}, callbackExit{false};
 std::atomic<int> failTaskAt{0}, taskCount{0}, connectDelay{0}, allocFailAt{0}, allocCount{0};
@@ -37,11 +43,24 @@ std::string delayedAfterEnd;
 std::atomic<size_t> playbackWriteLimit{3};
 std::atomic<unsigned> closeDelayMs{0};
 std::atomic<bool> closingSocket{false}, writeDuringClose{false};
+std::vector<int16_t> sessionPrefix, sessionTail;
+std::atomic<unsigned> capturePreparations{0}, playbackPreparations{0}, sessionReads{0}, sessionEnds{0};
+std::atomic<unsigned> sessionStopRequests{0};
+std::atomic<bool> sessionProducerAlive{false}, sessionStopRequested{false}, sessionReadAfterEnd{false};
+std::atomic<bool> sessionFail{false}, sessionOverflow{false}, sessionRejectRate{false}, failPrepareCapture{false}, failPreparePlayback{false};
+std::atomic<bool> playbackBeforeSessionEnd{false};
+std::atomic<uint32_t> sessionOutputRate{0};
+std::atomic<float> playbackVolume{0};
+std::string wireAfterSetup, wireAfterEnd, wireAfterToolResponse;
+std::atomic<bool> eofAfterSetup{false}, eofAfterEnd{false}, eofAfterToolResponse{false};
+std::atomic<bool> wireTailRead{false};
 void sleep(unsigned ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
 void reset() {
-  assert(tasksAlive == 0 && socketsAlive == 0);
+  assert(tasksAlive == 0 && socketsAlive == 0 && !sessionProducerAlive);
   std::lock_guard<std::mutex> lock(mutex);
   jsonSent.clear(); requests.clear(); hosts.clear(); playback.clear();
+  serialOutput.clear(); audioStackBytes = 0;
+  failPlaybackAfter = pausePlaybackAfter = SIZE_MAX; playbackPaused = false;
   captureReads = writes = rateChanges = taskCount = allocCount = 0;
   failTaskAt = connectDelay = allocFailAt = 0;
   codecOn = captureInRead = clockRace = callbackEntered = callbackExit = false;
@@ -52,6 +71,15 @@ void reset() {
   earlyPlayback = true;
   delayedAfterEnd.clear(); playbackWriteLimit = 3; closeDelayMs = 0;
   closingSocket = writeDuringClose = false;
+  sessionPrefix.clear(); sessionTail.clear();
+  capturePreparations = playbackPreparations = sessionReads = sessionEnds = 0;
+  sessionStopRequested = sessionReadAfterEnd = sessionFail = sessionOverflow = sessionRejectRate = false;
+  failPrepareCapture = failPreparePlayback = playbackBeforeSessionEnd = false;
+  sessionOutputRate = 0; playbackVolume = 0;
+  sessionStopRequests = 0;
+  wireAfterSetup.clear(); wireAfterEnd.clear(); wireAfterToolResponse.clear();
+  eofAfterSetup = eofAfterEnd = eofAfterToolResponse = false;
+  wireTailRead = false;
   const uint8_t pcm[] = {0x34, 0x12, 0xfe, 0xff, 0, 0x80, 0xff, 0x7f};
   afterEnd = "{\"serverContent\":{\"modelTurn\":{\"parts\":[{\"inlineData\":{\"mimeType\":\"audio/pcm;rate=24000\",\"data\":\"" +
     Assistant::base64(pcm, sizeof(pcm)) + "\"}}]},\"turnComplete\":true}}";
@@ -71,7 +99,8 @@ struct AssistantHostTask {
   bool deleted = false;
 };
 static thread_local TaskHandle_t currentTask = nullptr;
-int xTaskCreatePinnedToCore(void (*fn)(void *), const char *, unsigned, void *arg, unsigned, TaskHandle_t *out, int) {
+int xTaskCreatePinnedToCore(void (*fn)(void *), const char *name, unsigned stack, void *arg, unsigned, TaskHandle_t *out, int) {
+  if (!strcmp(name, "as_audio")) AssistantHost::audioStackBytes = stack;
   int n = ++AssistantHost::taskCount;
   if (AssistantHost::failTaskAt == n) return 0;
   auto h = new AssistantHostTask; *out = h; ++AssistantHost::tasksAlive;
@@ -98,6 +127,17 @@ uint32_t millis() {
   static const auto start = std::chrono::steady_clock::now();
   return uint32_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count()) + AssistantHost::timeOffset;
 }
+unsigned uxTaskGetStackHighWaterMark(TaskHandle_t) { return 4096; }
+AssistantHostSerial Serial;
+void AssistantHostSerial::printf(const char *format, ...) {
+  char line[1024];
+  va_list args; va_start(args, format);
+  const int length = std::vsnprintf(line, sizeof(line), format, args);
+  va_end(args);
+  assert(length >= 0 && size_t(length) < sizeof(line));
+  std::lock_guard<std::mutex> lock(AssistantHost::mutex);
+  AssistantHost::serialOutput.append(line, size_t(length));
+}
 void esp_fill_random(void *ptr, size_t n) {
   // Deliberately deterministic adapter, not a test of the ESP hardware RNG.
   static std::atomic<unsigned> seq{1}; unsigned seed = seq++;
@@ -121,12 +161,30 @@ void *heap_caps_malloc(size_t n, unsigned) {
 bool AudioCodec::setSampleRate(uint32_t rate) {
   if (AssistantHost::captureInRead) AssistantHost::clockRace = true;
   if (rate == 24000) ++AssistantHost::rateChanges;
-  return rate == 16000 || rate == 24000;
+  return rate == 8000 || rate == 16000 || rate == 24000 || rate == 32000 || rate == 44100 || rate == 48000;
 }
 bool AudioCodec::enable(bool on) {
   if (!on && AssistantHost::captureInRead) AssistantHost::clockRace = true;
   AssistantHost::codecOn = on; return true;
 }
+bool AudioCodec::prepareCapture(uint32_t rate, float gain) {
+  ++AssistantHost::capturePreparations;
+  return !AssistantHost::failPrepareCapture && setSampleRate(rate) && enable(true) && setMicGain(gain);
+}
+bool AudioCodec::preparePlayback(uint32_t rate, float percent, bool boundedSpeech) {
+  assert(boundedSpeech); // These fixtures exercise the real, peak-bounded speech path.
+  ++AssistantHost::playbackPreparations;
+  AssistantHost::playbackVolume = percent;
+  if (AssistantHost::sessionProducerAlive || (AssistantHost::sessionReads && !AssistantHost::sessionEnds))
+    AssistantHost::playbackBeforeSessionEnd = true;
+  return !AssistantHost::failPreparePlayback && setSampleRate(rate) && setVolume(percent) && enable(true);
+}
+float AudioCodec::volumePercent() const { return AssistantHost::playbackVolume.load(); }
+bool AudioCodec::readRegister(uint8_t address, uint16_t &value) {
+  if (address != 0x32 || !AssistantHost::codecOn) return false;
+  value = 0xBA; return true;
+}
+void AudioCodec::end() { enable(false); }
 bool AudioCodec::read(void *ptr, size_t capacity, size_t *n, uint32_t) {
   AssistantHost::captureInRead = true;
   AssistantHost::sleep(2);
@@ -141,7 +199,10 @@ bool AudioCodec::read(void *ptr, size_t capacity, size_t *n, uint32_t) {
 bool AudioCodec::write(const void *ptr, size_t n, size_t *written, uint32_t) {
   if (AssistantHost::closingSocket) AssistantHost::writeDuringClose = true;
   if (AssistantHost::captureInRead) AssistantHost::clockRace = true;
-  if (AssistantHost::failWrite) { *written = 0; return false; }
+  if (AssistantHost::failWrite || AssistantHost::playback.size() >= AssistantHost::failPlaybackAfter) { *written = 0; return false; }
+  if (AssistantHost::playback.size() >= AssistantHost::pausePlaybackAfter) {
+    AssistantHost::playbackPaused = true; *written = 0; return true;
+  }
   *written = std::min(n, AssistantHost::playbackWriteLimit.load()); // Also exercise partial stereo frames.
   const auto *bytes = static_cast<const uint8_t *>(ptr);
   std::lock_guard<std::mutex> lock(AssistantHost::mutex);
@@ -149,9 +210,60 @@ bool AudioCodec::write(const void *ptr, size_t n, size_t *written, uint32_t) {
   ++AssistantHost::writes; return true;
 }
 
+bool CaptureSession::start(AudioCodec &codec, uint32_t rate, float gain) {
+  if (!ended_.load() || !codec.prepareCapture(rate, gain)) return false;
+  codec_ = &codec; inputRate_ = rate; ended_ = false; finished_ = false; stop_ = false;
+  { std::lock_guard<std::mutex> lock(mutex_); pcm_ = AssistantHost::sessionPrefix; cursor_ = 0; }
+  readStarted_ = outputReady_ = false;
+  AssistantHost::sessionProducerAlive = true;
+  producer_ = std::thread([this] {
+    while (!stop_.load()) AssistantHost::sleep(1);
+    // Model a read already in flight at release, followed by a converter tail.
+    AssistantHost::sleep(20);
+    { std::lock_guard<std::mutex> lock(mutex_);
+      pcm_.insert(pcm_.end(), AssistantHost::sessionTail.begin(), AssistantHost::sessionTail.end()); }
+    finished_.store(true, std::memory_order_release);
+    AssistantHost::sessionProducerAlive = false;
+  });
+  return true;
+}
+bool CaptureSession::setOutputRate(uint32_t rate) {
+  if (ended_.load() || readStarted_ || rate != 16000 || AssistantHost::sessionRejectRate) return false;
+  AssistantHost::sessionOutputRate = rate; outputReady_ = true; return true;
+}
+bool CaptureSession::read(int16_t *mono, size_t capacity, size_t *samples, uint32_t timeoutMs) {
+  *samples = 0;
+  if (ended_.load()) { AssistantHost::sessionReadAfterEnd = true; return false; }
+  if (!outputReady_ || !capacity) return false;
+  readStarted_ = true; ++AssistantHost::sessionReads;
+  const auto begin = std::chrono::steady_clock::now();
+  do {
+    { std::lock_guard<std::mutex> lock(mutex_);
+      const size_t take = std::min(std::min(capacity, size_t(127)), pcm_.size() - cursor_);
+      if (take) { memcpy(mono, pcm_.data() + cursor_, take * 2); cursor_ += take; *samples = take; return true; } }
+    if (finished_.load()) return !failed();
+    AssistantHost::sleep(1);
+  } while (std::chrono::steady_clock::now() - begin < std::chrono::milliseconds(timeoutMs));
+  return !failed();
+}
+void CaptureSession::requestStop() {
+  ++AssistantHost::sessionStopRequests;
+  stop_ = true; AssistantHost::sessionStopRequested = true;
+}
+bool CaptureSession::drained() const {
+  std::lock_guard<std::mutex> lock(mutex_); return finished_.load() && cursor_ == pcm_.size();
+}
+bool CaptureSession::failed() const { return AssistantHost::sessionFail.load(); }
+uint32_t CaptureSession::overflowCount() const { return AssistantHost::sessionOverflow ? 1 : 0; }
+void CaptureSession::end() {
+  if (ended_.exchange(true)) return;
+  requestStop(); if (producer_.joinable()) producer_.join();
+  codec_->end(); ++AssistantHost::sessionEnds;
+}
+
 struct NetworkClient::Wire {
   bool live = false, connected = true, handshake = false, requestComplete = false;
-  bool delayedResponse = false;
+  bool delayedResponse = false, eofWhenDrained = false;
   std::string outgoing, input;
   size_t received = 0;
 };
@@ -204,12 +316,20 @@ size_t NetworkClient::write(const uint8_t *p, size_t n) {
       if (payload.find("\"setup\"") != std::string::npos) {
         serverFrame(w, "{\"setupComplete\":{}}");
         if (!AssistantHost::afterSetup.empty()) serverFrame(w, AssistantHost::afterSetup);
+        w.input += AssistantHost::wireAfterSetup;
+        w.eofWhenDrained = AssistantHost::eofAfterSetup;
       }
       if (payload.find("\"activityEnd\"") != std::string::npos) {
         if (!AssistantHost::afterEnd.empty()) serverFrame(w, AssistantHost::afterEnd);
         w.delayedResponse = !AssistantHost::delayedAfterEnd.empty();
+        w.input += AssistantHost::wireAfterEnd;
+        w.eofWhenDrained = AssistantHost::eofAfterEnd;
       }
-      if (payload.find("\"toolResponse\"") != std::string::npos && !AssistantHost::afterToolResponse.empty()) serverFrame(w, AssistantHost::afterToolResponse);
+      if (payload.find("\"toolResponse\"") != std::string::npos) {
+        if (!AssistantHost::afterToolResponse.empty()) serverFrame(w, AssistantHost::afterToolResponse);
+        w.input += AssistantHost::wireAfterToolResponse;
+        w.eofWhenDrained = AssistantHost::eofAfterToolResponse;
+      }
     }
     w.outgoing.erase(0, at + 4 + len);
   }
@@ -218,6 +338,9 @@ size_t NetworkClient::write(const uint8_t *p, size_t n) {
 int NetworkClient::read() {
   if (!available()) return -1;
   const int value = uint8_t(wire->input[wire->received++]);
+  if (wire->received == wire->input.size() &&
+      (!AssistantHost::wireAfterSetup.empty() || !AssistantHost::wireAfterEnd.empty() || !AssistantHost::wireAfterToolResponse.empty()))
+    AssistantHost::wireTailRead = true;
   if (wire->delayedResponse && wire->received == wire->input.size()) AssistantHost::responseHeadRead = true;
   return value;
 }
@@ -228,7 +351,9 @@ int NetworkClient::available() {
   }
   return int(wire->input.size() - wire->received);
 }
-bool NetworkClient::connected() { return wire && wire->connected; }
+bool NetworkClient::connected() {
+  return wire && wire->connected && !(wire->eofWhenDrained && wire->received == wire->input.size());
+}
 void NetworkClient::stop() {
   if (wire && wire->connected) {
     if (AssistantHost::closeDelayMs) {

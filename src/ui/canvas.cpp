@@ -2,6 +2,7 @@
 #include <string.h>
 
 void Canvas::clear(uint8_t color) {
+  if (!epd_.ready()) return;
   memset(epd_.buffer(), color == EPD_WHITE ? 0xFF : 0x00, epd_.bufferLen());
 }
 
@@ -16,7 +17,7 @@ void Canvas::drawPixel(int x, int y, uint8_t color) {
 // e a barra de selecao do menu - a chamada mais quente da UI - herdam
 // o ganho automaticamente, ja que so chamam isto por linha.
 void Canvas::drawFastHLine(int x, int y, int w, uint8_t color) {
-  if (y < 0 || y >= epd_.height() || w <= 0) return;
+  if (!epd_.ready() || y < 0 || y >= epd_.height() || w <= 0) return;
 
   int x0 = x;
   int x1 = x + w - 1;

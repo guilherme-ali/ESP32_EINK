@@ -1,4 +1,5 @@
 #include "recorder.h"
+#include "capture_session.h"
 #include "wav.h"
 #include <LittleFS.h>
 #include <string.h>
@@ -6,7 +7,9 @@
 #include <freertos/task.h>
 #include <freertos/stream_buffer.h>
 #include <esp_heap_caps.h>
+#include <esp_timer.h>
 #include "../storage/note_files.h"
+#include "../board/boot_trace.h"
 
 namespace {
 // Dimensionado pro PIOR caso (48kHz, a maior taxa configuravel em
@@ -23,15 +26,26 @@ constexpr size_t kChunkBytes = 2048;      // 512 frames estereo por vez (= dma_b
 constexpr UBaseType_t kCapturePriority = 5;
 constexpr UBaseType_t kWritePriority = 3;
 constexpr BaseType_t kAudioCore = 0; // loop() do Arduino roda no core 1
+constexpr int64_t kNoSamplesTimeoutUs = 2000000;
 } // namespace
 
 bool Recorder::start(const char *path, uint32_t sampleRate, AudioCodec *codec) {
-  if (active_ || !path || !codec || strlen(path) >= sizeof(path_) ||
+  return startImpl(path, sampleRate, codec, nullptr);
+}
+
+bool Recorder::start(const char *path, uint32_t sampleRate, CaptureSession *session) {
+  return startImpl(path, sampleRate, nullptr, session);
+}
+
+bool Recorder::startImpl(const char *path, uint32_t sampleRate, AudioCodec *codec, CaptureSession *session) {
+  if (active_ || !path || (!codec && !session) || strlen(path) >= sizeof(path_) ||
       !String(path).endsWith(".wav") || !validPcmFormat(makeWavHeader(sampleRate, 1, 0)) ||
       NoteFiles::noteExists(path)) return false;
+  if (session && (!session->active() || !session->setOutputRate(sampleRate))) return false;
 
   sampleRate_ = sampleRate;
   codec_ = codec;
+  session_ = nullptr;
   dataBytes_ = 0;
   checkpointBytes_ = 0;
   overflowCount_ = 0;
@@ -49,7 +63,7 @@ bool Recorder::start(const char *path, uint32_t sampleRate, AudioCodec *codec) {
   file_ = NoteFiles::fs().open(NoteFiles::pcmPath(path), FILE_APPEND);
   if (!file_) { NoteFiles::removeWav(path); return false; }
 
-  if (!ringStorage_) {
+  if (!session && !ringStorage_) {
     ringStorage_ = (uint8_t *)heap_caps_malloc(kRingBytes + 1, MALLOC_CAP_SPIRAM);
     ringStruct_ = malloc(sizeof(StaticStreamBuffer_t));
     if (!ringStorage_ || !ringStruct_) {
@@ -62,15 +76,16 @@ bool Recorder::start(const char *path, uint32_t sampleRate, AudioCodec *codec) {
       free(ringStorage_); free(ringStruct_); ringStorage_ = nullptr; ringStruct_ = nullptr;
       file_.close(); NoteFiles::removeWav(path); return false;
     }
-  } else {
+  } else if (!session) {
     xStreamBufferReset((StreamBufferHandle_t)ring_);
   }
 
-  captureTaskDone_ = false;
+  session_ = session;
+  captureTaskDone_ = session != nullptr;
   writeTaskDone_ = false;
   active_ = true;
 
-  if (xTaskCreatePinnedToCore(captureTaskFn, "audio_cap", 4096, this, kCapturePriority,
+  if (!session && xTaskCreatePinnedToCore(captureTaskFn, "audio_cap", 4096, this, kCapturePriority,
                             &captureTaskHandle_, kAudioCore) != pdPASS) {
     active_ = false; captureTaskDone_ = writeTaskDone_ = true;
     file_.close(); NoteFiles::removeWav(path); finish(); return false;
@@ -80,8 +95,8 @@ bool Recorder::start(const char *path, uint32_t sampleRate, AudioCodec *codec) {
   // (audio_wr)") - o driver de flash usa varios KB internamente.
   if (xTaskCreatePinnedToCore(writeTaskFn, "audio_wr", 8192, this, kWritePriority,
                             &writeTaskHandle_, kAudioCore) != pdPASS) {
-    stopRequested_ = true; writeTaskDone_ = true;
-    while (!captureTaskDone_) vTaskDelay(pdMS_TO_TICKS(5));
+    requestStop(); writeTaskDone_ = true;
+    while (!isFinished()) vTaskDelay(pdMS_TO_TICKS(5));
     active_ = false; file_.close(); NoteFiles::removeWav(path); finish(); return false;
   }
   return true;
@@ -91,27 +106,41 @@ void Recorder::captureTaskFn(void *arg) {
   Recorder *self = (Recorder *)arg;
   uint8_t buf[kChunkBytes];
   auto ring = (StreamBufferHandle_t)self->ring_;
+  int64_t lastSamplesUs = esp_timer_get_time();
 
   while (!self->stopRequested_) {
     size_t bytesRead = 0;
-    if (self->codec_->read(buf, sizeof(buf), &bytesRead, 200) && bytesRead > 0) {
-      bytesRead -= bytesRead % 4;
+    // DMA e pedidos sao frames LR PCM16 (4 bytes). Um bloco parcial alinhado
+    // e valido; tamanho impossivel/fragmento de frame nao pode ser truncado.
+    if (!self->codec_->read(buf, sizeof(buf), &bytesRead, 200) ||
+        bytesRead > sizeof(buf) || bytesRead % 4) {
+      self->writeFailed_ = true; self->requestStop(); break;
+    }
+    if (!bytesRead) {
+      if (self->stopRequested_.load()) break;
+      if (esp_timer_get_time() - lastSamplesUs >= kNoSamplesTimeoutUs) {
+        self->writeFailed_ = true; self->requestStop(); break;
+      }
+      vTaskDelay(1);
+      continue;
+    }
+    lastSamplesUs = esp_timer_get_time();
+    if (xStreamBufferSpacesAvailable(ring) < bytesRead) {
+      vTaskDelay(pdMS_TO_TICKS(50));
       if (xStreamBufferSpacesAvailable(ring) < bytesRead) {
-        vTaskDelay(pdMS_TO_TICKS(50));
-        if (xStreamBufferSpacesAvailable(ring) < bytesRead) {
-          self->overflowCount_++; self->writeFailed_ = true;
-          self->stopRequested_ = true; break;
-        }
+        self->overflowCount_++; self->writeFailed_ = true;
+        self->requestStop(); break;
       }
-      size_t sent = xStreamBufferSend(ring, buf, bytesRead, 0);
-      if (sent < bytesRead) {
-        self->overflowCount_++;
-        self->writeFailed_ = true;
-        self->stopRequested_ = true;
-      }
+    }
+    size_t sent = xStreamBufferSend(ring, buf, bytesRead, 0);
+    if (sent < bytesRead) {
+      self->overflowCount_++;
+      self->writeFailed_ = true;
+      self->requestStop();
     }
   }
 
+  // Ultimo acesso a self antes da autoexclusao; finish() pode liberar o ring.
   self->captureTaskDone_ = true;
   vTaskDelete(nullptr);
 }
@@ -150,15 +179,16 @@ void Recorder::writeTaskFn(void *arg) {
       size_t wanted = accumLen < room ? accumLen : room;
       size_t written = wanted ? self->file_.write(writeAccum, wanted) : 0;
       self->dataBytes_ += written & ~static_cast<size_t>(1);
-      if (written != wanted) { ioFailed = true; self->writeFailed_ = true; self->stopRequested_ = true; }
+      if (written != wanted) { ioFailed = true; self->writeFailed_ = true; self->requestStop(); }
       if (wanted < accumLen || self->dataBytes_ >= self->maximumBytes_) {
-        self->storageFull_ = true; self->stopRequested_ = true;
+        self->storageFull_ = true; self->requestStop();
       }
       // Commit append-only a cada ~1s de audio. Um reset preserva os
       // checkpoints anteriores; nao depende de close() no fim da sessao.
       if (self->dataBytes_.load() - self->checkpointBytes_.load() >= self->sampleRate_ * 2) {
         self->file_.flush();
         self->checkpointBytes_ = self->dataBytes_.load();
+        BootTrace::mark(BootTrace::FirstCheckpoint);
       }
       // taskYIELD nao libera CPU para IDLE0 (prioridade menor). Bloquear
       // pelo menos um tick evita starvation do watchdog no dreno da fila.
@@ -168,15 +198,26 @@ void Recorder::writeTaskFn(void *arg) {
   };
 
   for (;;) {
-    size_t got = xStreamBufferReceive(ring, stereoBuf, sizeof(stereoBuf), pdMS_TO_TICKS(100));
+    size_t monoBytes = 0;
+    size_t got = 0;
+    if (self->session_) {
+      size_t samples = 0;
+      self->session_->read(monoBuf, sizeof(monoBuf) / sizeof(monoBuf[0]), &samples, 100);
+      monoBytes = samples * sizeof(int16_t);
+      if (self->session_->failed()) self->writeFailed_ = true;
+      self->overflowCount_ = self->session_->overflowCount();
+    } else {
+      got = xStreamBufferReceive(ring, stereoBuf, sizeof(stereoBuf), pdMS_TO_TICKS(100));
+    }
     if (got > 0) {
       int frames = got / (2 * sizeof(int16_t));
       const int16_t *stereoSamples = (const int16_t *)stereoBuf;
       for (int i = 0; i < frames; i++) {
         monoBuf[i] = stereoSamples[i * 2]; // canal esquerdo
       }
-      size_t monoBytes = frames * sizeof(int16_t);
-
+      monoBytes = frames * sizeof(int16_t);
+    }
+    if (monoBytes) {
       size_t offset = 0;
       while (offset < monoBytes) {
         size_t space = kWriteChunkBytes - accumLen;
@@ -190,7 +231,9 @@ void Recorder::writeTaskFn(void *arg) {
       }
     }
 
-    if (self->stopRequested_ && self->captureTaskDone_ && xStreamBufferIsEmpty(ring)) break;
+    if (self->session_) {
+      if (self->session_->drained()) break;
+    } else if (self->stopRequested_ && self->captureTaskDone_ && xStreamBufferIsEmpty(ring)) break;
   }
 
   if (accumLen > 0) {
@@ -198,6 +241,7 @@ void Recorder::writeTaskFn(void *arg) {
   }
 
   self->file_.flush();
+  if (self->dataBytes_.load()) BootTrace::mark(BootTrace::FirstCheckpoint);
   self->file_.close();
   File persisted = NoteFiles::fs().open(NoteFiles::pcmPath(self->path_), FILE_READ);
   uint32_t expected = self->dataBytes_.load();
@@ -208,6 +252,7 @@ void Recorder::writeTaskFn(void *arg) {
   // Somente 44 bytes atomicos: nunca seek(0) no arquivo grande de PCM.
   if (committed && !NoteFiles::writeWavHeader(self->path_, makeWavHeader(self->sampleRate_, 1, expected)))
     self->writeFailed_ = true;
+  // Nenhum acesso ao Recorder/File/buffers apos publicar termino.
   self->writeTaskDone_ = true;
   vTaskDelete(nullptr);
 }
@@ -222,8 +267,19 @@ uint32_t Recorder::stop() {
   return finish();
 }
 
+void Recorder::requestStop() {
+  stopRequested_ = true;
+  if (session_) session_->requestStop();
+}
+
+bool Recorder::isFinished() const {
+  return (session_ ? session_->finished() : captureTaskDone_.load()) && writeTaskDone_.load();
+}
+
 uint32_t Recorder::finish() {
   if (!isFinished()) return dataBytes_;
+  if (session_) session_->end();
+  session_ = nullptr;
   active_ = false;
   if (ring_) vStreamBufferDelete((StreamBufferHandle_t)ring_);
   ring_ = nullptr;
